@@ -41,20 +41,19 @@ verify:
 	@echo
 	@echo "ok -- ready to publish $(NAME)@$(VERSION)"
 
-# The account has 2FA, so npm needs a one-time password; there is no way to supply it
-# ahead of time and it expires in ~30s, so pass it at the moment of publishing:
-#   make publish OTP=123456
+# The account has 2FA. It is the WEB flow: npm prints an authorization URL, opens a
+# browser, and waits for approval -- so publishing is interactive and cannot be run
+# unattended. Do not "fix" that by adding --auth-type=legacy.
+#
+# OTP is optional, for an account on TOTP instead:  make publish OTP=123456
 publish:
-	@if [ -z "$(OTP)" ]; then \
-		echo "error: OTP is required -- usage: make publish OTP=123456"; exit 1; \
-	fi
 	@if [ ! -f .npmrc ]; then \
 		echo "error: .npmrc with the publish token is missing"; exit 1; \
 	fi
 	@$(MAKE) verify
 	@echo
-	@echo "==> publishing $(NAME)@$(VERSION)"
-	@npm publish --otp=$(OTP)
+	@echo "==> publishing $(NAME)@$(VERSION) -- approve in the browser when prompted"
+	@npm publish $(if $(OTP),--otp=$(OTP))
 
 clean:
 	@rm -rf node_modules $(NAME)-*.tgz
