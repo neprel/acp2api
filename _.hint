@@ -1,0 +1,160 @@
+# goal acp2api
+
+Expose each coding CLI as one OpenAI model id, so a router can build failover
+chains out of subscriptions instead of API keys.
+
+The constraint that shapes everything here: **the subscription must be spent by the
+CLI itself**. The CLI is spawned and speaks ACP over stdio; no OAuth token is read,
+replayed, or forwarded. Every project surveyed on 2026-08-09 that handled quota
+exhaustion well did it by borrowing the vendor's token and calling the vendor's real
+HTTP API — engineering quality was inversely correlated with legality. This is the
+other branch of that fork, and its known cost is that a bad status code is the only
+signal a caller ever gets.
+
+# lang Node 22+, ESM, no build step
+
+JavaScript, not TypeScript: the ACP ecosystem is npm-first, and a build step buys
+nothing at this size. Tests are `node --test`; there is no test framework.
+
+# dep Four packages, and a reason for each
+
+Required: `@agentclientprotocol/sdk` (the protocol, zero transitive deps) and `yaml`
+(config). Optional: the adapters `@agentclientprotocol/claude-agent-acp` and
+`@agentclientprotocol/codex-acp` — only `general` agents work without them, and
+`@openai/codex` is a large download nobody using `general` should pay for.
+
+They are **dependencies, not global installs**, so their versions cannot drift with
+whatever `claude`/`codex` happens to be on PATH. `claude-agent-acp` bundles
+`@anthropic-ai/claude-agent-sdk` and reads the login in `~/.claude` — that directory
+must exist (and be mounted, in a container) for it to work at all.
+
+Do not add an HTTP framework. `node:http` covers the three routes, and every
+dependency here is one more thing that can break an unattended server.
+
+# bad Never spawn a preset by its bare bin name {#global_install}
+
+A dependency's bin is linked into **this package's** `node_modules/.bin`, which is
+not on PATH when the package is installed globally. Spawning `claude-agent-acp`
+therefore works from a checkout and fails for every `npm i -g acp2api` user — the
+worst kind of bug, invisible to the author.
+
+`resolvePreset()` resolves the adapter's `package.json`, reads its `bin` entry and
+spawns `process.execPath <entry>`: no PATH lookup, no shebang, no exec bit. It falls
+back to the bare name when the adapter is absent, because it is optional.
+
+# build make
+
+`make test` (48 tests, offline), `make check` (validates the shipped example
+config), `make verify` (`npm ci` + test + check + pack — the pre-publish gate).
+
+The npm account has 2FA, so publishing needs a one-time password that expires in
+seconds: `make publish OTP=123456`. There is no way to script that away, and the
+target refuses rather than pretending.
+
+`verify` uses `npm ci`, not `npm install`: a suite that passes only against a drifted
+tree proves nothing about what a consumer installs.
+
+# rule ACP specifies the model, and it took a live probe to know that {#acp_config_options}
+
+The protocol docs do not describe this and a page-level read says it is unsupported.
+It is supported, via `session/set_config_option`. `session/new` returns
+`configOptions[]`, each with `id`, `name`, `type` (`select` | `boolean`) and a
+semantic `category`:
+
+| category | what it selects | claude's id | codex's id |
+| --- | --- | --- | --- |
+| `model` | the model | `model` | `model` |
+| `thought_level` | reasoning depth | `effort` | `reasoning_effort` |
+| `model_config` | model parameters | `fast` | `fast-mode` |
+| `mode` | permission mode | `mode` | `mode` |
+
+**Select by category, never by id** — the table above is exactly why. `config.model`
+and `config.reasoning` resolve through `category`; `config.options` is the escape
+hatch that addresses a raw id.
+
+Verified on 2026-08-09 against `claude-agent-acp` 0.66.0 and `codex-acp` 1.1.14 by
+running `initialize` + `session/new` and printing the response. Do that again rather
+than trusting this table: the model lists move every few weeks.
+
+# bad Two failure modes that look like success {#silent_success}
+
+Both were found by running the thing, not by reading the code, and both would make a
+router treat a failure as an answer.
+
+- **A cancelled turn is an ordinary ACP stop reason**, not an error. Returned
+  unexamined, a timed-out turn is `200` carrying whatever partial text existed. The
+  server tracks timeout and client-disconnect separately and answers `504` for the
+  first, nothing for the second.
+- **Streaming headers must not be sent before the agent starts.** Committing to
+  `200 text/event-stream` up front turns a clean `429` into a stream that merely
+  stops early, and the caller cannot tell the difference. Headers go out on the first
+  streamed event.
+
+Also: never fall back to a different model when the requested one is unavailable.
+The caller picked that agent name to get that model; `400` is the honest answer.
+
+# rule 429 is the contract; ACP has no quota code {#limit_detection}
+
+An exhausted subscription arrives as a plain error string — there is no code, no
+field, nothing structured. `server.limitPatterns` (regexes, config not code) is the
+entire detection mechanism, and an unmatched message stays **502 on purpose**: a
+router must not spend its next provider on a crash it should have retried.
+
+Statuses are the whole interface to a failover chain — 429 try the next brain, 502
+fault, 503 could not spawn, 504 no answer in time, 401 not logged in.
+
+When a new agent phrases exhaustion differently, add a pattern; do not widen the
+default set to catch it by accident.
+
+# rule The option set changes when the model changes {#option_reapply}
+
+Selecting a model can add or remove other options. Claude drops the `effort`
+selector entirely once Haiku is chosen. So options are applied **in order** — model
+first, then reasoning, then raw ids — and the list is re-read from each
+`session/set_config_option` response rather than from the `session/new` snapshot.
+
+Resolving all ids up front looks equivalent and is not: it fails with
+`unknown config option "effort"` on a config that is merely contradictory.
+
+# good One process per agent, one session per request {#lifecycle}
+
+Spawning `claude-agent-acp` costs seconds, so the child process is lazily started
+and kept. The ACP **session** is per request, because an OpenAI chat completion is
+stateless and carries its whole history in `messages` — reusing a session would
+replay that history on top of the agent's own.
+
+`close()` is terminal. Without that, a request arriving during shutdown respawns a
+CLI that nothing is left to reap, and the process never exits.
+
+# rule No human answers a permission prompt
+
+`session/request_permission` must be answered from config (`server.permission`),
+matched on the option's `kind` and not its id. The blast radius is contained by
+`server.cwd`: the `fs/read_text_file` and `fs/write_text_file` handlers refuse any
+path outside it.
+
+# good Tests drive a real ACP agent, not a mock {#fixture}
+
+`test/fixtures/fake-agent.js` is a genuine ACP agent over genuine stdio, built on
+the same SDK. Mocking the connection would only prove the code calls the functions
+it was written to call; this covers the wire format, the `session/set_config_option`
+round trip, streaming, cancellation and the 429/502 split — offline, and without
+spending a subscription.
+
+Its prompt text selects the failure to exercise (`QUOTA`, `BOOM`, `HANG`, `REFUSE`).
+Add behaviour there rather than reaching for a mocking library.
+
+# done Acceptance
+
+Verified 2026-08-09 on the Mac, against the real logged-in Claude subscription:
+
+- `POST /v1/chat/completions` with `model: claude-haiku` returned `"Haiku"` with the
+  thinking separated into `reasoning_content` and usage populated.
+- The same request with `stream: true` on `claude-sonnet-high` produced well-formed
+  SSE deltas ending in `finish_reason: "stop"` and `[DONE]`.
+- 48 tests pass offline against the fixture.
+
+The live run is what caught [#option_reapply](#option_reapply); the suite did not,
+because the fixture had a stable option set until that finding was folded back in.
+Re-run a live check after protocol-facing changes — the fixture agrees with whatever
+it was taught.

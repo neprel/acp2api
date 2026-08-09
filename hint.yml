@@ -1,0 +1,4 @@
+name: acp2api
+description: OpenAI-compatible HTTP server over ACP agents
+books:
+  - npm://@openhint/hintbook-software-engineer

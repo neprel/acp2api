@@ -1,0 +1,58 @@
+{
+  "name": "acp2api",
+  "version": "1.0.1",
+  "description": "OpenAI-compatible HTTP server over ACP agents. Use Claude Code, Codex, opencode or any ACP CLI from anything that speaks the OpenAI API but does not speak ACP yet.",
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "openai",
+    "openai-compatible",
+    "openai-api",
+    "claude-code",
+    "codex",
+    "opencode",
+    "cline",
+    "hermes",
+    "agent",
+    "bridge",
+    "gateway",
+    "llm"
+  ],
+  "homepage": "https://github.com/neprel/acp2api#readme",
+  "bugs": {
+    "url": "https://github.com/neprel/acp2api/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neprel/acp2api.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Andrey <neprel@gmail.com>",
+  "type": "module",
+  "bin": {
+    "acp2api": "bin/acp2api.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "acp2api.example.yaml"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node bin/acp2api.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.3.0",
+    "yaml": "2.9.0"
+  },
+  "optionalDependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.66.0",
+    "@agentclientprotocol/codex-acp": "1.1.14"
+  }
+}

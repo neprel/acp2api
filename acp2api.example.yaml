@@ -1,0 +1,65 @@
+# acp2api -- one OpenAI model id per ACP agent.
+#
+# Copy, edit, then:  acp2api --config acp2api.yaml --check
+#
+# ${VAR} and ${VAR:-default} expand from the environment, so nothing secret has to
+# be written here.
+
+server:
+  host: 127.0.0.1
+  port: 10021
+
+  # What CLIENTS of this server send as `Authorization: Bearer ...`.
+  # NOT an Anthropic or OpenAI key -- none is ever used. Each agent spends the
+  # subscription its own CLI is logged into. Leave empty to disable auth.
+  apiKey: ${ACP2API_API_KEY:-}
+
+  # Workspace handed to every ACP session, and the boundary for fs/read_text_file
+  # and fs/write_text_file. Relative paths resolve against this file.
+  cwd: ./work
+
+  # Nobody is at a keyboard to answer session/request_permission, so it is answered
+  # from here: allow | deny. `cwd` above is what actually contains the blast radius.
+  permission: allow
+  fs: true
+
+  # Agents can think for a long time. Past this the caller gets 504 rather than a
+  # truncated 200 that a router would count as a success.
+  requestTimeoutMs: 900000
+
+  # What makes a failure a 429 ("out of quota, try the next brain") instead of a 502
+  # ("broken"). ACP has no quota error code, so this pattern list is the whole
+  # detection mechanism. Setting it REPLACES the built-in list.
+  # limitPatterns: ["rate.?limit", "usage limit", "quota"]
+
+agents:
+  # `name` is the OpenAI model id clients ask for.
+  - name: claude-opus
+    type: claude # bundled adapter: @agentclientprotocol/claude-agent-acp
+    model: opus[1m] # set on the option whose CATEGORY is "model"
+    reasoning: high # set on the option whose CATEGORY is "thought_level"
+
+  - name: claude-sonnet
+    type: claude
+    model: sonnet
+    reasoning: medium
+
+  - name: codex
+    type: codex # bundled adapter: @agentclientprotocol/codex-acp
+    model: gpt-5.6-sol
+    reasoning: high
+
+  # Any other ACP-speaking CLI. `command` is required; there is no preset.
+  - name: opencode
+    type: general
+    command: opencode
+    args: [acp]
+    # `options` addresses a raw config option id, for anything model/reasoning
+    # do not cover:
+    # options:
+    #   mode: bypassPermissions
+
+  - name: cline
+    type: general
+    command: cline
+    args: [--acp]
