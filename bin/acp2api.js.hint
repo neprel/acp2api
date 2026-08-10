@@ -1,0 +1,58 @@
+# goal Fail before binding, or run predictably
+
+Everything that can be checked without serving traffic is checked at startup. A
+config error must never first appear as a failed request.
+
+# scope What this module owns
+
+In: argument parsing, loading the config, `--check`, creating the workspace,
+logging, listening, and shutdown.
+
+Out: any request handling. This file wires and starts; it contains no behaviour that
+a test would need to reach through HTTP.
+
+# ui Command line
+
+```
+acp2api --config <file>   # or ACP2API_CONFIG
+acp2api --check           # validate and exit
+acp2api --help
+```
+
+## rule Exit codes {#exit_codes}
+
+- `0` — `--help`, `--check` on a valid config, or a clean shutdown
+- `2` — bad arguments, no config given, or a `ConfigError`
+
+A `ConfigError` prints as a single line. Anything else prints as-is, stack included:
+the first is the user's problem, the second is ours, and they should not look alike.
+
+# rule --check must exercise the real path {#check_is_real}
+
+It runs the same `loadConfig` the server does, so a config that passes `--check`
+cannot fail at startup for a config reason. Do not give it a lighter validation
+path; `make check` guards the example config shipped in the package, and a weaker
+check there would ship a broken example.
+
+# invariant The workspace exists before the first request {#mkdir_workspace}
+
+Every `cwd` — the server's and each agent's — is created at startup. It is a
+bind-mounted volume that does not exist on a fresh host, and an agent that cannot
+chdir into it fails per request, which reads as a broken agent rather than a missing
+directory.
+
+# rule Shutdown closes the server, which closes the agents {#shutdown}
+
+`SIGINT`/`SIGTERM` close the HTTP server and let its `close` handler reap the child
+processes; the 10s fallback timer is `unref`'d so it never holds the loop open
+itself. Do not `process.exit` directly on a signal — that leaves a logged-in CLI
+running with nobody owning it.
+
+# good Log lines are timestamped, levelled, and go to the right stream
+
+`warn` and `error` to stderr, everything else to stdout, so a supervisor can
+separate them. At startup, log every model id with the agent, model and reasoning
+behind it: that mapping is the one thing an operator needs when a caller reports the
+wrong answers from the right name.
+
+An empty `apiKey` is warned about explicitly at startup.

@@ -1,4 +1,4 @@
-.PHONY: help install test check pack verify publish clean
+.PHONY: help install test check spec pack verify publish clean
 
 VERSION := $(shell node -p "require('./package.json').version")
 NAME    := $(shell node -p "require('./package.json').name")
@@ -8,6 +8,7 @@ help:
 	@echo
 	@echo "  make test      run the test suite"
 	@echo "  make check     validate the example config"
+	@echo "  make spec      check the code still contains every surface its .hint declares"
 	@echo "  make pack      build the tarball and list what would ship"
 	@echo "  make verify    clean install + test + check + pack  (the pre-publish gate)"
 	@echo "  make publish OTP=123456   publish to npm (2FA one-time password required)"
@@ -23,6 +24,15 @@ test:
 check:
 	@node bin/acp2api.js --config acp2api.example.yaml --check
 
+# Each source file has a companion .hint declaring the functions, invariants and test
+# scenarios it must carry. This asserts the code still matches; when a spec changes on
+# purpose, re-run `hint lock` to record the new snapshot. Skipped when hint is absent,
+# because a contributor without it should still be able to run the tests.
+spec:
+	@command -v hint >/dev/null 2>&1 \
+		&& hint verify 'src/**' 'bin/**' 'test/fixtures/**' \
+		|| echo "hint not installed -- skipping the spec check"
+
 pack:
 	@rm -f $(NAME)-*.tgz
 	@npm pack
@@ -37,6 +47,7 @@ verify:
 	@npm ci
 	@$(MAKE) test
 	@$(MAKE) check
+	@$(MAKE) spec
 	@$(MAKE) pack
 	@echo
 	@echo "ok -- ready to publish $(NAME)@$(VERSION)"

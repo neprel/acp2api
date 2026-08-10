@@ -1,0 +1,54 @@
+# goal Prove the wire, not the wiring
+
+The whole test suite runs against this: a genuine ACP agent over genuine stdio,
+built on the same SDK. Mocking the connection would only prove the code calls the
+functions it was written to call. Rationale in [_.hint#fixture](../../_.hint).
+
+# rule Extend the fixture, never reach for a mocking library {#no_mocks}
+
+A new behaviour to test is a new branch here, keyed off the prompt text. That keeps
+every test honest about the protocol and keeps the suite offline and free — it
+spends no subscription and needs no network.
+
+The one exception is the HTTP layer, where `test/server.test.js` may inject a stub
+agent object to test routing that has nothing to do with ACP.
+
+# rule Prompt keywords {#keywords}
+
+The prompt text selects the behaviour, so a test asks for the failure it wants.
+
+| keyword | behaviour | what it exists to prove |
+| --- | --- | --- |
+| `QUOTA` | fails with usage-limit phrasing | the 429 path |
+| `BOOM` | fails with an unrelated error | that 502 stays 502 |
+| `HANG` | never finishes on its own | cancellation and the 504 path |
+| `REFUSE` | completes with `stopReason: "refusal"` | stop-reason mapping |
+| `COUNT` | streams 20 words, checking the abort each one | `max_tokens` and `stop` |
+| `ECHOMCP` | answers with the `mcpServers` it received | that MCP config reaches `session/new` |
+| anything else | echoes after a thought chunk and a tool call | the ordinary path |
+
+Adding a keyword means adding a row here. A branch nobody can find from this table
+is a branch the next person will duplicate.
+
+# rule The option set must stay unstable {#unstable_options}
+
+Selecting model `lite` **removes** the `thought_level` selector, mirroring what
+`claude-agent-acp` does for Haiku. That behaviour is the point of the model existing;
+do not simplify it away. See [_.hint#option_reapply](../../_.hint) — the live run
+caught that bug precisely because the fixture was stable at the time.
+
+Likewise the reasoning option is named `effort`, not `reasoning`, so that selection
+by category is genuinely exercised rather than accidentally matching an id.
+
+# invariant Every prompt turn is cancellable {#cancellable}
+
+`state.abort` is created at the start of each turn, not only for `HANG`. Any
+long-running branch must check it, or a cancellation test hangs until the suite
+times out instead of failing.
+
+# invariant The fixture advertises what it implements
+
+`sessionCapabilities.close` is declared and `session/close` is handled, so the
+production close path is exercised rather than skipped. If a branch stops being
+implemented, stop advertising it — a capability the agent claims and does not honour
+is exactly the bug this fixture should be catching.

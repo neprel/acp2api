@@ -1,0 +1,75 @@
+# goal Decide what an unsupportable OpenAI parameter costs
+
+This module exists because "not supported" is not one behaviour. The reasoning, and
+the split between style and contract, is in
+[_.hint#param_policy](../_.hint) — read that first; this file only records the
+contract and how to extend it.
+
+# invariant This module imports nothing {#no_imports}
+
+`openai.js` imports it, so importing back would create a cycle for the sake of one
+error class. `ParamReporter.report` therefore throws a plain `Error` with `.status`
+and `.code` attached, which the HTTP layer already handles the same way.
+
+If this file ever needs a helper, move the helper down here rather than importing up.
+
+# invariant Every parameter is in exactly one bucket {#one_bucket}
+
+`NATIVE`, `EMULATED`, `IGNORED`, `REFUSED`. A name in two buckets, or a REFUSED name
+that some other module also handles, is a bug — the buckets are the whole policy and
+they must be readable as one list.
+
+Unknown names fall through to ignored **by design**, so the sets do not have to be
+exhaustive to be correct.
+
+# rule Adding support for a parameter is a bucket change, not an if {#adding_params}
+
+When something becomes implementable, move its name from `REFUSED`/`IGNORED` into
+`EMULATED` or `NATIVE` and implement it — do not special-case it upstream and leave
+the name behind. A parameter honoured in `server.js` but still listed as ignored
+reports a lie to the caller in `x_acp2api.ignored`.
+
+Promoting a name **out** of `REFUSED` requires that the implementation preserve the
+meaning the caller expects. `tools` may only leave that set when real `tool_calls`
+come back, not when tools are merely passed to the agent somehow.
+
+# func classify {#classify}
+
+## arg body
+The raw request body. Only its **keys** matter, except for `n`, where `1` and `null`
+are indistinguishable from absent and so are not worth a 400.
+
+## result
+`{ignored: string[], refused: [{key, why}]}` — `ignored` sorted, so the value echoed
+back to callers and asserted in tests is stable.
+
+# func report {#report}
+
+A method of `ParamReporter`.
+
+## arg model
+The agent name, so the log line says which model the caller was aiming at.
+
+## arg ignored
+Names from `classify`.
+
+## result
+The same array, for echoing as `x_acp2api.ignored`.
+
+## error unsupported_parameter
+Thrown only when the mode is `error`. Status 400.
+
+## invariant One log line per (model, parameter), for the process lifetime
+Not per request. A client looping with `temperature` would otherwise produce one
+line per call forever, and the interesting event is the first one.
+
+# test params
+
+- style parameters (`temperature`, `top_p`, `seed`) are ignored, never refused
+- contract parameters (`tools`, `tool_choice`, `response_format`, `functions`, `audio`) are refused
+- the `tools` refusal explains where tools actually come from (`mcpServers`)
+- `n: 1` and `n: null` pass; `n: 3` is refused
+- an unknown future field is ignored rather than refused
+- native and emulated names appear in neither list
+- the reporter logs each (model, parameter) pair exactly once across repeated calls
+- mode `ignore` logs nothing; mode `error` throws with status 400 and the right code

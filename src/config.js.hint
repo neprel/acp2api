@@ -1,0 +1,96 @@
+# goal The config is the only place a deployment is described
+
+Everything that varies between installs lives in one YAML file and is fully
+validated before the server binds a port. A misconfiguration must fail at startup
+with a message naming the file, the path and the value — never at request time,
+where it looks like a broken agent.
+
+# scope What this module owns
+
+In: reading the file, `${VAR}` expansion, validation, defaults, path resolution,
+adapter resolution, MCP normalization.
+
+Out: everything else. This module performs no network access, spawns nothing, and
+knows nothing about HTTP or ACP message shapes. `loadConfig` is the only function
+here that touches the filesystem.
+
+# invariant Validation is total {#total_validation}
+
+Every field that reaches the rest of the program has been checked here. Downstream
+code may assume `config.server.port` is an integer in range, `agents[].command` is a
+non-empty string, `limitPatterns` are compiled `RegExp`s, and `mcpServers` are in
+ACP's exact wire shape. No defensive re-checking anywhere else — if a value can be
+wrong, it is rejected here.
+
+Consequence for changes: **a new option needs three things in the same commit** — an
+entry in `DEFAULTS`, a `req(...)` assertion, and a test asserting the rejection. Two
+out of three is a silent hole.
+
+# func normalizeConfig {#normalize}
+
+The single entry point for turning parsed YAML into the validated shape. `loadConfig`
+is a thin wrapper that adds file reading and error prefixing.
+
+## arg raw
+The parsed YAML object. Rejected unless it is a mapping.
+
+## arg options.baseDir
+Directory relative paths resolve against — the config file's own directory, so a
+config is portable between a checkout and a container without absolute paths.
+Defaults to `process.cwd()`.
+
+## arg options.env
+The environment used for `${VAR}` expansion. Injected rather than read from
+`process.env` directly, so tests are hermetic.
+
+## result
+`{server, agents}` — never a partial object. Throws `ConfigError` instead.
+
+## error ConfigError
+Every validation failure. `loadConfig` re-wraps it with the file path prefixed.
+Never throw a bare `Error` from this module: the CLI prints `ConfigError` as a clean
+message and anything else as a stack trace.
+
+# rule ${VAR} expansion happens before validation, and yields strings {#env_strings}
+
+`${VAR}` and `${VAR:-fallback}` expand recursively over the whole document first, so
+validation sees final values. An unset variable with no fallback is **fatal** — the
+alternative is a server that starts with an empty `apiKey` and an open port.
+
+Because expansion always produces strings, `port` and `requestTimeoutMs` are coerced
+from numeric strings before their integer checks, and `fs` from `"false"`/`"0"`.
+Any new numeric or boolean option needs the same treatment or it breaks the moment
+someone sources it from the environment. Coercion is deliberately narrow: only
+`/^\d+$/` converts, so nonsense still fails validation rather than becoming `NaN`.
+
+# func resolvePreset {#resolve_preset}
+
+See [_.hint#global_install](../_.hint) for why the bare bin name is never spawned.
+
+## result
+`{command, args}` — either `{process.execPath, [<adapter entry>]}` when the adapter
+resolves, or `{<bin name>, []}` as the fallback.
+
+## invariant Resolution never throws
+An absent optional adapter must not stop the server: agents of other types still
+work, and the missing one fails per-request as a clean 503 naming the command.
+
+# rule An explicit command bypasses preset resolution entirely {#explicit_command}
+
+`command` in the config wins and brings `args: []` with it, not the preset's args.
+Merging the two would silently append adapter flags to someone's custom binary.
+
+# test config
+
+- defaults fill in, and `cwd` resolves against `baseDir`
+- an absolute `cwd` is left alone; a per-agent `cwd` resolves against the server one
+- `claude`/`codex` resolve to the installed adapter entry, `general` demands `command`
+- an explicit `command` overrides the preset and does not inherit its args
+- `resolvePreset` falls back to the bare bin name when the package is absent
+- duplicate agent names are rejected — they are the OpenAI model ids
+- `port`, `permission`, `unsupportedParams`, `type`, `name`, `args` each rejected when malformed
+- `${VAR}` expands, `${VAR:-default}` falls back, an unset bare `${VAR}` throws
+- numeric strings from `${VAR}` coerce for `port`/`requestTimeoutMs`, but `"http"` still fails
+- `limitPatterns` compile case-insensitively and replace the default list when given
+- MCP mappings convert to `[{name, value}]`; stdio gets `args`/`env` even when omitted
+- `loadConfig` prefixes errors with the file path and reports an unreadable file

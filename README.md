@@ -200,8 +200,15 @@ Two related traps this handles rather than inherits:
 ```sh
 make test      # 75 tests, offline
 make check     # validate the example config
-make verify    # clean install + test + check + pack
+make spec      # the code still carries every surface its .hint declares
+make verify    # clean install + test + check + spec + pack
 ```
+
+Every source file has a companion `.hint` next to it stating what that file owns,
+its function contracts, its invariants, and the test scenarios it must cover — with
+the cross-cutting decisions in the folder-level [`_.hint`](_.hint). They are the
+contract, not documentation: `make spec` fails when the code drifts from them.
+Change a spec deliberately, then re-run `hint lock` to record the new snapshot.
 
 | file | |
 | --- | --- |

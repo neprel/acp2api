@@ -1,0 +1,88 @@
+# goal Own the ACP conversation, and translate its failures into decisions
+
+This is the only file that speaks ACP. Everything a caller needs to decide what to
+do next — retry, fail over, give up — comes out of here as a status code, so a
+mistranslation here is a routing mistake three systems away.
+
+The session/process lifecycle, the option-ordering rule, the drain-after-cut rule
+and the 429/502 split are stated in
+[_.hint#lifecycle](../_.hint), [#option_reapply](../_.hint), [#cut_drain](../_.hint)
+and [#limit_detection](../_.hint). This file records the contract.
+
+# scope What this module owns
+
+In: spawning the adapter, the ACP handshake, session lifecycle, config options, MCP
+declaration, the prompt turn, cancellation, and mapping ACP failures to HTTP status.
+
+Out: HTTP, OpenAI shapes, and any knowledge of what the caller asked for. `prompt`
+receives ACP content blocks and a `limit` callback; it never sees a request body.
+
+# func prompt {#prompt}
+
+One prompt turn on a fresh session.
+
+## arg blocks
+ACP `ContentBlock[]`, already translated.
+
+## arg options.signal
+Aborting it cancels the ACP turn. Removing the listener in `finally` is mandatory:
+the signal outlives the turn and a leaked listener cancels the *next* one.
+
+## arg options.onEvent
+`{type: "text" | "reasoning" | "tool_call", ...}`, called as the agent streams and
+always before this resolves.
+
+## arg options.limit
+See [openai.js.hint#limiter](./openai.js.hint). Optional.
+
+## result
+`{text, reasoning, stopReason, usage}`. `stopReason` is the limiter's verdict when
+it fired, not the agent's `cancelled` — otherwise a truncation is reported as a
+clean stop.
+
+## error AgentError
+The only error type leaving this module. Always carries `status` and `code`:
+401 auth required, 429 usage limit, 499 cancelled, 400 unsupported option,
+503 cannot spawn / shut down, 502 anything else.
+
+## flow
+1. Connect (memoized) — spawn, `initialize`, remember capabilities.
+2. Build the session, declaring the agent's MCP servers.
+3. Apply model, then reasoning, then raw options — re-reading the option set each time.
+4. Prompt; consume updates, consulting `limit` after each text chunk.
+5. On cut: cancel, then drain to the stop message without accumulating.
+6. Always: remove the abort listener, dispose, and `session/close` when supported.
+
+# invariant tool_call updates are progress, never content {#tool_calls_are_progress}
+
+The agent's own tool calls are surfaced through `onEvent` and never appended to
+`text`. They are things the agent already did — not OpenAI `tool_calls` for the
+caller to execute and answer. Anything that makes them look like the latter is
+wrong; see [_.hint#mcp_tools](../_.hint).
+
+# invariant A dead child never takes the server down {#respawn}
+
+The `exit` handler drops the memoized connection so the next request respawns rather
+than writing into a dead pipe. `close()` is terminal in the other direction: after
+it, `prompt` throws 503 instead of spawning a CLI nothing is left to reap.
+
+# bad Never widen the 429 net to catch an unfamiliar error
+
+An unrecognised failure stays 502. A router that reads 429 spends its next provider;
+doing that on a crash it should have retried burns a subscription for nothing. New
+phrasings belong in `server.limitPatterns` (config), not in this file.
+
+# test agent
+
+- a turn streams reasoning, tool calls and text in order, and reports usage
+- model and reasoning are selected by category, not by option id
+- raw `options` address an id directly, including booleans
+- an unavailable model value, and an unknown option id, are 400 — never a fallback
+- selecting a model that removes the reasoning selector reports *that*, not a stale id
+- a model with no reasoning selector works when none is requested
+- quota phrasing is 429; an unrelated failure is 502; `limitPatterns` are configurable
+- aborting the signal cancels the turn in the agent
+- `max_tokens` and `stop` cut the turn, and nothing past the cut is emitted or accumulated
+- `mcpServers` reach `session/new` in ACP's array shape
+- the child is reused across turns; after `close()` a further prompt is 503
+- an unspawnable command is 503, not a crash

@@ -1,0 +1,88 @@
+# goal Translate between two shapes, and nothing else
+
+Everything in this file is a pure function of its arguments. That is what makes the
+OpenAI surface testable without spawning an agent or opening a socket, and it is the
+property to protect when adding to it.
+
+# invariant No I/O, ever {#pure}
+
+No filesystem, no network, no clock beyond what callers pass in, no `process.env`.
+`created` timestamps and completion ids are produced by `newCompletionId()` and by
+the caller respectively, so responses stay reproducible in tests.
+
+The rule bites hardest on attachments: a remote `image_url` or a `file_id` is
+**refused, never fetched**. Fetching would make a translation function egress —
+silently, from wherever this is deployed, which in the original deployment is behind
+a VPN on purpose.
+
+# func toPromptBlocks {#to_prompt}
+
+Renders OpenAI `messages` into ACP content blocks.
+
+## arg messages
+The OpenAI array. Rejected when empty, when a message lacks `role`, or when it
+contains only system messages.
+
+## result
+`[{type: "text", text}, ...attachments]` — always exactly one text block first,
+followed by image and resource blocks in the order they appeared.
+
+## flow
+1. Flatten each message's content, collecting attachments as ACP blocks.
+2. Split into system/developer messages and conversation turns.
+3. A **single** turn is passed through verbatim — the common case must not be
+   wrapped in scaffolding the model then has to see through.
+4. Several turns become a labelled `User:` / `Assistant:` transcript, which is the
+   only faithful option when the agent owns its own conversation state.
+5. System text is prepended, unlabelled.
+
+## invariant A one-turn request produces the user's text unchanged
+Any added prefix, suffix or label on the single-turn path is a regression, however
+harmless it looks.
+
+# func makeLimiter {#limiter}
+
+Builds the callback `Agent.prompt` consults after each chunk. Returns `null` when
+the request asks for no limits, so the hot path stays free of a no-op call.
+
+## result
+`null`, or `(text) => null | {stopReason, text}`.
+
+## invariant The limiter is pure and idempotent
+It is called after every chunk with the full accumulated text, so it must decide
+from that text alone and never from call history. See
+[_.hint#param_policy](../_.hint) for why only `stop` and `max_tokens` qualify.
+
+## rule A stop sequence is excluded from the answer
+OpenAI semantics: the text is cut **before** the match, and the reason is
+`end_turn` — the model stopped where it was told to, it did not run out.
+
+# data estimateTokens {#token_estimate}
+
+`Math.ceil(text.length / 4)`. Deliberately crude and documented as such: the agent
+picks the model, so no tokenizer here can be correct. `max_tokens` is a budget, not
+an accountant. Do not replace this with a real tokenizer without also deciding which
+model's tokenizer it is supposed to be.
+
+# rule Response builders never invent fields {#response_shape}
+
+`completion`, `chunk` and `usageChunk` emit exactly what OpenAI emits, plus
+`reasoning_content` and `x_acp2api` — both omitted entirely when empty rather than
+sent as `""` or `[]`. An unknown future ACP stop reason maps to `"stop"`, never to
+an invalid `finish_reason` that a strict client would reject.
+
+# test openai
+
+- a single user turn passes through with no scaffolding
+- system and developer messages are prepended, not labelled
+- a multi-turn history becomes a labelled transcript
+- content part arrays flatten; data-URI images become image blocks
+- `file`/`input_file` parts become resource blocks: text inline, binary as blob
+- `file_id` and remote `image_url` are refused rather than fetched
+- malformed requests (no messages, no role, system-only, no model) are rejected
+- `parseChatRequest` surfaces `stream`, `includeUsage`, `maxTokens`, `stop`, `ignored`
+- `max_completion_tokens` wins over `max_tokens`; both validated as positive integers
+- `makeLimiter` returns null when unconstrained; cuts before a stop sequence; truncates on budget
+- stop reasons map to `finish_reason`, and an unknown one maps to `"stop"`
+- `reasoning_content` and `x_acp2api` are absent, not empty, when there is nothing to report
+- usage maps ACP token names to OpenAI's, including reasoning tokens

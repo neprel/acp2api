@@ -1,0 +1,114 @@
+# hint.lock — managed by `hint lock`. Records which specs have been generated so
+# unchanged specs can be skipped. Deterministic and diff-friendly; do not edit by hand.
+version: 2
+files:
+  bin/acp2api.js:
+    hash: 9d7999477a9acb8a5b5c2465c598dc0a7c5188b7ee06af506673a29c0065636e
+    target: d138996faf0c8f6538f39e03e1563839f49a2a4007c5587c7bfaf6b7b1e28448
+    blocks:
+      goal Fail before binding, or run predictably: feeb79f4bf5b72fd71f75b023868d077e10714a7de2e05c564b970891c48a336
+      scope What this module owns: 62e4db39d183e3ce20945fca7d48a9cc90d5d6159c3d8e20cc368cc1a72dcc24
+      ui Command line: 9c7cb04dd316465f852e667f0dc4abc195b0f0efe6bd567c547106029ae70e0b
+      ui Command line > rule Exit codes: 47f51cd36afb2e6263c1721782cd116277df07744e4e6a225b48f59c64ec79a8
+      rule --check must exercise the real path: 9f510befe17832ef2b9a37d094cd91615ffe280f319c79d3377ac3f96d7baa1e
+      invariant The workspace exists before the first request: 7bc4e0a7e4d8a1bf3b5dea255ee08b1deea9a4f8b2449964eea2fbe970139e1a
+      rule Shutdown closes the server, which closes the agents: b92bfc1f2f9037c96eb91548528658729c4ff276ab05d018e3d7e20e5fd37aeb
+      good Log lines are timestamped, levelled, and go to the right stream: 59a657734c4d5ecad6a14e8e9b3c1f7d9ca3147793d84ce744a878064d371c0a
+  src/agent.js:
+    hash: 822b2f28e46f6d37c8db232e2b585a5b9bfc65eac36a48e024d9364d9d0ea891
+    target: c916af7a9a65f36e673207a98d822c3bb855693dba3cc1fac808e1c6ce04a572
+    blocks:
+      goal Own the ACP conversation, and translate its failures into decisions: f1748034d7b9cc98fec9f905ed912b7b3ffcba51862abaa7f1d18186e35e457d
+      scope What this module owns: 40b50b7b8b5f695a1d21b557fabe7bdc926f6acdf8e27f601f89c0d66b1a7ec2
+      func prompt: a8c85482a6f97dd275ccc596d5304db240884ba4ca427d422f923aaa92872b9f
+      func prompt > arg blocks: 8b663093e4a1f065659329c26353f541e8e66870a75bc3f244a4de2f1e1ffcdd
+      func prompt > arg options.signal: 44231df3c8b8f8175674f96ed27d0b15ae696b76752a1c5b2e06a491404b3dec
+      func prompt > arg options.onEvent: aaa0cd325e890a2cf30dc296d4489d831ac4a51b736475f5b18fea3728bcd3eb
+      func prompt > arg options.limit: efbc7136bba0a7f01c8105092881368a8ee9335553a7b96cd7b814afddb995ce
+      func prompt > result: 912944c426fbaaf27fa2dac5c8dc1482eaabe0e6c0b12c3259393298d1b922ca
+      func prompt > error AgentError: e1a6be2331fa37916cf348be9f1422dedf71dd47ddda1d46b4cad38f77a8948a
+      func prompt > flow: 159731b03b1d490981e904c9b95cb055d0c276237556ab21a4c3deca992970dc
+      invariant tool_call updates are progress, never content: b3583269d03819788fd27ab473d3b9daf23c71292164e544c2d038ba2b9367c1
+      invariant A dead child never takes the server down: ee9fe862b4cacdec6e0bffa0cd3344a66369406730433ee2f497b7168e830668
+      bad Never widen the 429 net to catch an unfamiliar error: bf6aec90b624c1f5bb150271f2b5ffdd4749f783c5b19b12ceb5b19b7344c1d7
+      test agent: 5f2da2c01361d82f117a355317df26f5aa4d82f826ff7d5e0ebb825a68703079
+  src/config.js:
+    hash: 55a3d5b834c5e9be929f8b5ce8bba99523c3cbdae235f796ffff82d62874d275
+    target: 59b4e2c197c28fa944da5d31c083c3fcaa0c1da075c2b478ad1bbc6daf79f2ee
+    blocks:
+      goal The config is the only place a deployment is described: af23a4e57ba6ede9b91abce9a3beb5a9ec005c1612407915c34abd46bcbf1e66
+      scope What this module owns: 74bd7c9119676ca047f283e751cdd2196590d949c65d743c15133684ba55794c
+      invariant Validation is total: 385a19b1b0575296c9245e12fe4b73cb634dbd40edfb9b95aad7d676797f4b84
+      func normalizeConfig: 7a857ea28dd029e610560059280ccd666ef0eb213185247a9c07e614dfe38afe
+      func normalizeConfig > arg raw: adb954f817848f7314a681dc0c2991442f0ed78fa792cfb7087a3cbf9dfe4044
+      func normalizeConfig > arg options.baseDir: e79e6730509257de82f716b6685e1961f0b7d75864cb96120b4ac8a987b59091
+      func normalizeConfig > arg options.env: e1f5e8fedf573c98b073b389bee5f6f7b01125a54dc01761a6c5d28c28f1dd15
+      func normalizeConfig > result: 8eb472c7f9ec9a45337d598aa02d0fd44daa977d2f27355e703004ab24d21cd0
+      func normalizeConfig > error ConfigError: 9405224d324be6875a82484cb056619be440f1094160eeb663858ee232691afe
+      rule ${VAR} expansion happens before validation, and yields strings: 6350d9519ef0bdabe6bf3ddca680300a0031007cc46ab405f6ac5df35db4b31a
+      func resolvePreset: 9a3d690c2c3c790a7b348c9a6b350cc7982553a7be2175af4474221859f2c805
+      func resolvePreset > result: f926b56161f7dba7d8e475992aec99d92937d0d2f5d663f7e719e36f5720ae61
+      func resolvePreset > invariant Resolution never throws: b7e0cda012128a1c7cf8397e381c874609292861d2687ee0a021b39cdf00809d
+      rule An explicit command bypasses preset resolution entirely: 295d885ca992e32df0ab34a87464dee2c88184753418ab14046a7a452fc58d36
+      test config: 301fcb9155e86554ae57ab007e32dd57685ab3538869f93bcb2d82412c3e664c
+  src/openai.js:
+    hash: 9b4a4f520b34854bcc2ae14ef3743eaabdd2f5a6b42377c966b0c580676fbfcd
+    target: d7e3ef958daf59d3956eff1769c4635885ecc058b0bf2ceb384d433ae74d28e0
+    blocks:
+      goal Translate between two shapes, and nothing else: 955663737f6dda9934717a4edb927f8f278384584f7e57a242a4d640466ffa89
+      invariant No I/O, ever: f12859433f466c77767b17812765fe9c13dee23832810b6d45f7635201cfd215
+      func toPromptBlocks: 811788d58bbd12aeb6d621cec53955dbe9efb3bfc57b564ea61f15fe4c802d10
+      func toPromptBlocks > arg messages: cf453aa267a06cdd5a415d709544522c04a53f5d01d56bffb9491f84a78b19d0
+      func toPromptBlocks > result: 0f63c9ccc21c90e21438d9fe4b8b8990ab65f0a9a26309865de7dd2b9592a8d3
+      func toPromptBlocks > flow: 40f58374469194ae7b5ae518c8fa476df662cf601183088289480e3e01e49b26
+      func toPromptBlocks > invariant A one-turn request produces the user's text unchanged: b52d97caff4234f0226dda506261f5af3beca4bc44055680ef7684bb9f705337
+      func makeLimiter: c8a303fa06f8f331bc1aa9742c911d6167f395ac6dfd7ce17bb865a194843f5c
+      func makeLimiter > result: 7b2f66348e7e7eebd4dbad15610f69b5f7e0337ce5dd1bace5611deddcdbd858
+      func makeLimiter > invariant The limiter is pure and idempotent: b6f80ab9357633ed636840286abdb88164c428947300b00dc969cb1d15f4a294
+      func makeLimiter > rule A stop sequence is excluded from the answer: b63d14c237182ab46fbbaa0f88e0bc75ae250c3dca5bc99394d2ba6e90e06fab
+      data estimateTokens: cfbdb61d1b3bfdfb1d9ea07c2a59d1b742ca1ea4a43a33125fc6541fddca701b
+      rule Response builders never invent fields: b9bb9fdb0b65d73123de4d37adb44355c36e9b20ac009ab7ed3e9df04fd5d13b
+      test openai: 34ecb8b24c6a066c79d1687ae7b3101f523fe9673302c6275828406e00f50596
+  src/params.js:
+    hash: 84674f744076d15120c7ceec88cd3e8c80f13ca1da9ecc6121b52fb5106e83df
+    target: 09357ee404a22a85a337c30876cc1f7a7d7c4f345e1a81a255ce1bafac9d7079
+    blocks:
+      goal Decide what an unsupportable OpenAI parameter costs: 95aed719999e8ffc178cb8dcffdcc99a75f45defd4d70f45e94b67a8017a73aa
+      invariant This module imports nothing: b343d1f6162a8d11aa03ead30649926dfec789b2ce3632a1a280ecccdca2e6da
+      invariant Every parameter is in exactly one bucket: b2069c1cb3c4f1c8f3cad841eae8006d72b964ad71cc6d8c5677ca2f7415211a
+      rule Adding support for a parameter is a bucket change, not an if: bd1875ec6c7a2a62b4e48e73655188f120e314b77c92e9494f34ad095e221c97
+      func classify: df2f5268fa9d4629fbc7c03fbc804bc96f73f38f7d971e522646550edb406c59
+      func classify > arg body: 47b0f442832b04925894f59132ad6eabb2770a747e23790d7a21a4c6f09ffff6
+      func classify > result: f5885c42acf6486b9c70eaae95ecff2fc9be252795979f683d53f1db991bd8fd
+      func report: d22733266027758e0bd68e112e746f6468b98ec6a522198d63fbd2ae9928f895
+      func report > arg model: 7dd866c91aff110f0e5e13388d8583a07d142b6ae2d2a9db57f71b4a6e339d58
+      func report > arg ignored: 5ce5dc8200a0bb7bacdfc89d2a4c901778600a0c70d542f9422018a84a0821e9
+      func report > result: ddd4589c25516b014ff577dd3b8bbb19d4562a9e89c357281f6da30e33dbc6f1
+      func report > error unsupported_parameter: ab3b911f85db63ce0aaa077b552ccec6a4031a2e056c079e9a9b6efc92ef7e06
+      func report > invariant One log line per (model, parameter), for the process lifetime: 2155c49d94cc3167d5d847bedede1da65795d2d022e459adb83242fca05fc5cd
+      test params: 6934ae20b74b08bf33ff4cc1ae388564728b881433ee9d2218b043b3f4ad4cd0
+  src/server.js:
+    hash: f6a1d2ea9c82a2ab7faa5a7bb3e68006deb94578fe43289e6e79f6791204a9a1
+    target: 8ed1f5a768423b4357450016efea8b4c379c362746adda4e9e2c924f4c989842
+    blocks:
+      goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
+      scope What this module owns: 4f3a55599f250c73bdede6f27753dd3f184438ae6d27c62c684102d7534f1869
+      ui Routes: be354e3c7ecaf7ca61e3f86707a7574853ec4fc5811e0e2ff8e3664d78ef613f
+      invariant Auth compares in constant time, on both header spellings: 7a863748e83adc88a3b83ea82f8cd2bed1fa96331bcc36c24f29ac839b0a774a
+      func handleCompletion: c5df34909a3b262b9c0fef2fd090d3d5857c547c7696385d773653582b130763
+      func handleCompletion > flow: 363b68bada0234d2fd3b2e085c49e34ba542fb774cd31e407b30ed6d62f2bcdb
+      func handleCompletion > invariant Timeout and disconnect are tracked separately: 937414eff0730a6f7d0eaa6d294f9ab4a93f9a48fd4067058456c090b754d8fd
+      rule Streaming headers are withheld until the agent produces something: 3116183bd31ba358d2935f24827d04acf7a3057f2129fbfd1ae5e3f7ddde26ff
+      rule Every response carries an OpenAI-shaped error body: 808711ce073af6f143deeb64fcd768d9989a1d1a6151df1fa486e0a9ca457c16
+      invariant Closing the server closes every agent: d847be6d32688ae17d96b605029185d6259baabafa429253900342a9e5d75c40
+      test server: 0b0b4d88623599ee329a0d9c793cd5578ede20927f89f0b93ca57631fd88728b
+  test/fixtures/fake-agent.js:
+    hash: 4500d80cf03189cc77c8ece8413212d95c65506f2f941da95a4cc2b0151bb5e3
+    target: 116ab69e4ad76cad1a733d62cc6e840e51dde33fe5ad5380b32aa1c820f50079
+    blocks:
+      goal Prove the wire, not the wiring: 17d265dbad00362dcd608b670dc28b0ade984644220a31e8f2371da95efebbce
+      rule Extend the fixture, never reach for a mocking library: 08d0b55afcfcf216eb1cec8ae8750fd24d0a760ff1de3414f8c461140563b5a1
+      rule Prompt keywords: 28cd18de392f73061a6f7fa5063fc1df47cb4074d7ddfcdde14575bc335ee80f
+      rule The option set must stay unstable: e06d9cce4804ae10874e332c9a046f90af88a0aacec5e0e88299c3d8d15344c6
+      invariant Every prompt turn is cancellable: b3056bee22af380502fa4a3f8c3b047b001681307ad6aba2647239f8ecd34415
+      invariant The fixture advertises what it implements: 4a88fef52b9955f68cc5be7226998476a9a7aa442b507f9f4022eabd89d8ee84
