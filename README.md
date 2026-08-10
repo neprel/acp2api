@@ -161,10 +161,30 @@ acp2api --config acp2api.yaml
 | --- | --- |
 | `GET /health` | no auth; lists the configured model ids |
 | `GET /v1/models` | OpenAI model list |
-| `POST /v1/chat/completions` | one stateless turn; `stream: true` gives SSE |
+| `POST /v1/chat/completions` | one turn; `stream: true` gives SSE |
 | `POST /v1/responses` | one turn of a **retained conversation** |
 | `GET /v1/responses/{id}` | a stored response |
 | `DELETE /v1/responses/{id}` | forget it |
+
+### Continuity: a stateless caller becomes a conversation
+
+The OpenAI API asks every client to resend its whole history each time. Taken
+literally that restarts the agent on every message — it re-reads a growing
+transcript and loses the working state it had built (its plan, its open files, its
+own subagents), which for an agent is most of what it knows.
+
+So an incoming history is matched against live sessions by longest prefix, and only
+the unheard tail is sent:
+
+```
+claude-haiku: new session for 1 message(s)
+claude-haiku: continuing session, 1 new of 3 message(s)
+```
+
+No client support is required — the caller stays stateless and the continuity
+happens here. A diverging history (edited, branched, trimmed) or a changed system
+prompt still gets a fresh session, because neither is a continuation. Disable with
+`server.continuity: false`.
 
 ### /v1/responses is the better fit
 
@@ -236,7 +256,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 96 tests, offline
+make test      # 103 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack

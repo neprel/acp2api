@@ -10,10 +10,11 @@ import {
   newCompletionId,
   parseChatRequest,
   RequestError,
+  toPromptBlocks,
   usageChunk,
 } from "./openai.js";
 import { parseResponsesRequest, responseObject, ResponseStream } from "./responses.js";
-import { newResponseId, SessionStore } from "./sessions.js";
+import { conversationKey, fingerprint, newResponseId, SessionStore } from "./sessions.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
@@ -88,7 +89,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
       }
 
       if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
-        return await handleCompletion(req, res, registry, config, log, params);
+        return await handleCompletion(req, res, registry, config, log, params, sessions);
       }
 
       if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
@@ -282,7 +283,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
 const timeoutError = (model, config) =>
   new AgentError(`${model}: no answer within ${config.server.requestTimeoutMs}ms`, 504, "timeout");
 
-async function handleCompletion(req, res, registry, config, log, params) {
+async function handleCompletion(req, res, registry, config, log, params, sessions) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
@@ -290,7 +291,7 @@ async function handleCompletion(req, res, registry, config, log, params) {
     throw e instanceof RequestError ? e : new RequestError(`invalid JSON body: ${e.message}`);
   }
 
-  const { model, blocks, stream, includeUsage, maxTokens, stop, ignored } = parseChatRequest(body);
+  const { model, stream, includeUsage, maxTokens, stop, ignored } = parseChatRequest(body);
   params.report(model, ignored);
   const limit = makeLimiter({ maxTokens, stop });
   const agent = registry.get(model);
@@ -325,14 +326,41 @@ async function handleCompletion(req, res, registry, config, log, params) {
   const timeout = () =>
     new AgentError(`${model}: no answer within ${config.server.requestTimeoutMs}ms`, 504, "timeout");
 
+  // Continuity: reuse the session that already heard the start of this history and
+  // send only what is new. Without it a stateless caller -- which is what the OpenAI
+  // API asks every client to be -- restarts the agent on every message.
+  const { systemId, turns, prefix } = conversationKey(body.messages);
+  const match = config.server.continuity ? sessions.matchPrefix(model, systemId, prefix) : null;
+  let convId = match?.convId ?? null;
+  let session = match?.session ?? null;
+  const opened = !session;
+
+  // Only the turns the session has not heard. The preamble goes with the session,
+  // so it is sent once, when the session opens.
+  const fresh = turns.slice(match?.matched ?? 0);
+  const blocks = toPromptBlocks(
+    opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
+  );
+
   try {
+    if (opened) {
+      await sessions.prune(registry);
+      session = await agent.openSession();
+      convId = sessions.open(model, session, { systemId, prefix });
+      log("info", `${model}: new session for ${prefix.length} message(s)`);
+    } else {
+      log("info", `${model}: continuing session, ${fresh.length} new of ${prefix.length} message(s)`);
+    }
+    sessions.setBusy(convId, true);
+
     if (!stream) {
-      const turn = await agent.prompt(blocks, { signal: controller.signal, limit });
+      const turn = await agent.turn(session, blocks, { signal: controller.signal, limit });
       if (clientGone) return res.end();
       // ACP reports cancellation as an ordinary stop reason, so without this a
       // timed-out turn would return 200 with whatever partial text it had -- which
       // a router downstream would count as success.
       if (timedOut) throw timeout();
+      remember(sessions, convId, prefix, turn.text);
       return send(res, 200, completion({ ...meta, ...turn, ignored }));
     }
 
@@ -352,7 +380,7 @@ async function handleCompletion(req, res, registry, config, log, params) {
       write(res, chunk({ ...meta, delta: { role: "assistant", content: "" } }));
     };
 
-    const turn = await agent.prompt(blocks, {
+    const turn = await agent.turn(session, blocks, {
       signal: controller.signal,
       limit,
       onEvent: (e) => {
@@ -369,6 +397,7 @@ async function handleCompletion(req, res, registry, config, log, params) {
     // Nothing was streamed yet, so the status is still ours to choose.
     if (timedOut && !started) throw timeout();
 
+    remember(sessions, convId, prefix, turn.text);
     start(); // an empty turn still owes the client a well-formed stream
     // Mid-stream there is no status left to change, so say "length": the answer is
     // genuinely truncated, and that is the closest honest finish_reason.
@@ -377,6 +406,10 @@ async function handleCompletion(req, res, registry, config, log, params) {
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (e) {
+    // A session that never answered has heard messages nobody can account for, so
+    // it must not be offered to the next request. A brand new one goes entirely.
+    if (convId) await sessions.discard(convId, registry);
+    convId = null;
     if (clientGone) {
       log("warn", `${model}: client disconnected`);
       return res.end();
@@ -389,7 +422,23 @@ async function handleCompletion(req, res, registry, config, log, params) {
     throw e;
   } finally {
     clearTimeout(timer);
+    if (convId) sessions.setBusy(convId, false);
   }
+}
+
+/**
+ * Records what the session has now heard: the history it was given, plus the answer
+ * it produced -- because that answer comes back as an `assistant` message in the
+ * next request, and a prefix stopping short of it would resend it.
+ *
+ * If the caller alters that text (redaction, truncation) the fingerprint will not
+ * match, and the shorter prefix wins instead: one redundant message, not a wrong
+ * conversation. That graceful step down is why matching is by longest prefix rather
+ * than by exact bookkeeping.
+ */
+function remember(sessions, convId, prefix, text) {
+  if (!convId) return;
+  sessions.extendPrefix(convId, [...prefix, fingerprint({ role: "assistant", content: text })]);
 }
 
 const finishOf = (stopReason) =>

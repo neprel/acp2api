@@ -152,6 +152,105 @@ test("a tool-sending agent framework is answered, not rejected", async (t) => {
   assert.deepEqual(body.x_acp2api.ignored, ["temperature", "tool_choice", "tools"]);
 });
 
+test("a growing history continues one session and sends only what is new", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  // The fixture echoes both its session id and the prompt it was handed, so this
+  // asserts what the agent actually saw rather than what we hoped it saw.
+  const first = await said(await ask([{ role: "user", content: "ECHOSESSION one" }]));
+  assert.match(first, /^s1/);
+
+  const second = await said(
+    await ask([
+      { role: "user", content: "ECHOSESSION one" },
+      { role: "assistant", content: first },
+      { role: "user", content: "ECHOSESSION two" },
+    ]),
+  );
+  // Same session: the agent kept whatever state it had built up.
+  assert.match(second, /^s1/);
+});
+
+test("continuity resends nothing the session has already heard", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  const first = await said(await ask([{ role: "user", content: "one" }]));
+  const seen = await said(
+    await ask([
+      { role: "user", content: "one" },
+      { role: "assistant", content: first },
+      { role: "user", content: "two" },
+    ]),
+  );
+  // The fixture echoes the prompt text it received. Only the new turn is in it --
+  // no "one", and no replay of the answer we ourselves produced.
+  assert.match(seen, /two/);
+  assert.ok(!seen.includes("one"), `expected only the new turn, got ${JSON.stringify(seen)}`);
+});
+
+test("a diverging history starts a fresh session rather than guessing", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  await ask([{ role: "user", content: "ECHOSESSION one" }]);
+  // Same length, different content: this is a different conversation, not a
+  // continuation, and reusing the session would put the agent in someone else's.
+  const other = await said(await ask([{ role: "user", content: "ECHOSESSION elsewhere" }]));
+  assert.match(other, /^s2/);
+});
+
+test("a changed system prompt is a different brief, not a continuation", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  const sys = (text) => ({ role: "system", content: text });
+  const first = await said(await ask([sys("be terse"), { role: "user", content: "ECHOSESSION one" }]));
+  assert.match(first, /^s1/);
+
+  const history = [
+    { role: "user", content: "ECHOSESSION one" },
+    { role: "assistant", content: first },
+    { role: "user", content: "ECHOSESSION two" },
+  ];
+  assert.match(await said(await ask([sys("be terse"), ...history])), /^s1/);
+  // Same conversation, different standing brief. Continuing under the old one would
+  // let the agent go on following instructions it is no longer given.
+  assert.match(await said(await ask([sys("be verbose"), ...history])), /^s2/);
+});
+
+test("continuity: false restores a fresh session per request", async (t) => {
+  const call = await start(t, { server: { continuity: false } });
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  const first = await said(await ask([{ role: "user", content: "ECHOSESSION one" }]));
+  const second = await said(
+    await ask([
+      { role: "user", content: "ECHOSESSION one" },
+      { role: "assistant", content: first },
+      { role: "user", content: "ECHOSESSION two" },
+    ]),
+  );
+  assert.match(first, /^s1/);
+  assert.match(second, /^s2/);
+});
+
+test("a failed turn does not leave its session to be continued", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+
+  assert.equal((await ask([{ role: "user", content: "BOOM" }])).status, 502);
+  // A session that never answered has heard messages nobody can account for.
+  const after = await (await ask([{ role: "user", content: "ECHOSESSION next" }])).json();
+  assert.match(after.choices[0].message.content, /^s2/);
+});
+
 test("response_format is still a 400", async (t) => {
   const call = await start(t);
   const res = await call(
@@ -289,7 +388,9 @@ test("an agent error carrying no status still yields a 500-class response", asyn
   const boom = {
     name: "stub",
     spec: { type: "general" },
-    prompt: async () => {
+    openSession: async () => ({ id: "s", options: [] }),
+    closeSession: async () => {},
+    turn: async () => {
       throw new AgentError("upstream said no", 502, "agent_error");
     },
     close: () => {},

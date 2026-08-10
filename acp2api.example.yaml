@@ -47,6 +47,13 @@ server:
   maxSessions: 100
   sessionTtlMs: 3600000
 
+  # Reuse the session that already heard the start of an incoming history and send
+  # only what is new. The OpenAI API asks every client to be stateless, so without
+  # this an agent restarts on every message: it re-reads a growing transcript and
+  # loses its working state. A diverging history, or a changed system prompt, still
+  # gets a fresh session. Set false for a strictly stateless server.
+  continuity: true
+
 agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus

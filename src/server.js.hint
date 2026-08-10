@@ -10,8 +10,8 @@ success are in [_.hint#silent_success](../_.hint).
 In: routing, authentication, body limits, SSE framing, the timeout and
 client-disconnect distinction, and turning errors into OpenAI-shaped bodies.
 
-Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest` and
-`Agent.prompt` and does no shape work of its own.
+Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest`,
+`Agent.openSession`/`turn` and the session store, and does no shape work of its own.
 
 # ui Routes
 
@@ -19,7 +19,7 @@ Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest` and
 | --- | --- | --- | --- |
 | GET | `/health` | none | liveness plus the configured model ids |
 | GET | `/v1/models`, `/models` | yes | OpenAI model list |
-| POST | `/v1/chat/completions`, `/chat/completions` | yes | one stateless turn |
+| POST | `/v1/chat/completions`, `/chat/completions` | yes | one turn, continuing a session when the history extends one |
 | POST | `/v1/responses`, `/responses` | yes | one turn of a retained conversation |
 | GET | `/v1/responses/{id}` | yes | a stored response |
 | DELETE | `/v1/responses/{id}` | yes | forget it, closing the session if it was the last |
@@ -47,6 +47,11 @@ about it at startup. That is a deployment choice, not an accident to guess at.
 5. Arm the timeout and the disconnect watcher.
 6. Run the turn, streaming or not.
 7. Translate the outcome.
+
+## invariant A session that never answered is discarded
+It has heard messages nobody can account for, so offering it to the next request
+would put the agent in a conversation that half-happened. See
+[sessions.js.hint#continuity](./sessions.js.hint).
 
 ## invariant Timeout and disconnect are tracked separately
 They need opposite answers: a timeout owes the caller 504, a vanished client owes it
@@ -99,9 +104,13 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - a quota failure is 429 **even on a streaming request** — the header-deferral test
 - an unrelated failure is 502; an unknown model is 404 naming what is available
 - `temperature` returns 200 and reports itself in `x_acp2api.ignored`
-- `tools` is 400 and the message points at `mcpServers`
+- a tool-sending client is answered, and its `tools` reported as ignored
 - `unsupportedParams: error` turns the ignorable ones into 400 as well
 - `max_tokens` finishes with `length`; `stop` cuts the text and finishes with `stop`
+- a growing history continues one session and sends only the new turn
+- a diverging history, and a changed system prompt, each start a fresh session
+- `continuity: false` restores a fresh session per request
+- a failed turn leaves no session to be continued
 - a timeout is 504, not a truncated 200
 - malformed bodies are 400 with an OpenAI-shaped error; unknown routes are 404
 - closing the server closes every agent

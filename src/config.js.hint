@@ -93,4 +93,5 @@ Merging the two would silently append adapter flags to someone's custom binary.
 - numeric strings from `${VAR}` coerce for `port`/`requestTimeoutMs`, but `"http"` still fails
 - `limitPatterns` compile case-insensitively and replace the default list when given
 - MCP mappings convert to `[{name, value}]`; stdio gets `args`/`env` even when omitted
+- `continuity` accepts a boolean, and a "false"/"0" string from ${VAR}
 - `loadConfig` prefixes errors with the file path and reports an unreadable file

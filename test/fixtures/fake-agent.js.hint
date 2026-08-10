@@ -25,6 +25,7 @@ The prompt text selects the behaviour, so a test asks for the failure it wants.
 | `REFUSE` | completes with `stopReason: "refusal"` | stop-reason mapping |
 | `COUNT` | streams 20 words, checking the abort each one | `max_tokens` and `stop` |
 | `ECHOMCP` | answers with the `mcpServers` it received | that MCP config reaches `session/new` |
+| `ECHOSESSION` | answers with its own session id | which session a turn actually ran in |
 | anything else | echoes after a thought chunk and a tool call | the ordinary path |
 
 Adding a keyword means adding a row here. A branch nobody can find from this table
@@ -39,6 +40,12 @@ caught that bug precisely because the fixture was stable at the time.
 
 Likewise the reasoning option is named `effort`, not `reasoning`, so that selection
 by category is genuinely exercised rather than accidentally matching an id.
+
+# invariant Session ids are monotonic, never reused {#unique_ids}
+
+Derived from a counter, not from the live session count. With ids that come round
+again after a close, a test asserting "this is a *different* session" passes by
+accident — which is exactly what happened while the continuity tests were written.
 
 # invariant Every prompt turn is cancellable {#cancellable}
 

@@ -16,6 +16,36 @@
  * shutdown.
  */
 
+import { createHash } from "node:crypto";
+
+/**
+ * Fingerprints one OpenAI message.
+ *
+ * Covers exactly the fields that make a turn what it is. `content` alone is not
+ * enough: an assistant turn that only called tools has `content: null`, and two
+ * different tool results can share a `tool_call_id` across branches.
+ */
+const digest = (parts) => createHash("sha256").update(JSON.stringify(parts)).digest("base64url").slice(0, 22);
+
+export const fingerprint = (m) =>
+  digest([m?.role ?? null, m?.content ?? null, m?.tool_calls ?? null, m?.tool_call_id ?? null, m?.name ?? null]);
+
+/**
+ * Splits messages into the standing preamble and the conversation.
+ *
+ * System and developer messages are session IDENTITY, not turns: they are sent once
+ * when the session opens. The conversation is what grows, and what a later request
+ * can extend.
+ */
+export function conversationKey(messages) {
+  const system = [];
+  const turns = [];
+  for (const m of messages ?? []) {
+    (m?.role === "system" || m?.role === "developer" ? system : turns).push(m);
+  }
+  return { systemId: digest(system.map(fingerprint)), turns, prefix: turns.map(fingerprint) };
+}
+
 let counter = 0;
 const nextId = (prefix) => `${prefix}_${Date.now().toString(36)}${(counter++).toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 
@@ -37,15 +67,63 @@ export class SessionStore {
   }
 
   /** Starts a conversation around a freshly opened session. Returns its id. */
-  open(agentName, session) {
+  open(agentName, session, { systemId = null, prefix = [] } = {}) {
     const convId = nextId("conv");
     this.#conversations.set(convId, {
       agentName,
       session,
       responses: new Set(),
       lastUsed: this.now(),
+      // Continuity state: what this session has already been told.
+      systemId,
+      prefix: [...prefix],
+      busy: false,
     });
     return convId;
+  }
+
+  /**
+   * Finds a live session this history CONTINUES, and says how much of it the
+   * session has already heard.
+   *
+   * This is what turns a stateless caller into a continuous conversation. A client
+   * that resends its whole history every time (which is what the OpenAI API asks
+   * for) otherwise gets a cold agent each turn: it re-reads a growing transcript and
+   * loses whatever working state it had built up.
+   *
+   * Matching is by longest prefix, because that is the most specific continuation.
+   * A history that diverges -- edited, branched, trimmed -- simply matches nothing
+   * and gets a fresh session, which is the correct answer rather than a fallback.
+   */
+  matchPrefix(agentName, systemId, prefix) {
+    let best = null;
+    for (const [convId, conv] of this.#conversations) {
+      // A session serves one turn at a time; handing a second turn to a busy one
+      // would interleave two conversations inside the agent.
+      if (conv.busy || conv.agentName !== agentName || conv.systemId !== systemId) continue;
+      // The standing preamble is part of identity: a changed system prompt is a
+      // different brief, and continuing under the old one would be a lie.
+      if (conv.prefix.length > prefix.length) continue;
+      if (!conv.prefix.every((fp, i) => fp === prefix[i])) continue;
+      if (!best || conv.prefix.length > best.matched) best = { convId, conv, matched: conv.prefix.length };
+    }
+    if (!best) return null;
+    best.conv.lastUsed = this.now();
+    return { convId: best.convId, session: best.conv.session, matched: best.matched };
+  }
+
+  /** Records what a session has now heard, so the next request can extend it. */
+  extendPrefix(convId, prefix) {
+    const conv = this.#conversations.get(convId);
+    if (!conv) return;
+    conv.prefix = [...prefix];
+    conv.lastUsed = this.now();
+  }
+
+  /** Marks a conversation as serving a turn, so no other request joins it. */
+  setBusy(convId, busy) {
+    const conv = this.#conversations.get(convId);
+    if (conv) conv.busy = busy;
   }
 
   /** Resolves a response id to its conversation, or null. Refreshes its TTL. */
@@ -96,12 +174,15 @@ export class SessionStore {
    * continuing must outlive an abandoned one started later.
    */
   async prune(agents) {
+    // A busy conversation is mid-turn: closing it would cancel work already paid
+    // for and leave the caller with nothing.
     const cutoff = this.now() - this.ttlMs;
     for (const [convId, conv] of this.#conversations) {
-      if (conv.lastUsed < cutoff) await this.#close(convId, "expired", agents);
+      if (!conv.busy && conv.lastUsed < cutoff) await this.#close(convId, "expired", agents);
     }
+    const idle = [...this.#conversations.entries()].filter(([, c]) => !c.busy);
     if (this.#conversations.size <= this.max) return;
-    const byAge = [...this.#conversations.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    const byAge = idle.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
     for (const [convId] of byAge.slice(0, this.#conversations.size - this.max)) {
       await this.#close(convId, "evicted", agents);
     }

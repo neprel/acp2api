@@ -26,6 +26,37 @@ The one that is easy to miss: a turn that **fails before producing a response**
 leaves a conversation no id points at. `discard` exists for exactly that, and
 `server.js` calls it on the error path.
 
+# rule Continuity turns a stateless caller into a conversation {#continuity}
+
+The OpenAI API asks every client to be stateless: resend the whole history, every
+time. Taken literally that restarts the agent on each message — it re-reads a
+growing transcript and loses the working state it had built up, which for an agent
+(a plan, open files, its own subagents) is most of what it knows.
+
+So an incoming history is matched against live sessions by **longest prefix**, and
+only the unheard tail is sent. Three properties make this safe rather than clever:
+
+- **Divergence matches nothing.** An edited, branched or trimmed history simply
+  fails to match and gets a fresh session. That is the correct answer, not a
+  fallback — reusing a session there would drop the agent into a conversation that
+  never happened.
+- **The preamble is identity, not a turn.** System and developer messages are sent
+  once, when the session opens, and a changed preamble prevents a match: continuing
+  under a brief the caller has withdrawn would be a lie.
+- **A busy session is never joined.** One session serves one turn; a second request
+  would interleave two conversations inside the agent, and eviction must not close
+  work already paid for.
+
+The recorded prefix includes the answer we produced, because it comes back as an
+`assistant` message next time. If the caller alters that text — redaction,
+truncation — the fingerprint stops matching and the shorter prefix wins: one
+redundant message, not a wrong conversation. That graceful step down is the reason
+for longest-prefix matching rather than exact bookkeeping.
+
+Reuse is logged. Silence would be the failure mode otherwise: a caller whose
+preamble carries a timestamp would never match, continuity would quietly never
+happen, and nothing would say so.
+
 # rule Eviction is by last use, never by age {#lru}
 
 A long conversation someone is actively continuing must outlive an abandoned one
@@ -52,3 +83,6 @@ held, because this module must not depend on the agent layer.
   refreshed old one survives while a newer idle one goes
 - forgetting one response of a chain keeps the conversation; forgetting the last closes it
 - `find` resolves any response in a chain to the same session
+- a growing history continues one session; only the unheard tail is sent
+- a diverging history, and a changed system preamble, each start a fresh session
+- a busy conversation is neither matched nor evicted

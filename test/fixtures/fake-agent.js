@@ -30,6 +30,7 @@ const EFFORTS = [
 ];
 
 const sessions = new Map();
+let opened = 0;
 
 const optionsFor = (state) => [
   { id: "model", name: "Model", category: "model", type: "select", currentValue: state.model, options: MODELS },
@@ -49,7 +50,10 @@ const app = acp
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
-    const sessionId = `s${sessions.size + 1}`;
+    // Monotonic, NOT derived from the live count: ids must never be reused after a
+    // session closes, or a test asserting "this is a different session" passes by
+    // accident when the id happens to come round again.
+    const sessionId = `s${++opened}`;
     const state = { model: "fast", effort: "low", verbose: false, mcp: params.mcpServers ?? [] };
     sessions.set(sessionId, state);
     return { sessionId, configOptions: optionsFor(state) };

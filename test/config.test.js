@@ -80,6 +80,13 @@ test("numbers that arrive as strings from ${VAR} are coerced", () => {
   assert.throws(() => load({ ...minimal, server: { port: "${P}" } }, { P: "http" }), /port/);
 });
 
+test("continuity is a boolean, and accepts a string from ${VAR}", () => {
+  assert.equal(load(minimal).server.continuity, true);
+  assert.equal(load({ ...minimal, server: { continuity: "false" } }).server.continuity, false);
+  assert.equal(load({ ...minimal, server: { continuity: "${C}" } }, { C: "0" }).server.continuity, false);
+  assert.throws(() => load({ ...minimal, server: { continuity: 1 } }), /continuity must be true or false/);
+});
+
 test("limitPatterns compile to case-insensitive regexes and can be replaced", () => {
   const d = load(minimal);
   assert.ok(d.server.limitPatterns.some((re) => re.test("Claude USAGE LIMIT reached")));

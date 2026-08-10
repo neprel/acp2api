@@ -3,7 +3,7 @@
 version: 2
 files:
   bin/acp2api.js:
-    hash: b62d8f2b96d7552f88890c3d175880281c0203eac54bc032d12742f62a8ca76d
+    hash: f6e52f5129279e6452fac75f98d3aa5b6bc821c5550f2e9530c1f59d9cb4a7b6
     target: d138996faf0c8f6538f39e03e1563839f49a2a4007c5587c7bfaf6b7b1e28448
     blocks:
       goal Fail before binding, or run predictably: feeb79f4bf5b72fd71f75b023868d077e10714a7de2e05c564b970891c48a336
@@ -15,7 +15,7 @@ files:
       rule Shutdown closes the server, which closes the agents: b92bfc1f2f9037c96eb91548528658729c4ff276ab05d018e3d7e20e5fd37aeb
       good Log lines are timestamped, levelled, and go to the right stream: 59a657734c4d5ecad6a14e8e9b3c1f7d9ca3147793d84ce744a878064d371c0a
   src/agent.js:
-    hash: fde3bfcbddc762946c43125d874dad5a4f95ddc1b4bc72fb9a78ecbb20d0200e
+    hash: 8966bbe90009a5368324ac0cdc75add1e5267a7009de91b7ba11ec56f52d12af
     target: 4b87a2d2b2cf2f8deafda9a34b2703d29a6115ef1e3aeff6852a5f12f4be7ed2
     blocks:
       goal Own the ACP conversation, and translate its failures into decisions: f1748034d7b9cc98fec9f905ed912b7b3ffcba51862abaa7f1d18186e35e457d
@@ -37,8 +37,8 @@ files:
       bad Never widen the 429 net to catch an unfamiliar error: bf6aec90b624c1f5bb150271f2b5ffdd4749f783c5b19b12ceb5b19b7344c1d7
       test agent: 5f2da2c01361d82f117a355317df26f5aa4d82f826ff7d5e0ebb825a68703079
   src/config.js:
-    hash: 373453386479aded40c648056af7f547048ea118fb488ccce8287bff70077400
-    target: 11e208f0970b4602e3e00fd565a17985709726c5753b4a433ec97a9959a65581
+    hash: ecfd1bec8890cd2b109ce1c9d1a68a8700a0f605b22457a7202410dad9dddbb6
+    target: 0fc0fe97f842bd9fe4ecafab9fb55c1e6d2645bf2e267bd49537dc6ab05240d0
     blocks:
       goal The config is the only place a deployment is described: af23a4e57ba6ede9b91abce9a3beb5a9ec005c1612407915c34abd46bcbf1e66
       scope What this module owns: 74bd7c9119676ca047f283e751cdd2196590d949c65d743c15133684ba55794c
@@ -54,9 +54,9 @@ files:
       func resolvePreset > result: f926b56161f7dba7d8e475992aec99d92937d0d2f5d663f7e719e36f5720ae61
       func resolvePreset > invariant Resolution never throws: b7e0cda012128a1c7cf8397e381c874609292861d2687ee0a021b39cdf00809d
       rule An explicit command bypasses preset resolution entirely: 295d885ca992e32df0ab34a87464dee2c88184753418ab14046a7a452fc58d36
-      test config: 301fcb9155e86554ae57ab007e32dd57685ab3538869f93bcb2d82412c3e664c
+      test config: a8e26c7be2eee11da955baa87496d535ae8fac9185c08f3d34cd7d7567161699
   src/openai.js:
-    hash: af516af4a11ba7b2a847070fa8e87f3d9c8183ad4ea437843fd4434eb1456c21
+    hash: c082d7d26b24334200c5f625cbea43c2a40e1a5a193662c602071566e7647c5e
     target: e41756e2faa85f483d3f2d54de58c7035dfbc54716010eac6dbb6eef3469cb53
     blocks:
       goal Translate between two shapes, and nothing else: 955663737f6dda9934717a4edb927f8f278384584f7e57a242a4d640466ffa89
@@ -75,7 +75,7 @@ files:
       rule Response builders never invent fields: b9bb9fdb0b65d73123de4d37adb44355c36e9b20ac009ab7ed3e9df04fd5d13b
       test openai: 8fc54179bfb4ebdc3990d781b071293547ab5559d404e723bfa03b752aa9a3df
   src/params.js:
-    hash: cead240b0d0215a5c4d11c129622a6c892f81dc613e9a52527f3bdd46f70b23f
+    hash: 230673153728ab5512ade03efb7b2b63f2890e4cbb5f8f3308e1b5d105745080
     target: 5bb3f247fc3619292d129a17713ea5779bcbab4a172d866760cb52241e8ff766
     blocks:
       goal Decide what an unsupportable OpenAI parameter costs: 95aed719999e8ffc178cb8dcffdcc99a75f45defd4d70f45e94b67a8017a73aa
@@ -94,7 +94,7 @@ files:
       func report > invariant One log line per (model, parameter), for the process lifetime: 2155c49d94cc3167d5d847bedede1da65795d2d022e459adb83242fca05fc5cd
       test params: ac2ab486800581c3caed7048dba0a9a916af97f500a3e57df74bc9fe2e2c39b3
   src/responses.js:
-    hash: e49eb3fdad0b30d547449ddd195c10742e659a430675e5da4407e5149c598649
+    hash: e189b3ac4cf2c9e3b817f2fefe49167ea3eef6f98869be0f56623e8acf2c53cd
     target: d0788713eb5175b2c924fec48718c15bca4d8476af8cf80b82b7f1f8959817c3
     blocks:
       goal The surface that actually fits ACP: d395b4fdeea633ac8b4a04fa85c15b0b2f3a2d7165ca598e184f19a89d79b35f
@@ -110,8 +110,8 @@ files:
       rule The stream is ordered, and that ordering is the contract: 76a4e309bd422a7e20338d09b22d2824ccfbf2639c0e155c77439d5aadcdc3ee
       test responses: a02cbf4ce60c6c14514258ab32035123e8d23f0c4a4503318640d921afb88ea7
   src/server.js:
-    hash: 71faeb9d4622b9e8dcce45c2120c960e31518b8b14e23763d64383bf0ba47313
-    target: f4fa963ea05b04444d862e80235f22dafbf6dad1bd480c3691f2596f42dc6efc
+    hash: 36245c5b9f07916a26ac57d837a756c8efb83f25d0b8a6d008f8bf3df6e3198d
+    target: b364f7a9f5fa9434da00a235e8cc100c4e70bd29bfcb5100d4542e487934c544
     blocks:
       goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
       scope What this module owns: 4f3a55599f250c73bdede6f27753dd3f184438ae6d27c62c684102d7534f1869
@@ -119,6 +119,7 @@ files:
       invariant Auth compares in constant time, on both header spellings: 7a863748e83adc88a3b83ea82f8cd2bed1fa96331bcc36c24f29ac839b0a774a
       func handleCompletion: c5df34909a3b262b9c0fef2fd090d3d5857c547c7696385d773653582b130763
       func handleCompletion > flow: 363b68bada0234d2fd3b2e085c49e34ba542fb774cd31e407b30ed6d62f2bcdb
+      func handleCompletion > invariant A session that never answered is discarded: e6bc789e724c205ef5274911a620b4ca380cad0ffd9c0352f1bace47cd01fd08
       func handleCompletion > invariant Timeout and disconnect are tracked separately: 937414eff0730a6f7d0eaa6d294f9ab4a93f9a48fd4067058456c090b754d8fd
       rule Streaming headers are withheld until the agent produces something: 3116183bd31ba358d2935f24827d04acf7a3057f2129fbfd1ae5e3f7ddde26ff
       rule Every response carries an OpenAI-shaped error body: 808711ce073af6f143deeb64fcd768d9989a1d1a6151df1fa486e0a9ca457c16
@@ -126,26 +127,28 @@ files:
       func handleResponse > invariant A conversation is pinned to its agent: 9d3ec31344ff11e74bea866f319263fa432df4dd1ca6d449f89d02ec8217f7bc
       func handleResponse > invariant A failed first turn leaves nothing behind: 6ed4c657b23d4ea3dcf87dbf551fbaeafeffa2e0e2c6f4a58a5fd9b47adb59f4
       invariant Closing the server closes every agent: 315bc80e3612937b67068e06fdb2059752ccb7edda060e44e7497387159f04b9
-      test server: 0b0b4d88623599ee329a0d9c793cd5578ede20927f89f0b93ca57631fd88728b
+      test server: b143ce9eae9be8111d3d70001ff048046882b46f626a79bb8173c8f5ac6911ea
   src/sessions.js:
-    hash: 68462d5787d8e5ad21507ddc9de42182a1d24f7a4beb27b21cf3ac10541d6850
-    target: ec02ef1b540ab60bd975b4b5d5e8e18c3fd19e9c32ac673990f66e48872164bb
+    hash: a4124a32113b0d7fbe5e28bf0587a5620a96daede934a6802b75e43221e0f381
+    target: 1f01489bc3fe64ab93a69b836c9d01383317a3871f37bee16f0471ec74da78a9
     blocks:
       goal Keep conversations alive without leaking logins: 21d91386497248afb75265c83c7e8844c46df84cd811f8d6d310d6b6af31273b
       invariant The unit of retention is a conversation, not a response: ec50861fa9dbcf1e5e4afe3d2fd2f68b4d8f9439dc442a68430ef69d387f1bea
       invariant Every path out of the store closes the ACP session: 4ce284435590a6314b850d4456b6ea16514958fed8d8b6d7e8c59af57186c84c
+      rule Continuity turns a stateless caller into a conversation: feadcdb906277505e8ebd06397d02112374e517c325759203db73243e07ab267
       rule Eviction is by last use, never by age: 031edd8a154852475376bb2b45e2829417cddfd8c367a9e0f76eadb936c80dba
       func prune: de3a0bbf6a714099aada126dcd8e451e2fc289380e6338a55aff2abe76e33b7c
       func prune > arg agents: d8422b3bcf479ebc8f5d12d6b672498c2900e731c1072b71127eb267dde4741e
       func prune > invariant No clock of its own: 6c9a7d4091d92c670d827c2f6c47075fc873a1200f8eb245e4d046ba06bd3396
-      test sessions: 0ba132a8ba82d5cc05915893c13eb3feab85d7a3b780828fab6d541270ebe3e4
+      test sessions: 572f10f715163cc6dad35d096ef310af641b239ec5ec06e07e0f66490feafc13
   test/fixtures/fake-agent.js:
-    hash: d42f8a461962de6eb81c48d7b363bd06b5ee018bdd1f123577f098b65827863b
-    target: dfe1f9f2602b55184baf6f1eb99061ead4fad64cb2f52a3a595b0cfcc5069f94
+    hash: 9d4975729a7d63c5e44d5ae8b5dd44697751ac6526b687a82af172771e69273d
+    target: 49042a6c426cc4549504cd5081a76347076c74541d827cc7daefec8aa51c60a6
     blocks:
       goal Prove the wire, not the wiring: 17d265dbad00362dcd608b670dc28b0ade984644220a31e8f2371da95efebbce
       rule Extend the fixture, never reach for a mocking library: 08d0b55afcfcf216eb1cec8ae8750fd24d0a760ff1de3414f8c461140563b5a1
-      rule Prompt keywords: 28cd18de392f73061a6f7fa5063fc1df47cb4074d7ddfcdde14575bc335ee80f
+      rule Prompt keywords: f478dbaa02dfdd839f7ab66dcdcb82084cf2a2cd43892ab2efcfb44702b6389b
       rule The option set must stay unstable: e06d9cce4804ae10874e332c9a046f90af88a0aacec5e0e88299c3d8d15344c6
+      invariant Session ids are monotonic, never reused: 566efd9c0feaf8f8b1991b01e586d71bae22a48826e8d80c703ba1b457c5e720
       invariant Every prompt turn is cancellable: b3056bee22af380502fa4a3f8c3b047b001681307ad6aba2647239f8ecd34415
       invariant The fixture advertises what it implements: 4a88fef52b9955f68cc5be7226998476a9a7aa442b507f9f4022eabd89d8ee84
