@@ -29,9 +29,29 @@ When something becomes implementable, move its name from `REFUSED`/`IGNORED` int
 the name behind. A parameter honoured in `server.js` but still listed as ignored
 reports a lie to the caller in `x_acp2api.ignored`.
 
-Promoting a name **out** of `REFUSED` requires that the implementation preserve the
-meaning the caller expects. `tools` may only leave that set when real `tool_calls`
-come back, not when tools are merely passed to the agent somehow.
+# decision Tool definitions moved from refused to ignored in 1.2.0 {#tools_ignored}
+
+The earlier rule here said `tools` could leave `REFUSED` only when real `tool_calls`
+came back. That rule is **superseded**, deliberately, and the reasoning is worth
+keeping because it will look like a regression otherwise.
+
+It assumed the caller had another way to get the work done, so a 400 merely
+redirected them. The deciding case is a client whose **only** model is an ACP agent:
+there the refusal left it with no brain at all, which is a worse answer than a
+one-step loop.
+
+What makes ignoring acceptable now is capability parity, not resignation. An ACP
+agent has its own tools, and the caller's own tool servers can be handed to it
+through `mcpServers` — so it *acts* rather than asking, and the work happens inside
+its loop instead of the caller's. What the caller loses is orchestration, not
+outcomes.
+
+The obligation that remains: tool calls and results already present in the history
+must be rendered faithfully — see
+[openai.js.hint#tool_history](./openai.js.hint). Dropping the definitions is a
+choice; garbling the record of what was already done is a bug.
+
+`response_format` stays refused: nothing gives the caller its guarantee back.
 
 # func classify {#classify}
 
@@ -66,8 +86,8 @@ line per call forever, and the interesting event is the first one.
 # test params
 
 - style parameters (`temperature`, `top_p`, `seed`) are ignored, never refused
-- contract parameters (`tools`, `tool_choice`, `response_format`, `functions`, `audio`) are refused
-- the `tools` refusal explains where tools actually come from (`mcpServers`)
+- tool definitions (`tools`, `tool_choice`, `functions`, `function_call`) are ignored, not refused
+- what remains contract-changing (`response_format`, `audio`, `modalities`) is still refused
 - `n: 1` and `n: null` pass; `n: 3` is refused
 - an unknown future field is ignored rather than refused
 - native and emulated names appear in neither list

@@ -34,21 +34,49 @@ export function toPromptBlocks(messages) {
   }
 
   const images = [];
+  // tool_call_id -> the name it was called with, so a result can say what it is
+  // the result OF. The `role: "tool"` message carries only the id.
+  const calledAs = new Map();
+
   const rendered = messages.map((m) => {
     if (!m || typeof m !== "object" || typeof m.role !== "string") {
       throw new RequestError("each message needs a `role` and `content`");
     }
-    return { role: m.role, text: contentToText(m.content, images) };
+    const text = contentToText(m.content, images);
+
+    // An assistant turn that called tools has `content: null` and the calls in a
+    // separate field. Rendered as text it was an empty "Assistant:" line -- the
+    // agent saw a silent turn where work had happened.
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const calls = m.tool_calls.map((c) => {
+        const name = c?.function?.name ?? "tool";
+        if (c?.id) calledAs.set(c.id, name);
+        return `[calls ${name}] ${c?.function?.arguments ?? "{}"}`;
+      });
+      return { role: "assistant", text: [text, ...calls].filter(Boolean).join("\n") };
+    }
+
+    // A tool result is not something the USER said. Labelling it "User:" told the
+    // agent a person had pasted the output, which is a different conversation.
+    if (m.role === "tool") {
+      const name = m.name ?? calledAs.get(m.tool_call_id) ?? "tool";
+      return { role: "tool", text: `[result of ${name}]\n${text}` };
+    }
+
+    return { role: m.role, text };
   });
 
   const system = rendered.filter((m) => m.role === "system" || m.role === "developer").map((m) => m.text);
   const turns = rendered.filter((m) => m.role !== "system" && m.role !== "developer");
   if (turns.length === 0) throw new RequestError("`messages` needs at least one user or assistant message");
 
+  // Tool results carry their own marker, so labelling them again would read as a
+  // speaker that does not exist.
+  const speaker = (role) => (role === "tool" ? null : role === "assistant" ? "Assistant" : "User");
   const body =
-    turns.length === 1
+    turns.length === 1 && turns[0].role === "user"
       ? turns[0].text
-      : turns.map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.text}`).join("\n\n");
+      : turns.map((m) => (speaker(m.role) ? `${speaker(m.role)}: ${m.text}` : m.text)).join("\n\n");
 
   const text = [...system, body].filter((s) => s.length > 0).join("\n\n");
   return [{ type: "text", text }, ...images];

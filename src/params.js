@@ -44,6 +44,20 @@ export const IGNORED = new Set([
   "store",
   "parallel_tool_calls",
   "prediction",
+  // Tool DEFINITIONS. Refused until 1.2.0, on the reasoning that a caller waiting
+  // for `tool_calls` would get prose instead. That reasoning assumed the caller had
+  // no other way to get the work done. It does: an ACP agent has its own tools, and
+  // can be handed the caller's own tool servers through `mcpServers` -- so it acts
+  // rather than asks, and the work happens inside its loop instead of the caller's.
+  //
+  // The deciding case: a client whose ONLY model is an ACP agent. Refusing here left
+  // it with no brain at all, which is a worse answer than a one-step loop. Tool
+  // definitions are therefore dropped, while tool calls and results already in the
+  // history are rendered faithfully -- see openai.js#toPromptBlocks.
+  "tools",
+  "tool_choice",
+  "functions",
+  "function_call",
 ]);
 
 /**
@@ -51,10 +65,6 @@ export const IGNORED = new Set([
  * the response MEANS, and the caller has no way to notice.
  */
 export const REFUSED = {
-  tools: "the agent runs its own tool loop and cannot return tool_calls; give it tools with `mcpServers` in the agent config instead",
-  tool_choice: "see `tools`",
-  functions: "deprecated by OpenAI, and see `tools`",
-  function_call: "deprecated by OpenAI, and see `tools`",
   response_format: "structured output is not implemented yet; it can only be emulated by prompting and validating",
   audio: "no ACP agent currently advertises the audio prompt capability",
   modalities: "text only",

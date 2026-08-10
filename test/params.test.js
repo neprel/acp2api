@@ -13,14 +13,17 @@ test("style-only parameters are ignored, not refused", () => {
   assert.deepEqual(refused, []);
 });
 
-test("contract-changing parameters are refused regardless of the setting", () => {
-  // Ignoring `tools` returns prose to a caller waiting for tool_calls, which breaks
-  // inside its own agent loop with no clue why. A 400 is kinder than that 200.
-  const { refused } = classify({ ...base, tools: [{ type: "function" }] });
-  assert.equal(refused.length, 1);
-  assert.equal(refused[0].key, "tools");
-  assert.match(refused[0].why, /mcpServers/);
-  for (const key of ["tool_choice", "response_format", "functions", "audio"]) {
+test("tool definitions are accepted and ignored, not refused", () => {
+  // Reversed in 1.2.0. An ACP agent has its own tools and can be handed the
+  // caller's through mcpServers, so it acts instead of asking -- and for a client
+  // whose only model IS an ACP agent, refusing left it with no brain at all.
+  const { ignored, refused } = classify({ ...base, tools: [{ type: "function" }], tool_choice: "auto" });
+  assert.deepEqual(refused, []);
+  assert.deepEqual(ignored, ["tool_choice", "tools"]);
+});
+
+test("parameters that would still change the meaning are refused", () => {
+  for (const key of ["response_format", "audio", "modalities", "web_search_options"]) {
     assert.equal(classify({ ...base, [key]: {} }).refused[0]?.key, key);
   }
 });
@@ -67,12 +70,13 @@ test("mode ignore is silent, mode error rejects", () => {
   });
 });
 
-test("parseChatRequest refuses contract-changing parameters with a reason", () => {
-  assert.throws(() => parseChatRequest({ ...base, tools: [] }), (e) => {
+test("parseChatRequest refuses what is left, and reports tools as ignored", () => {
+  assert.throws(() => parseChatRequest({ ...base, response_format: {} }), (e) => {
     assert.equal(e.status, 400);
-    assert.match(e.message, /`tools` is not supported/);
+    assert.match(e.message, /`response_format` is not supported/);
     return true;
   });
+  assert.deepEqual(parseChatRequest({ ...base, tools: [] }).ignored, ["tools"]);
 });
 
 test("parseChatRequest surfaces the emulated knobs and validates them", () => {

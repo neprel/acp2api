@@ -132,16 +132,54 @@ test("temperature is accepted, reported back, and does not fail the request", as
   assert.deepEqual(body.x_acp2api, { ignored: ["temperature", "top_p"] });
 });
 
-test("tools is a 400 that says where tools actually come from", async (t) => {
+test("a tool-sending agent framework is answered, not rejected", async (t) => {
+  // The shape a framework like Hermes sends on EVERY request: its whole toolset
+  // plus sampling knobs. Refusing left such a client with no usable model at all.
   const call = await start(t);
   const res = await call(
     "/v1/chat/completions",
-    chat({ model: "fake", messages: [{ role: "user", content: "hi" }], tools: [{ type: "function" }] }),
+    chat({
+      model: "fake",
+      messages: [{ role: "user", content: "hi" }],
+      temperature: 1,
+      tools: [{ type: "function", function: { name: "read_file", parameters: {} } }],
+      tool_choice: "auto",
+    }),
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.choices[0].message.content, "[fast] hi");
+  assert.deepEqual(body.x_acp2api.ignored, ["temperature", "tool_choice", "tools"]);
+});
+
+test("response_format is still a 400", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "hi" }], response_format: { type: "json_object" } }),
   );
   assert.equal(res.status, 400);
-  const { error } = await res.json();
-  assert.equal(error.code, "unsupported_parameter");
-  assert.match(error.message, /mcpServers/);
+  assert.equal((await res.json()).error.code, "unsupported_parameter");
+});
+
+test("a history with tool calls and results reaches the agent intact", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({
+      model: "fake",
+      messages: [
+        { role: "user", content: "fix it" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", function: { name: "recall", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "you prefer tabs" },
+      ],
+    }),
+  );
+  // The fixture echoes the prompt it received, so this asserts what the agent saw.
+  const seen = (await res.json()).choices[0].message.content;
+  assert.match(seen, /\[calls recall\]/);
+  assert.match(seen, /\[result of recall\]\nyou prefer tabs/);
+  assert.ok(!seen.includes("User: you prefer tabs"));
 });
 
 test("unsupportedParams: error turns the ignorable ones into 400 too", async (t) => {

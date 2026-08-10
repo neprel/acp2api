@@ -123,7 +123,8 @@ So parameters are split by **what breaks if we proceed**, not by what is support
 | `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (token counts are approximate; there is no tokenizer here) |
 | `stream_options.include_usage` | native |
 | `temperature`, `top_p`, `seed`, penalties, `logprobs`, unknown fields | **accepted and ignored.** Every client library sends `temperature` unasked; failing on it would reject nearly every real request over a difference the caller cannot perceive |
-| `tools`, `tool_choice`, `response_format`, `n > 1`, `audio` | **400.** Ignoring these changes what the answer *means* — a caller waiting for `tool_calls` gets prose and breaks inside its own loop with no clue why |
+| `tools`, `tool_choice`, `functions` | **accepted and ignored.** An ACP agent runs its own tool loop, so it acts rather than returning `tool_calls` — give it the same capabilities through `mcpServers` and the work still happens, just inside its loop. Tool calls and results already in the history are rendered faithfully |
+| `response_format`, `n > 1`, `audio` | **400.** Nothing gives the caller its guarantee back |
 
 Ignored parameters are never silent: they are logged once per (model, parameter)
 and echoed back on the response as `x_acp2api.ignored`, which no client trips over
@@ -235,7 +236,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 90 tests, offline
+make test      # 96 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack

@@ -44,7 +44,7 @@ back to the bare name when the adapter is absent, because it is optional.
 
 # build make
 
-`make test` (48 tests, offline), `make check` (validates the shipped example
+`make test` (offline, no subscription spent), `make check` (validates the shipped example
 config), `make verify` (`npm ci` + test + check + pack — the pre-publish gate).
 
 The npm account has 2FA, so publishing needs a one-time password that expires in
@@ -69,10 +69,14 @@ differ enough to need different handling:
 - **Style** — `temperature`, `top_p`, `seed`, penalties. Every client library sends
   them unasked, so a 400 would reject nearly every real request over a difference
   the caller cannot perceive. **Accept and ignore.**
-- **Contract** — `tools`, `tool_choice`, `response_format`, `n > 1`. Ignoring these
-  returns something that means the wrong thing; the caller waits for `tool_calls`,
-  gets prose, and breaks deep inside its own agent loop. **400, always**, even under
-  `unsupportedParams: ignore` — "succeed at the wrong thing" is not a mode.
+- **Contract** — `response_format`, `n > 1`, `audio`. Ignoring these returns
+  something that means the wrong thing, and nothing gives the caller its guarantee
+  back. **400, always**, even under `unsupportedParams: ignore` — "succeed at the
+  wrong thing" is not a mode.
+
+`tools` was in the second group until 1.2.0 and deliberately moved to the first; the
+reasoning is recorded in [src/params.js.hint#tools_ignored](src/params.js.hint) and
+is not a lapse.
 
 Unknown fields count as style: OpenAI adds parameters faster than any bridge tracks
 them, and failing on an unrecognised name would age badly.
@@ -96,7 +100,9 @@ quietly grew back to full length. Once cut, skip every update until the stop mes
 The agent runs its own tool loop and calls back into the client; it never returns
 tool calls for someone else to execute. So tools arrive as `mcpServers` on
 `session/new` and are fixed for the session's life. There is no per-request path,
-which is exactly why OpenAI's `tools` is refused rather than approximated.
+which is why OpenAI's `tools` cannot be honoured and is dropped — the caller's own
+tool servers reach the agent through `mcpServers` instead, so it acts rather than
+asks. See [src/params.js.hint#tools_ignored](src/params.js.hint).
 
 ACP wants `env` and `headers` as `[{name, value}]` arrays; the config accepts a
 mapping and converts. The stdio variant has **no `type` discriminator** and requires

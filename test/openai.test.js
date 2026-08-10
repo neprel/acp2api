@@ -47,6 +47,50 @@ test("content part arrays flatten, data: images become image blocks", () => {
   ]);
 });
 
+test("an assistant turn that called tools renders the calls, not an empty line", () => {
+  const [block] = toPromptBlocks([
+    { role: "user", content: "fix the bug" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a.js"}' } }],
+    },
+    { role: "tool", tool_call_id: "c1", content: "line one" },
+    { role: "assistant", content: "found it" },
+  ]);
+  assert.equal(
+    block.text,
+    [
+      "User: fix the bug",
+      "",
+      'Assistant: [calls read_file] {"path":"a.js"}',
+      "",
+      "[result of read_file]\nline one",
+      "",
+      "Assistant: found it",
+    ].join("\n"),
+  );
+});
+
+test("a tool result is attributed to the tool, never to the user", () => {
+  // Labelling it "User:" told the agent a person had pasted the output, which is a
+  // different conversation from the one that happened.
+  const [block] = toPromptBlocks([
+    { role: "user", content: "go" },
+    { role: "tool", tool_call_id: "unknown", name: "recall", content: "a fact" },
+  ]);
+  assert.match(block.text, /\[result of recall\]\na fact/);
+  assert.ok(!block.text.includes("User: a fact"));
+});
+
+test("an assistant turn with both text and calls keeps both", () => {
+  const [block] = toPromptBlocks([
+    { role: "user", content: "go" },
+    { role: "assistant", content: "reading it now", tool_calls: [{ id: "c", function: { name: "ls" } }] },
+  ]);
+  assert.match(block.text, /Assistant: reading it now\n\[calls ls\] \{\}/);
+});
+
 test("file parts become ACP resource blocks, text inline and binary as blob", () => {
   const text = Buffer.from("hello file").toString("base64");
   const [, res] = toPromptBlocks([

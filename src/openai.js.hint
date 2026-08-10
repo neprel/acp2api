@@ -36,6 +36,24 @@ followed by image and resource blocks in the order they appeared.
    only faithful option when the agent owns its own conversation state.
 5. System text is prepended, unlabelled.
 
+## rule Tool calls and results are conversation, and must read as such {#tool_history}
+
+Tool DEFINITIONS are dropped (see [params.js.hint#tools_ignored](./params.js.hint)),
+but calls and results that already happened are facts about the conversation and the
+agent needs them to understand where it is.
+
+Two renderings were wrong before 1.2.0 and are the reason this rule exists:
+
+- An assistant turn that called tools has `content: null`, so it rendered as an
+  empty `Assistant:` line — a silent turn where work had happened.
+- A `role: "tool"` message rendered as `User:` — telling the agent a *person* had
+  pasted that output, which is a different conversation from the one that occurred.
+
+So calls render as `[calls <name>] <arguments>` under their assistant turn, and
+results as `[result of <name>]` with **no speaker label**, since they were not
+spoken by anyone. The name for a result comes from the `tool_call_id` recorded when
+the call was rendered — the result message carries only the id.
+
 ## invariant A one-turn request produces the user's text unchanged
 Any added prefix, suffix or label on the single-turn path is a regression, however
 harmless it looks.
@@ -80,6 +98,8 @@ an invalid `finish_reason` that a strict client would reject.
 - `file`/`input_file` parts become resource blocks: text inline, binary as blob
 - `file_id` and remote `image_url` are refused rather than fetched
 - malformed requests (no messages, no role, system-only, no model) are rejected
+- an assistant turn with `tool_calls` renders the calls, and keeps its text if any
+- a tool result is attributed to the tool, never to the user
 - `parseChatRequest` surfaces `stream`, `includeUsage`, `maxTokens`, `stop`, `ignored`
 - `max_completion_tokens` wins over `max_tokens`; both validated as positive integers
 - `makeLimiter` returns null when unconstrained; cuts before a stop sequence; truncates on budget
