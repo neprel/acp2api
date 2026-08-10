@@ -185,15 +185,26 @@ export class Agent {
   /**
    * Runs one prompt turn.
    *
-   * `onEvent` receives `{type: "text"|"reasoning", delta}` as the agent streams, and
-   * is called before this resolves. Returns the accumulated turn.
+   * `onEvent` receives `{type: "text"|"reasoning"|"tool_call", ...}` as the agent
+   * streams, and is called before this resolves.
+   *
+   * `limit(text)` implements the OpenAI knobs ACP has no field for. It is consulted
+   * after every text chunk and returns a stop reason -- `"max_tokens"` or
+   * `"end_turn"` -- to cut the turn short, or a falsy value to continue. Cutting
+   * means cancelling the ACP turn, which is why this lives here rather than in the
+   * HTTP layer: a caller that stops reading does not stop the agent from working.
    */
-  async prompt(blocks, { signal, onEvent = () => {} } = {}) {
+  async prompt(blocks, { signal, onEvent = () => {}, limit = null } = {}) {
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
     const caps = init.agentCapabilities ?? {};
 
-    const session = await ctx.buildSession(this.#spec.cwd).start();
+    const builder = ctx.buildSession(this.#spec.cwd);
+    // Tools belong to the AGENT, not to the request: the agent runs its own tool
+    // loop, so MCP servers are declared once, when the session opens. There is no
+    // per-request equivalent, which is why OpenAI's `tools` cannot map onto this.
+    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+    const session = await builder.start();
     const onAbort = () => {
       ctx.notify(acp.methods.agent.session.cancel, { sessionId: session.sessionId }).catch(() => {});
     };
@@ -204,20 +215,48 @@ export class Agent {
 
       let text = "";
       let reasoning = "";
+      let cut = null; // stop reason imposed by `limit`, once it fires
       session.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
 
       for (;;) {
         const message = await session.nextUpdate();
         if (message.kind === "stop") {
-          return { text, reasoning, stopReason: message.stopReason, usage: message.response.usage ?? null };
+          return {
+            text,
+            reasoning,
+            // A turn cancelled by `limit` reports `cancelled`, which would reach the
+            // caller as an ordinary "stop". Report what actually happened instead.
+            stopReason: cut ?? message.stopReason,
+            usage: message.response.usage ?? null,
+          };
         }
+        // Once cut, drain to the stop message without accumulating anything more.
+        // Cancellation is not instant -- the agent keeps sending for a moment, and
+        // appending that would undo the truncation the caller asked for.
+        if (cut) continue;
+
         const u = message.update;
         if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text") {
+          const before = text.length;
           text += u.content.text;
+          const verdict = limit?.(text);
+          if (verdict) {
+            // `limit` may shorten the text -- a stop sequence is not part of the
+            // answer -- so emit only what survived, then cancel and drain.
+            cut = verdict.stopReason;
+            text = verdict.text;
+            if (text.length > before) onEvent({ type: "text", delta: text.slice(before) });
+            onAbort();
+            continue;
+          }
           onEvent({ type: "text", delta: u.content.text });
         } else if (u.sessionUpdate === "agent_thought_chunk" && u.content?.type === "text") {
           reasoning += u.content.text;
           onEvent({ type: "reasoning", delta: u.content.text });
+        } else if (u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update") {
+          // Progress only. These are the agent's OWN tool calls, already executed by
+          // it -- not OpenAI `tool_calls` for the caller to run and answer.
+          onEvent({ type: "tool_call", id: u.toolCallId, title: u.title, status: u.status, kind: u.kind });
         }
       }
     } catch (e) {

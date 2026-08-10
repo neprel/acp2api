@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Agent, AgentError, selectValues } from "../src/agent.js";
 import { normalizeConfig } from "../src/config.js";
+import { makeLimiter } from "../src/openai.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "fake-agent.js");
@@ -40,9 +41,11 @@ test("a prompt turn streams reasoning and text, then reports usage", async (t) =
   assert.equal(turn.reasoning, "thinking(low)");
   assert.equal(turn.stopReason, "end_turn");
   assert.deepEqual(turn.usage, { inputTokens: 11, outputTokens: 22, totalTokens: 33, thoughtTokens: 3 });
-  // Streamed incrementally, and the tool_call update is not mistaken for content.
+  // Streamed incrementally, with the tool call reported as progress rather than
+  // folded into the answer.
   assert.deepEqual(events, [
     { type: "reasoning", delta: "thinking(low)" },
+    { type: "tool_call", id: "t1", title: "noop", status: "completed", kind: "other" },
     { type: "text", delta: "[fast] " },
     { type: "text", delta: "hello" },
   ]);
@@ -149,6 +152,69 @@ test("the child process is reused across turns and shut down on close", async ()
     assert.match(e.message, /shut down/);
     return true;
   });
+});
+
+test("mcpServers from config reach session/new in ACP's own shape", async (t) => {
+  // Tools belong to the agent, not the request: this is the only way an ACP agent
+  // gets them. The conversion is the part worth proving -- ACP takes env and
+  // headers as [{name, value}] arrays, which nobody writes by hand.
+  const agent = makeAgent({
+    agent: {
+      mcpServers: [
+        { name: "http-one", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } },
+        { name: "stdio-one", command: "/bin/true", env: { K: "v" } },
+      ],
+    },
+  });
+  t.after(() => agent.close());
+
+  assert.deepEqual(JSON.parse((await agent.prompt([{ type: "text", text: "ECHOMCP" }])).text), [
+    { type: "http", name: "http-one", url: "http://127.0.0.1:9/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
+    { name: "stdio-one", command: "/bin/true", args: [], env: [{ name: "K", value: "v" }] },
+  ]);
+});
+
+test("max_tokens cuts the turn short and reports it", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const turn = await agent.prompt([{ type: "text", text: "COUNT" }], {
+    limit: makeLimiter({ maxTokens: 3, stop: [] }),
+  });
+  assert.equal(turn.stopReason, "max_tokens");
+  assert.ok(turn.text.length <= 12, `expected a truncated answer, got ${turn.text.length} chars`);
+});
+
+test("a stop sequence cuts the turn and excludes itself", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const turn = await agent.prompt([{ type: "text", text: "COUNT" }], {
+    limit: makeLimiter({ maxTokens: null, stop: ["word4"] }),
+  });
+  assert.equal(turn.stopReason, "end_turn");
+  assert.equal(turn.text, "word1 word2 word3 ");
+});
+
+test("nothing past the cut is streamed", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const seen = [];
+  const turn = await agent.prompt([{ type: "text", text: "COUNT" }], {
+    limit: makeLimiter({ maxTokens: null, stop: ["word3"] }),
+    onEvent: (e) => e.type === "text" && seen.push(e.delta),
+  });
+  assert.equal(seen.join(""), turn.text);
+  assert.ok(!seen.join("").includes("word3"));
+});
+
+test("the agent's own tool calls surface as progress, not as content", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const events = [];
+  const turn = await agent.prompt([{ type: "text", text: "hi" }], { onEvent: (e) => events.push(e) });
+  const tools = events.filter((e) => e.type === "tool_call");
+  assert.equal(tools.length, 1);
+  assert.deepEqual(tools[0], { type: "tool_call", id: "t1", title: "noop", status: "completed", kind: "other" });
+  assert.ok(!turn.text.includes("noop"));
 });
 
 test("a command that cannot be spawned is 503, not a crash", async (t) => {

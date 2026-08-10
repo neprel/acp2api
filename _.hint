@@ -54,6 +54,54 @@ target refuses rather than pretending.
 `verify` uses `npm ci`, not `npm install`: a suite that passes only against a drifted
 tree proves nothing about what a consumer installs.
 
+# rule Split OpenAI parameters by consequence, not by support {#param_policy}
+
+`session/prompt` carries exactly `{sessionId, prompt, _meta}` — no sampling knobs,
+no tools, no response format. There is no lower layer to reach either:
+`claude-agent-acp` reads only `ANTHROPIC_MODEL`, `MAX_THINKING_TOKENS` and
+`CLAUDE_CONFIG_DIR`, so **restarting the CLI does not help** — there is no
+temperature to set, at any layer. This is a property of the product, not of the
+bridge; do not go looking for a flag that exposes it.
+
+The useful question is what breaks if the request proceeds, and the two answers
+differ enough to need different handling:
+
+- **Style** — `temperature`, `top_p`, `seed`, penalties. Every client library sends
+  them unasked, so a 400 would reject nearly every real request over a difference
+  the caller cannot perceive. **Accept and ignore.**
+- **Contract** — `tools`, `tool_choice`, `response_format`, `n > 1`. Ignoring these
+  returns something that means the wrong thing; the caller waits for `tool_calls`,
+  gets prose, and breaks deep inside its own agent loop. **400, always**, even under
+  `unsupportedParams: ignore` — "succeed at the wrong thing" is not a mode.
+
+Unknown fields count as style: OpenAI adds parameters faster than any bridge tracks
+them, and failing on an unrecognised name would age badly.
+
+Ignored is never silent — logged once per (model, parameter), never per request, and
+echoed as `x_acp2api.ignored` on the response.
+
+`max_tokens` and `stop` are honoured **for real**, by watching the output and
+cancelling the turn. They are the only two of that family that are decidable from
+the output alone. Token counts are ~4 chars/token: there is no tokenizer and cannot
+be a correct one, since the agent picks the model.
+
+# bad Do not accumulate after the limit fires {#cut_drain}
+
+Cancelling an ACP turn is not instant — the agent keeps sending for a moment. The
+first version appended those chunks before re-checking `cut`, so a truncated answer
+quietly grew back to full length. Once cut, skip every update until the stop message.
+
+# rule Tools belong to the agent, not the request {#mcp_tools}
+
+The agent runs its own tool loop and calls back into the client; it never returns
+tool calls for someone else to execute. So tools arrive as `mcpServers` on
+`session/new` and are fixed for the session's life. There is no per-request path,
+which is exactly why OpenAI's `tools` is refused rather than approximated.
+
+ACP wants `env` and `headers` as `[{name, value}]` arrays; the config accepts a
+mapping and converts. The stdio variant has **no `type` discriminator** and requires
+`args` and `env` present even when empty.
+
 # rule ACP specifies the model, and it took a live probe to know that {#acp_config_options}
 
 The protocol docs do not describe this and a page-level read says it is unsupported.

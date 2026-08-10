@@ -47,6 +47,37 @@ test("content part arrays flatten, data: images become image blocks", () => {
   ]);
 });
 
+test("file parts become ACP resource blocks, text inline and binary as blob", () => {
+  const text = Buffer.from("hello file").toString("base64");
+  const [, res] = toPromptBlocks([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "summarise" },
+        { type: "file", file: { filename: "a.txt", file_data: `data:text/plain;base64,${text}` } },
+      ],
+    },
+  ]);
+  // Text arrives as text so the agent can actually read it, not as an opaque blob.
+  assert.deepEqual(res, {
+    type: "resource",
+    resource: { uri: "file:///a.txt", mimeType: "text/plain", text: "hello file" },
+  });
+
+  const [, pdf] = toPromptBlocks([
+    { role: "user", content: [{ type: "input_file", file_data: "data:application/pdf;base64,QUJD", filename: "b.pdf" }] },
+  ]);
+  assert.deepEqual(pdf.resource, { uri: "file:///b.pdf", mimeType: "application/pdf", blob: "QUJD" });
+});
+
+test("file_id is refused rather than silently dropped", () => {
+  // Dropping it would send a prompt that talks about an attachment nobody attached.
+  assert.throws(
+    () => toPromptBlocks([{ role: "user", content: [{ type: "file", file: { file_id: "file-abc" } }] }]),
+    /file_id refers to an OpenAI-hosted file/,
+  );
+});
+
 test("a remote image URL is refused rather than fetched", () => {
   assert.throws(
     () => toPromptBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] }]),

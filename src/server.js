@@ -1,7 +1,17 @@
 import { createServer as createHttpServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { Agent, AgentError } from "./agent.js";
-import { chunk, completion, errorBody, newCompletionId, parseChatRequest, RequestError } from "./openai.js";
+import { ParamReporter } from "./params.js";
+import {
+  chunk,
+  completion,
+  errorBody,
+  makeLimiter,
+  newCompletionId,
+  parseChatRequest,
+  RequestError,
+  usageChunk,
+} from "./openai.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
@@ -41,6 +51,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   const registry =
     agents ??
     new Map(config.agents.map((spec) => [spec.name, new Agent(spec, config.server, log)]));
+  const params = new ParamReporter(config.server.unsupportedParams, log);
 
   const authorized = (req) => {
     if (!config.server.apiKey) return true;
@@ -70,7 +81,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
       }
 
       if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
-        return await handleCompletion(req, res, registry, config, log);
+        return await handleCompletion(req, res, registry, config, log, params);
       }
 
       return send(res, 404, errorBody(`no route for ${req.method} ${url.pathname}`, "not_found"));
@@ -88,7 +99,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   return server;
 }
 
-async function handleCompletion(req, res, registry, config, log) {
+async function handleCompletion(req, res, registry, config, log, params) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
@@ -96,7 +107,9 @@ async function handleCompletion(req, res, registry, config, log) {
     throw e instanceof RequestError ? e : new RequestError(`invalid JSON body: ${e.message}`);
   }
 
-  const { model, blocks, stream } = parseChatRequest(body);
+  const { model, blocks, stream, includeUsage, maxTokens, stop, ignored } = parseChatRequest(body);
+  params.report(model, ignored);
+  const limit = makeLimiter({ maxTokens, stop });
   const agent = registry.get(model);
   if (!agent) {
     throw new RequestError(
@@ -131,13 +144,13 @@ async function handleCompletion(req, res, registry, config, log) {
 
   try {
     if (!stream) {
-      const turn = await agent.prompt(blocks, { signal: controller.signal });
+      const turn = await agent.prompt(blocks, { signal: controller.signal, limit });
       if (clientGone) return res.end();
       // ACP reports cancellation as an ordinary stop reason, so without this a
       // timed-out turn would return 200 with whatever partial text it had -- which
       // a router downstream would count as success.
       if (timedOut) throw timeout();
-      return send(res, 200, completion({ ...meta, ...turn }));
+      return send(res, 200, completion({ ...meta, ...turn, ignored }));
     }
 
     // Headers go out only once the turn is under way. Sending them earlier would
@@ -158,9 +171,14 @@ async function handleCompletion(req, res, registry, config, log) {
 
     const turn = await agent.prompt(blocks, {
       signal: controller.signal,
-      onEvent: ({ type, delta }) => {
+      limit,
+      onEvent: (e) => {
+        // The agent's own tool calls are progress, not content: emitting them as
+        // text would put "running bash" inside the answer.
+        if (e.type === "tool_call") return;
         start();
-        write(res, chunk({ ...meta, delta: type === "reasoning" ? { reasoning_content: delta } : { content: delta } }));
+        const delta = e.type === "reasoning" ? { reasoning_content: e.delta } : { content: e.delta };
+        write(res, chunk({ ...meta, delta }));
       },
     });
 
@@ -172,6 +190,7 @@ async function handleCompletion(req, res, registry, config, log) {
     // Mid-stream there is no status left to change, so say "length": the answer is
     // genuinely truncated, and that is the closest honest finish_reason.
     write(res, chunk({ ...meta, delta: {}, finishReason: timedOut ? "length" : finishOf(turn.stopReason) }));
+    if (includeUsage && turn.usage) write(res, usageChunk({ ...meta, usage: turn.usage }));
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (e) {

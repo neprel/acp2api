@@ -10,10 +10,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "fake-agent.js");
 
 /** Starts the server on an ephemeral port and returns a fetch bound to it. */
-async function start(t, { apiKey = "", agents, specs } = {}) {
+async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {}) {
   const config = normalizeConfig(
     {
-      server: { host: "127.0.0.1", port: 10021, apiKey, cwd: here },
+      server: { host: "127.0.0.1", port: 10021, apiKey, cwd: here, ...serverOpts },
       agents: specs ?? [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
     },
     { baseDir: here, env: {} },
@@ -117,6 +117,83 @@ test("an unrelated agent failure is 502", async (t) => {
   const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "BOOM" }] }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error.code, "agent_error");
+});
+
+test("temperature is accepted, reported back, and does not fail the request", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "hi" }], temperature: 0, top_p: 0.9 }),
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.choices[0].message.content, "[fast] hi");
+  // Accepted, but the caller is told rather than left believing it took effect.
+  assert.deepEqual(body.x_acp2api, { ignored: ["temperature", "top_p"] });
+});
+
+test("tools is a 400 that says where tools actually come from", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "hi" }], tools: [{ type: "function" }] }),
+  );
+  assert.equal(res.status, 400);
+  const { error } = await res.json();
+  assert.equal(error.code, "unsupported_parameter");
+  assert.match(error.message, /mcpServers/);
+});
+
+test("unsupportedParams: error turns the ignorable ones into 400 too", async (t) => {
+  const call = await start(t, { server: { unsupportedParams: "error" } });
+  const ok = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(ok.status, 200);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "hi" }], temperature: 0 }),
+  );
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, "unsupported_parameter");
+});
+
+test("max_tokens truncates and finishes with length", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "COUNT" }], max_tokens: 3 }),
+  );
+  const body = await res.json();
+  assert.equal(body.choices[0].finish_reason, "length");
+  assert.ok(body.choices[0].message.content.length <= 12);
+});
+
+test("stop cuts the answer and finishes with stop", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "COUNT" }], stop: "word4" }),
+  );
+  const body = await res.json();
+  assert.equal(body.choices[0].message.content, "word1 word2 word3 ");
+  assert.equal(body.choices[0].finish_reason, "stop");
+});
+
+test("stream_options.include_usage appends a usage-only chunk before [DONE]", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({
+      model: "fake",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  );
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  assert.equal(frames.at(-1), "[DONE]");
+  const last = JSON.parse(frames.at(-2));
+  assert.deepEqual(last.choices, []);
+  assert.equal(last.usage.total_tokens, 33);
 });
 
 test("an unknown model is 404 and names what is available", async (t) => {

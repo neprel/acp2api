@@ -32,6 +32,15 @@ server:
   # detection mechanism. Setting it REPLACES the built-in list.
   # limitPatterns: ["rate.?limit", "usage limit", "quota"]
 
+  # OpenAI parameters ACP cannot carry -- temperature, top_p, seed and friends.
+  #   warn   (default) accept, drop, log once, and report in `x_acp2api.ignored`
+  #   ignore accept and drop silently
+  #   error  reject with 400
+  # `warn` is the default because every client library sends temperature unasked.
+  # Parameters that would change what the ANSWER MEANS (tools, response_format,
+  # n > 1) are refused regardless of this setting -- see src/params.js.
+  unsupportedParams: warn
+
 agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus
@@ -48,6 +57,23 @@ agents:
     type: codex # bundled adapter: @agentclientprotocol/codex-acp
     model: gpt-5.6-sol
     reasoning: high
+
+  # Tools are a property of the AGENT, not of the request: an ACP agent runs its own
+  # tool loop, so OpenAI's `tools` array has nowhere to go (and is refused with a
+  # 400 that says so). MCP servers are how an agent gets tools.
+  #
+  # `headers` and `env` accept a mapping here and are converted to the
+  # [{name, value}] arrays ACP wants. Claude speaks http and sse; Codex, http.
+  #
+  # - name: claude-with-tools
+  #   type: claude
+  #   mcpServers:
+  #     - name: docs
+  #       url: https://mcp.example.com/mcp
+  #       headers: { Authorization: "Bearer ${DOCS_TOKEN}" }
+  #     - name: local
+  #       command: /usr/local/bin/my-mcp
+  #       args: [--stdio]
 
   # Any other ACP-speaking CLI. `command` is required; there is no preset.
   - name: opencode

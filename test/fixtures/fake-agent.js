@@ -48,9 +48,9 @@ const app = acp
     agentCapabilities: { loadSession: false, sessionCapabilities: { close: {} } },
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
-  .onRequest(acp.methods.agent.session.new, () => {
+  .onRequest(acp.methods.agent.session.new, ({ params }) => {
     const sessionId = `s${sessions.size + 1}`;
-    const state = { model: "fast", effort: "low", verbose: false };
+    const state = { model: "fast", effort: "low", verbose: false, mcp: params.mcpServers ?? [] };
     sessions.set(sessionId, state);
     return { sessionId, configOptions: optionsFor(state) };
   })
@@ -77,15 +77,33 @@ const app = acp
     if (text.includes("BOOM")) throw new Error("connection reset by peer");
 
     const say = (update) => client.notify(acp.methods.client.session.update, { sessionId: params.sessionId, update });
+    state.abort = new AbortController();
 
     await say({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking(${state.effort})` } });
     await say({ sessionUpdate: "tool_call", toolCallId: "t1", title: "noop", status: "completed", kind: "other" });
 
     if (text.includes("HANG")) {
-      const abort = new AbortController();
-      state.abort = abort;
-      await new Promise((r) => abort.signal.addEventListener("abort", r, { once: true }));
+      await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
       return { stopReason: "cancelled" };
+    }
+
+    // Reports what session/new was given, so a test can prove MCP servers and
+    // attachment blocks actually reached the agent instead of being dropped.
+    if (text.includes("ECHOMCP")) {
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: JSON.stringify(state.mcp) },
+      });
+      return { stopReason: "end_turn" };
+    }
+
+    // Streams one word at a time so `stop` and `max_tokens` have somewhere to cut.
+    if (text.includes("COUNT")) {
+      for (let i = 1; i <= 20; i++) {
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `word${i} ` } });
+        if (state.abort?.signal.aborted) return { stopReason: "cancelled" };
+      }
+      return { stopReason: "end_turn" };
     }
 
     for (const part of [`[${state.model}] `, text]) {

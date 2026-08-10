@@ -82,7 +82,60 @@ agents:
 | `model` | set on the config option whose **category** is `model` |
 | `reasoning` | set on the config option whose **category** is `thought_level` |
 | `options` | `{configId: value}` for anything else the agent exposes |
+| `mcpServers` | tools for this agent — see below |
 | `env`, `cwd`, `args` | per-agent spawn overrides |
+
+### Tools come from MCP, not from `tools`
+
+An ACP agent runs its **own** tool loop, so there is no per-request `tools` array to
+honour. Tools are a property of the agent, declared when its session opens:
+
+```yaml
+agents:
+  - name: claude-opus
+    type: claude
+    mcpServers:
+      - name: docs
+        url: https://mcp.example.com/mcp
+        headers: { Authorization: "Bearer ${DOCS_TOKEN}" }
+      - name: local
+        command: /usr/local/bin/my-mcp
+        args: [--stdio]
+        env: { API_KEY: "${KEY}" }
+```
+
+Mappings for `headers`/`env` are converted to the `[{name, value}]` arrays ACP
+actually wants. Claude speaks `http` and `sse`, Codex `http`.
+
+## What OpenAI parameters do
+
+`session/prompt` carries exactly `{sessionId, prompt, _meta}` — no sampling knobs,
+no tools, no response format. An ACP agent is an *agent*, not a raw model endpoint:
+it owns its inference settings. There is no lower layer to reach either;
+`claude-agent-acp` reads only `ANTHROPIC_MODEL`, `MAX_THINKING_TOKENS` and
+`CLAUDE_CONFIG_DIR` — there is no temperature to set, anywhere.
+
+So parameters are split by **what breaks if we proceed**, not by what is supported.
+
+| | behaviour |
+| --- | --- |
+| `model`, `messages`, `stream` | native |
+| `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (token counts are approximate; there is no tokenizer here) |
+| `stream_options.include_usage` | native |
+| `temperature`, `top_p`, `seed`, penalties, `logprobs`, unknown fields | **accepted and ignored.** Every client library sends `temperature` unasked; failing on it would reject nearly every real request over a difference the caller cannot perceive |
+| `tools`, `tool_choice`, `response_format`, `n > 1`, `audio` | **400.** Ignoring these changes what the answer *means* — a caller waiting for `tool_calls` gets prose and breaks inside its own loop with no clue why |
+
+Ignored parameters are never silent: they are logged once per (model, parameter)
+and echoed back on the response as `x_acp2api.ignored`, which no client trips over
+because everything reads `choices[0]`. Set `server.unsupportedParams` to `ignore`
+to drop the reporting or `error` to refuse those too.
+
+The ACP-native way to vary what a request cannot carry is **another agent entry**:
+names are model ids, so "codex at low effort" is simply another model id.
+
+Attachments work: an OpenAI `file` part with `file_data` becomes an ACP `resource`
+block (text inline, anything else as a blob). `file_id` is refused — it names an
+OpenAI-hosted file that does not exist here.
 
 `model` and `reasoning` are matched by
 [category](https://agentclientprotocol.com/protocol/session-setup), never by option
@@ -145,7 +198,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 48 tests, offline
+make test      # 75 tests, offline
 make check     # validate the example config
 make verify    # clean install + test + check + pack
 ```
@@ -153,6 +206,7 @@ make verify    # clean install + test + check + pack
 | file | |
 | --- | --- |
 | `src/config.js` | load, `${VAR}` expansion, validation, defaults |
+| `src/params.js` | which OpenAI parameters are ignored, refused, or emulated, and why |
 | `src/agent.js` | one ACP agent: spawn, initialize, session per turn, config options |
 | `src/openai.js` | OpenAI ⇄ ACP translation, no I/O |
 | `src/server.js` | HTTP routing, auth, SSE, status mapping |

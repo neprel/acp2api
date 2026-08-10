@@ -66,6 +66,11 @@ const DEFAULTS = {
   requestTimeoutMs: 600_000,
   permission: "allow",
   fs: true,
+  // What to do with OpenAI parameters ACP cannot carry. `warn` is the default and
+  // the only sane one: every client library sends `temperature` unasked, so `error`
+  // would reject almost every request in the wild. See src/params.js for why some
+  // parameters are refused regardless of this setting.
+  unsupportedParams: "warn",
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -113,6 +118,10 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(typeof s.host === "string" && s.host.length > 0, "server.host must be a non-empty string");
   req(typeof s.apiKey === "string", "server.apiKey must be a string");
   req(["allow", "deny"].includes(s.permission), `server.permission must be "allow" or "deny", got ${s.permission}`);
+  req(
+    ["ignore", "warn", "error"].includes(s.unsupportedParams),
+    `server.unsupportedParams must be ignore, warn or error, got ${s.unsupportedParams}`,
+  );
   req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
 
   const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;
@@ -148,6 +157,7 @@ function normalizeAgent(a, i, server, seen) {
 
   req(a.args === undefined || Array.isArray(a.args), `${at}.args must be a list`);
   req(a.env === undefined || (a.env && typeof a.env === "object"), `${at}.env must be a mapping`);
+  req(a.mcpServers === undefined || Array.isArray(a.mcpServers), `${at}.mcpServers must be a list`);
   req(a.options === undefined || (a.options && typeof a.options === "object"), `${at}.options must be a mapping of configOption id to value`);
 
   return {
@@ -165,8 +175,42 @@ function normalizeAgent(a, i, server, seen) {
     model: a.model ?? null,
     reasoning: a.reasoning ?? null,
     options: a.options ?? {},
+    mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
     description: a.description ?? "",
   };
+}
+
+/**
+ * Normalizes one MCP server entry into the exact shape `session/new` wants.
+ *
+ * ACP takes `env` and `headers` as ARRAYS of `{name, value}`, which is miserable to
+ * write by hand, so a plain mapping is accepted here and converted. The stdio
+ * variant carries no `type` discriminator and requires `args` and `env` to be
+ * present even when empty -- omitting them is rejected by the agent, not by us.
+ *
+ * MCP is how an ACP agent gets tools at all: the agent runs its own tool loop, so
+ * there is nothing to pass per request. Tools are a property of the agent.
+ */
+function normalizeMcpServer(m, at) {
+  req(m && typeof m === "object", `${at} must be a mapping`);
+  req(typeof m.name === "string" && m.name, `${at}.name is required`);
+  const pairs = (v, what) => {
+    if (v === undefined) return [];
+    if (Array.isArray(v)) return v;
+    req(v && typeof v === "object", `${at}.${what} must be a mapping or a list of {name, value}`);
+    return Object.entries(v).map(([name, value]) => ({ name, value: String(value) }));
+  };
+
+  const type = m.type ?? (m.url ? "http" : "stdio");
+  if (type === "http" || type === "sse") {
+    req(typeof m.url === "string" && m.url, `${at}.url is required for type "${type}"`);
+    return { type, name: m.name, url: m.url, headers: pairs(m.headers, "headers") };
+  }
+  if (type === "stdio") {
+    req(typeof m.command === "string" && m.command, `${at}.command is required for type "stdio"`);
+    return { name: m.name, command: m.command, args: m.args ?? [], env: pairs(m.env, "env") };
+  }
+  throw new ConfigError(`${at}.type must be http, sse or stdio, got ${type}`);
 }
 
 /** Reads and normalizes a YAML (or JSON -- YAML is a superset) config file. */
