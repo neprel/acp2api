@@ -71,6 +71,11 @@ const DEFAULTS = {
   // would reject almost every request in the wild. See src/params.js for why some
   // parameters are refused regardless of this setting.
   unsupportedParams: "warn",
+  // Retained ACP sessions behind the Responses API. Each is a live child process
+  // holding a login, so both bounds matter: the cap stops an unbounded client from
+  // spawning CLIs forever, and the TTL reaps conversations nobody returns to.
+  maxSessions: 100,
+  sessionTtlMs: 3_600_000,
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -112,6 +117,8 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   // environment arrives as "10021" and would fail an Number.isInteger check.
   s.port = asInt(s.port);
   s.requestTimeoutMs = asInt(s.requestTimeoutMs);
+  s.maxSessions = asInt(s.maxSessions);
+  s.sessionTtlMs = asInt(s.sessionTtlMs);
   if (typeof s.fs === "string") s.fs = s.fs !== "false" && s.fs !== "0";
 
   req(Number.isInteger(s.port) && s.port > 0 && s.port < 65536, `server.port must be a port number, got ${s.port}`);
@@ -123,6 +130,8 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
     `server.unsupportedParams must be ignore, warn or error, got ${s.unsupportedParams}`,
   );
   req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
+  req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
+  req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
 
   const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;
   req(Array.isArray(patterns), "server.limitPatterns must be a list of regex strings");

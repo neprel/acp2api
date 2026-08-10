@@ -143,18 +143,19 @@ export class Agent {
    * on the wrong model is worse than a 400, since the caller picked this agent name
    * precisely to get that model.
    */
-  async #applyOptions(ctx, session) {
-    let opts = session.newSessionResponse.configOptions ?? [];
+  async #applyOptions(ctx, session, wants) {
+    let opts = session.options;
     if (opts.length === 0) return;
 
     // Model first, then reasoning: choosing a model CHANGES the option set. Claude
     // drops the `effort` selector entirely once Haiku is selected, so an id looked
     // up before the model was applied would no longer exist by the time it is used.
     const wanted = [
-      ...(this.#spec.model ? [{ category: "model", value: this.#spec.model }] : []),
-      ...(this.#spec.reasoning ? [{ category: "thought_level", value: this.#spec.reasoning }] : []),
-      ...Object.entries(this.#spec.options).map(([id, value]) => ({ id, value })),
+      ...(wants.model ? [{ category: "model", value: wants.model }] : []),
+      ...(wants.reasoning ? [{ category: "thought_level", value: wants.reasoning }] : []),
+      ...Object.entries(wants.options ?? {}).map(([id, value]) => ({ id, value })),
     ];
+    if (wanted.length === 0) return;
 
     for (const want of wanted) {
       const opt = want.id
@@ -166,7 +167,7 @@ export class Agent {
       }
       const { value } = want;
       const configId = opt.id;
-      const payload = { sessionId: session.sessionId, configId };
+      const payload = { sessionId: session.id, configId };
       if (opt.type === "boolean") {
         Object.assign(payload, { type: "boolean", value: value === true || value === "true" });
       } else {
@@ -177,9 +178,58 @@ export class Agent {
       const res = await ctx.request(acp.methods.agent.session.setConfigOption, payload);
       // The response carries the full refreshed set, and setting one option can
       // change another's choices (models restrict reasoning levels), so keep going
-      // against the latest state rather than the snapshot from session/new.
+      // against the latest state rather than the snapshot from session/new. The
+      // session keeps it too: a retained session is configured again on later turns.
       opts = res.configOptions ?? opts;
+      session.options = opts;
     }
+  }
+
+  /**
+   * Opens an ACP session and configures it from the agent's own settings.
+   *
+   * Returned separately from `prompt` because the Responses API keeps a session
+   * alive across requests -- that is the whole point of `previous_response_id`, and
+   * the reason a continued turn sends only the new input instead of replaying the
+   * history the agent already holds.
+   */
+  async openSession() {
+    const { connection } = await Promise.resolve().then(() => this.#connect());
+    const ctx = connection.agent;
+    const builder = ctx.buildSession(this.#spec.cwd);
+    // Tools belong to the AGENT, not to the request: the agent runs its own tool
+    // loop, so MCP servers are declared once, when the session opens. There is no
+    // per-request equivalent, which is why OpenAI's `tools` cannot map onto this.
+    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+
+    const active = await builder.start();
+    const session = {
+      id: active.sessionId,
+      active,
+      // Tracked on the session rather than re-read from `session/new`, because that
+      // snapshot goes stale the moment an option is set.
+      options: active.newSessionResponse.configOptions ?? [],
+      agent: this.name,
+    };
+    try {
+      await this.#applyOptions(ctx, session, this.#spec);
+    } catch (e) {
+      await this.closeSession(session);
+      throw this.#classify(e);
+    }
+    return session;
+  }
+
+  /** Ends a session and stops routing its updates. Safe to call twice. */
+  async closeSession(session) {
+    if (!session || session.closed) return;
+    session.closed = true;
+    session.active.dispose();
+    const conn = this.#conn && (await this.#conn.catch(() => null));
+    if (!conn?.init.agentCapabilities?.sessionCapabilities?.close) return;
+    await conn.connection.agent
+      .request(acp.methods.agent.session.close, { sessionId: session.id })
+      .catch(() => {});
   }
 
   /**
@@ -194,32 +244,42 @@ export class Agent {
    * means cancelling the ACP turn, which is why this lives here rather than in the
    * HTTP layer: a caller that stops reading does not stop the agent from working.
    */
-  async prompt(blocks, { signal, onEvent = () => {}, limit = null } = {}) {
-    const { connection, init } = await Promise.resolve().then(() => this.#connect());
-    const ctx = connection.agent;
-    const caps = init.agentCapabilities ?? {};
+  async prompt(blocks, options = {}) {
+    const session = await this.openSession();
+    try {
+      return await this.turn(session, blocks, options);
+    } finally {
+      await this.closeSession(session);
+    }
+  }
 
-    const builder = ctx.buildSession(this.#spec.cwd);
-    // Tools belong to the AGENT, not to the request: the agent runs its own tool
-    // loop, so MCP servers are declared once, when the session opens. There is no
-    // per-request equivalent, which is why OpenAI's `tools` cannot map onto this.
-    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
-    const session = await builder.start();
+  /**
+   * Runs one turn inside an existing session.
+   *
+   * `overrides` re-applies config options before the turn -- this is how the
+   * Responses API honours a per-request `reasoning.effort`, which chat completions
+   * cannot express at all.
+   */
+  async turn(session, blocks, { signal, onEvent = () => {}, limit = null, overrides = null } = {}) {
+    const { connection } = await Promise.resolve().then(() => this.#connect());
+    const ctx = connection.agent;
+    const active = session.active;
+
     const onAbort = () => {
-      ctx.notify(acp.methods.agent.session.cancel, { sessionId: session.sessionId }).catch(() => {});
+      ctx.notify(acp.methods.agent.session.cancel, { sessionId: session.id }).catch(() => {});
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
-      await this.#applyOptions(ctx, session);
+      if (overrides) await this.#applyOptions(ctx, session, overrides);
 
       let text = "";
       let reasoning = "";
       let cut = null; // stop reason imposed by `limit`, once it fires
-      session.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
+      active.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
 
       for (;;) {
-        const message = await session.nextUpdate();
+        const message = await active.nextUpdate();
         if (message.kind === "stop") {
           return {
             text,
@@ -262,11 +322,10 @@ export class Agent {
     } catch (e) {
       throw this.#classify(e);
     } finally {
+      // The signal outlives the turn -- on a retained session it belongs to one
+      // request while the session serves many, so a leaked listener would cancel
+      // somebody else's turn.
       signal?.removeEventListener("abort", onAbort);
-      session.dispose();
-      if (caps.sessionCapabilities?.close) {
-        await ctx.request(acp.methods.agent.session.close, { sessionId: session.sessionId }).catch(() => {});
-      }
     }
   }
 

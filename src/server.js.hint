@@ -19,7 +19,10 @@ Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest` and
 | --- | --- | --- | --- |
 | GET | `/health` | none | liveness plus the configured model ids |
 | GET | `/v1/models`, `/models` | yes | OpenAI model list |
-| POST | `/v1/chat/completions`, `/chat/completions` | yes | the turn |
+| POST | `/v1/chat/completions`, `/chat/completions` | yes | one stateless turn |
+| POST | `/v1/responses`, `/responses` | yes | one turn of a retained conversation |
+| GET | `/v1/responses/{id}` | yes | a stored response |
+| DELETE | `/v1/responses/{id}` | yes | forget it, closing the session if it was the last |
 
 `/health` is deliberately unauthenticated: a probe that needs a secret is a probe
 that silently stops working when the secret rotates. It exposes model ids and
@@ -65,9 +68,25 @@ Once headers are out the status is spent: mid-stream truncation is reported as
 `{error: {message, type, code, param}}`. Clients branch on `error.code`, so a new
 failure mode needs a distinct code, not a new message under an existing one.
 
+# func handleResponse {#handle_response}
+
+Differs from `handleCompletion` in one structural way: **the session outlives the
+request**. A new conversation opens one; `previous_response_id` continues an
+existing one.
+
+## invariant A conversation is pinned to its agent
+A session belongs to one child process, so continuing with a different `model` is a
+400 rather than a silent restart on the other agent.
+
+## invariant A failed first turn leaves nothing behind
+If the turn fails before producing a response, the conversation it opened is
+discarded. No response id would ever point at it, so it could never be closed
+otherwise — and it is a live login. The same applies to `store: false`.
+
 # invariant Closing the server closes every agent
 Agents are child processes holding authenticated sessions. The `close` handler on
-the server is what reaps them, and `bin/acp2api.js` relies on exactly that.
+the server reaps them — retained sessions first, so each CLI is *told* to end rather
+than killed — and `bin/acp2api.js` relies on exactly that.
 
 # test server
 

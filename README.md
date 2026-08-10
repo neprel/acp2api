@@ -160,7 +160,44 @@ acp2api --config acp2api.yaml
 | --- | --- |
 | `GET /health` | no auth; lists the configured model ids |
 | `GET /v1/models` | OpenAI model list |
-| `POST /v1/chat/completions` | `stream: true` gives SSE |
+| `POST /v1/chat/completions` | one stateless turn; `stream: true` gives SSE |
+| `POST /v1/responses` | one turn of a **retained conversation** |
+| `GET /v1/responses/{id}` | a stored response |
+| `DELETE /v1/responses/{id}` | forget it |
+
+### /v1/responses is the better fit
+
+The Responses API is stateful and so is ACP, which makes the mapping direct rather
+than approximate:
+
+| OpenAI | ACP |
+| --- | --- |
+| `previous_response_id` | a retained session — the agent's own memory of the turn |
+| `instructions` | system preamble |
+| `reasoning: {effort}` | the `thought_level` config option, **per request** |
+| `max_output_tokens` | the same output-watching cut as `max_tokens` |
+| `store: false` | close the session with the turn |
+
+```sh
+curl localhost:10021/v1/responses -H "authorization: Bearer $KEY" \
+  -d '{"model":"claude-opus","input":"My favourite number is 41. Reply: noted"}'
+# {"id":"resp_...","output_text":"noted", ...}
+
+curl localhost:10021/v1/responses -H "authorization: Bearer $KEY" \
+  -d '{"model":"claude-opus","input":"What was my number?","previous_response_id":"resp_..."}'
+# "41"
+```
+
+The second request sends **only the new input**. Chat completions has to resend the
+whole history each time and the agent reads it as one flattened transcript; here the
+agent already holds it. `reasoning.effort` can likewise be raised for one hard
+question mid-conversation and dropped again — chat completions has no field for that
+at all.
+
+Retained sessions are live child processes holding logins, so they are bounded by
+`server.maxSessions` (evicted by last *use*, so an actively continued conversation
+outlives a newer idle one) and `server.sessionTtlMs`. Both close the ACP session, as
+do delete, shutdown, and a first turn that fails before answering.
 
 Auth is `Authorization: Bearer <apiKey>` or `x-api-key`. An empty `apiKey` disables
 it, and the server says so on startup.
@@ -198,7 +235,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 75 tests, offline
+make test      # 90 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack
@@ -215,7 +252,9 @@ Change a spec deliberately, then re-run `hint lock` to record the new snapshot.
 | `src/config.js` | load, `${VAR}` expansion, validation, defaults |
 | `src/params.js` | which OpenAI parameters are ignored, refused, or emulated, and why |
 | `src/agent.js` | one ACP agent: spawn, initialize, session per turn, config options |
-| `src/openai.js` | OpenAI ⇄ ACP translation, no I/O |
+| `src/openai.js` | chat-completions ⇄ ACP translation, no I/O |
+| `src/responses.js` | Responses API ⇄ ACP translation, and the typed event stream |
+| `src/sessions.js` | retained conversations: lookup, TTL, LRU eviction, closing |
 | `src/server.js` | HTTP routing, auth, SSE, status mapping |
 | `test/fixtures/fake-agent.js` | a **real** ACP agent over real stdio |
 

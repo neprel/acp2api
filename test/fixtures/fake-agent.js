@@ -97,6 +97,13 @@ const app = acp
       return { stopReason: "end_turn" };
     }
 
+    // Answers with its own session id, so a test can prove a conversation was
+    // continued in the SAME ACP session rather than silently restarted.
+    if (text.includes("ECHOSESSION")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
+      return { stopReason: "end_turn" };
+    }
+
     // Streams one word at a time so `stop` and `max_tokens` have somewhere to cut.
     if (text.includes("COUNT")) {
       for (let i = 1; i <= 20; i++) {

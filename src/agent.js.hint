@@ -17,9 +17,31 @@ declaration, the prompt turn, cancellation, and mapping ACP failures to HTTP sta
 Out: HTTP, OpenAI shapes, and any knowledge of what the caller asked for. `prompt`
 receives ACP content blocks and a `limit` callback; it never sees a request body.
 
+# func openSession {#open_session}
+
+Opens an ACP session, declares the agent's MCP servers, and applies the agent's own
+model/reasoning/options. Separate from `prompt` because the Responses API keeps a
+session alive across requests; see
+[responses.js.hint#no_replay](./responses.js.hint).
+
+## result
+`{id, active, options, agent}`. `options` is tracked on the session rather than
+re-read from `session/new`, whose snapshot goes stale the moment an option is set —
+a later turn reconfigures against the live set.
+
+# func turn {#turn}
+
+One turn inside an existing session. `overrides` re-applies config options first,
+which is how a per-request `reasoning.effort` is honoured mid-conversation.
+
+## invariant The abort listener is removed in `finally`
+On a retained session the signal belongs to one request while the session serves
+many, so a leaked listener cancels somebody else's turn.
+
 # func prompt {#prompt}
 
-One prompt turn on a fresh session.
+One prompt turn on a fresh session: `openSession` + `turn` + `closeSession`. The
+stateless path, and what chat completions uses.
 
 ## arg blocks
 ACP `ContentBlock[]`, already translated.

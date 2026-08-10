@@ -15,12 +15,16 @@ files:
       rule Shutdown closes the server, which closes the agents: b92bfc1f2f9037c96eb91548528658729c4ff276ab05d018e3d7e20e5fd37aeb
       good Log lines are timestamped, levelled, and go to the right stream: 59a657734c4d5ecad6a14e8e9b3c1f7d9ca3147793d84ce744a878064d371c0a
   src/agent.js:
-    hash: 822b2f28e46f6d37c8db232e2b585a5b9bfc65eac36a48e024d9364d9d0ea891
-    target: c916af7a9a65f36e673207a98d822c3bb855693dba3cc1fac808e1c6ce04a572
+    hash: 49cac7068c66d80f0273722059464dd4a146b4658501a5c500a5d2d5e1a8f1f9
+    target: 4b87a2d2b2cf2f8deafda9a34b2703d29a6115ef1e3aeff6852a5f12f4be7ed2
     blocks:
       goal Own the ACP conversation, and translate its failures into decisions: f1748034d7b9cc98fec9f905ed912b7b3ffcba51862abaa7f1d18186e35e457d
       scope What this module owns: 40b50b7b8b5f695a1d21b557fabe7bdc926f6acdf8e27f601f89c0d66b1a7ec2
-      func prompt: a8c85482a6f97dd275ccc596d5304db240884ba4ca427d422f923aaa92872b9f
+      func openSession: a1f1b237ee47817eeb6d4d172c563803c8a3b9c8aec18fe1b2805225c0e7a93c
+      func openSession > result: 3c989ad7cb26623ef11f1d27f24c8069dc7fe8f22819f1a5ec2c748d1c5ada3e
+      func turn: 568d5b08970294eaa010ea55dd65eb64f3a6640b9e5f36a660991e1ea40c0c52
+      func turn > invariant The abort listener is removed in finally: 8327b9de1e7dac738a1310854d6ac5afd238ea0ad8ef6997b97b3eef8d60b631
+      func prompt: c9bc320dfba603c9256c3eb118991cf264b4de2560e42383840e4385ad9ea070
       func prompt > arg blocks: 8b663093e4a1f065659329c26353f541e8e66870a75bc3f244a4de2f1e1ffcdd
       func prompt > arg options.signal: 44231df3c8b8f8175674f96ed27d0b15ae696b76752a1c5b2e06a491404b3dec
       func prompt > arg options.onEvent: aaa0cd325e890a2cf30dc296d4489d831ac4a51b736475f5b18fea3728bcd3eb
@@ -34,7 +38,7 @@ files:
       test agent: 5f2da2c01361d82f117a355317df26f5aa4d82f826ff7d5e0ebb825a68703079
   src/config.js:
     hash: 55a3d5b834c5e9be929f8b5ce8bba99523c3cbdae235f796ffff82d62874d275
-    target: 59b4e2c197c28fa944da5d31c083c3fcaa0c1da075c2b478ad1bbc6daf79f2ee
+    target: 11e208f0970b4602e3e00fd565a17985709726c5753b4a433ec97a9959a65581
     blocks:
       goal The config is the only place a deployment is described: af23a4e57ba6ede9b91abce9a3beb5a9ec005c1612407915c34abd46bcbf1e66
       scope What this module owns: 74bd7c9119676ca047f283e751cdd2196590d949c65d743c15133684ba55794c
@@ -87,24 +91,55 @@ files:
       func report > error unsupported_parameter: ab3b911f85db63ce0aaa077b552ccec6a4031a2e056c079e9a9b6efc92ef7e06
       func report > invariant One log line per (model, parameter), for the process lifetime: 2155c49d94cc3167d5d847bedede1da65795d2d022e459adb83242fca05fc5cd
       test params: 6934ae20b74b08bf33ff4cc1ae388564728b881433ee9d2218b043b3f4ad4cd0
+  src/responses.js:
+    hash: 5545924366d6b008cd2a6145cd9f9b4efba911529dd05223430494628620c700
+    target: d0788713eb5175b2c924fec48718c15bca4d8476af8cf80b82b7f1f8959817c3
+    blocks:
+      goal The surface that actually fits ACP: d395b4fdeea633ac8b4a04fa85c15b0b2f3a2d7165ca598e184f19a89d79b35f
+      invariant Pure translation, like openai.js: 2e7134cd7359754482238d1c2cd6723c55d2619eddd589ff38585d05bf53e0fe
+      rule A continued turn sends only the new input: 72d9d5d829e1a2ee735a9572b904262cc2f14ba78270d4795f75e2aefbd79401
+      rule reasoning.effort is per request, and re-applied every turn: fa50a9efa502f969a3d7405ca048300a223af3ad0ae48645408ac7bb8ed93dcf
+      func parseResponsesRequest: 4103943c14493dbd2328c334fa7d39973887d786a010b5695dc9a10b66cd712f
+      func parseResponsesRequest > result: 003eba0fa66176dfcc63675d8ea09e0c4266dd3a985eaf579c9cf7f854332d10
+      func parseResponsesRequest > rule store defaults to true: 86f7c7b52ddc210fa169ac7e140d4e285dfec926f1642fed17e7ad61c705684f
+      func parseResponsesRequest > error unsupported_parameter: 4d16f6676773ad580607cc9544772b255494519ff1c51c8af57e3a2b7f757b40
+      func responseObject: de5c5d151105a908f1c88a17f26cd2d4da23174e55c2d818457e1701e5b46864
+      func responseObject > rule status comes from the ACP stop reason, and incompleteness is stated: cd398b700992d3429b73c581f58023fd363dab9ebdb07733674de3fdae7f5123
+      rule The stream is ordered, and that ordering is the contract: 76a4e309bd422a7e20338d09b22d2824ccfbf2639c0e155c77439d5aadcdc3ee
+      test responses: a02cbf4ce60c6c14514258ab32035123e8d23f0c4a4503318640d921afb88ea7
   src/server.js:
-    hash: f6a1d2ea9c82a2ab7faa5a7bb3e68006deb94578fe43289e6e79f6791204a9a1
-    target: 8ed1f5a768423b4357450016efea8b4c379c362746adda4e9e2c924f4c989842
+    hash: 23712a77369bc08b9b0e6b56bdddd986c993229657b52383fa4e0fbc848a1a83
+    target: f4fa963ea05b04444d862e80235f22dafbf6dad1bd480c3691f2596f42dc6efc
     blocks:
       goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
       scope What this module owns: 4f3a55599f250c73bdede6f27753dd3f184438ae6d27c62c684102d7534f1869
-      ui Routes: be354e3c7ecaf7ca61e3f86707a7574853ec4fc5811e0e2ff8e3664d78ef613f
+      ui Routes: dcfee00ed0f85c60bed9f426a5132ad369b3d0e88f685ff1205bce32da3e80a5
       invariant Auth compares in constant time, on both header spellings: 7a863748e83adc88a3b83ea82f8cd2bed1fa96331bcc36c24f29ac839b0a774a
       func handleCompletion: c5df34909a3b262b9c0fef2fd090d3d5857c547c7696385d773653582b130763
       func handleCompletion > flow: 363b68bada0234d2fd3b2e085c49e34ba542fb774cd31e407b30ed6d62f2bcdb
       func handleCompletion > invariant Timeout and disconnect are tracked separately: 937414eff0730a6f7d0eaa6d294f9ab4a93f9a48fd4067058456c090b754d8fd
       rule Streaming headers are withheld until the agent produces something: 3116183bd31ba358d2935f24827d04acf7a3057f2129fbfd1ae5e3f7ddde26ff
       rule Every response carries an OpenAI-shaped error body: 808711ce073af6f143deeb64fcd768d9989a1d1a6151df1fa486e0a9ca457c16
-      invariant Closing the server closes every agent: d847be6d32688ae17d96b605029185d6259baabafa429253900342a9e5d75c40
+      func handleResponse: d749dea9aa4468b511d930ef8086ef6ddacc4caca24031c1109d1bb547020856
+      func handleResponse > invariant A conversation is pinned to its agent: 9d3ec31344ff11e74bea866f319263fa432df4dd1ca6d449f89d02ec8217f7bc
+      func handleResponse > invariant A failed first turn leaves nothing behind: 6ed4c657b23d4ea3dcf87dbf551fbaeafeffa2e0e2c6f4a58a5fd9b47adb59f4
+      invariant Closing the server closes every agent: 315bc80e3612937b67068e06fdb2059752ccb7edda060e44e7497387159f04b9
       test server: 0b0b4d88623599ee329a0d9c793cd5578ede20927f89f0b93ca57631fd88728b
+  src/sessions.js:
+    hash: a4e69a85c58708ef96a87fc0d8ac5dff0698e98bba280823a0a27ff865e562aa
+    target: ec02ef1b540ab60bd975b4b5d5e8e18c3fd19e9c32ac673990f66e48872164bb
+    blocks:
+      goal Keep conversations alive without leaking logins: 21d91386497248afb75265c83c7e8844c46df84cd811f8d6d310d6b6af31273b
+      invariant The unit of retention is a conversation, not a response: ec50861fa9dbcf1e5e4afe3d2fd2f68b4d8f9439dc442a68430ef69d387f1bea
+      invariant Every path out of the store closes the ACP session: 4ce284435590a6314b850d4456b6ea16514958fed8d8b6d7e8c59af57186c84c
+      rule Eviction is by last use, never by age: 031edd8a154852475376bb2b45e2829417cddfd8c367a9e0f76eadb936c80dba
+      func prune: de3a0bbf6a714099aada126dcd8e451e2fc289380e6338a55aff2abe76e33b7c
+      func prune > arg agents: d8422b3bcf479ebc8f5d12d6b672498c2900e731c1072b71127eb267dde4741e
+      func prune > invariant No clock of its own: 6c9a7d4091d92c670d827c2f6c47075fc873a1200f8eb245e4d046ba06bd3396
+      test sessions: 0ba132a8ba82d5cc05915893c13eb3feab85d7a3b780828fab6d541270ebe3e4
   test/fixtures/fake-agent.js:
     hash: 4500d80cf03189cc77c8ece8413212d95c65506f2f941da95a4cc2b0151bb5e3
-    target: 116ab69e4ad76cad1a733d62cc6e840e51dde33fe5ad5380b32aa1c820f50079
+    target: dfe1f9f2602b55184baf6f1eb99061ead4fad64cb2f52a3a595b0cfcc5069f94
     blocks:
       goal Prove the wire, not the wiring: 17d265dbad00362dcd608b670dc28b0ade984644220a31e8f2371da95efebbce
       rule Extend the fixture, never reach for a mocking library: 08d0b55afcfcf216eb1cec8ae8750fd24d0a760ff1de3414f8c461140563b5a1

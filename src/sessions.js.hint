@@ -1,0 +1,54 @@
+# goal Keep conversations alive without leaking logins
+
+Retaining an ACP session is what makes `previous_response_id` mean anything, and it
+is also the only place in this program that holds a resource indefinitely. Both
+halves are the point: retain enough to continue a conversation, never enough to
+strand a child process nobody can reach.
+
+# invariant The unit of retention is a conversation, not a response {#conversation_unit}
+
+One ACP session serves a whole chain, and **every** response id in that chain
+resolves to it. That is why `previous_response_id` may name any response in the
+chain, not only its tip — a caller branching from an earlier turn is continuing the
+same conversation, because the agent holds one history and cannot be forked.
+
+Consequence: `forget` removes a response and closes the session only when the last
+response of its conversation goes. Closing on the first delete would end a
+conversation the caller is still using.
+
+# invariant Every path out of the store closes the ACP session {#no_leaks}
+
+Expiry, eviction, explicit delete, discard-on-failure, and shutdown all funnel
+through the same private close. A new exit path that forgets to is not a leak of
+memory — it is a logged-in CLI running forever with nothing owning it.
+
+The one that is easy to miss: a turn that **fails before producing a response**
+leaves a conversation no id points at. `discard` exists for exactly that, and
+`server.js` calls it on the error path.
+
+# rule Eviction is by last use, never by age {#lru}
+
+A long conversation someone is actively continuing must outlive an abandoned one
+started later. `find` refreshes the timestamp, so continuing a chain is what keeps
+it alive.
+
+`prune` runs before every new conversation, so the store cannot grow between
+requests, and it applies TTL first and the cap second — expiry is about
+abandonment, the cap is about pressure, and they are not the same question.
+
+# func prune {#prune}
+
+## arg agents
+The registry, so a closing conversation can reach its agent. Passed in rather than
+held, because this module must not depend on the agent layer.
+
+## invariant No clock of its own
+`now` is injected. Tests drive expiry and LRU by moving a number, not by sleeping.
+
+# test sessions
+
+- an expired conversation is closed by `prune` and stops resolving
+- with the cap exceeded, the least recently *used* conversation is evicted — a
+  refreshed old one survives while a newer idle one goes
+- forgetting one response of a chain keeps the conversation; forgetting the last closes it
+- `find` resolves any response in a chain to the same session

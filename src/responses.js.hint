@@ -1,0 +1,79 @@
+# goal The surface that actually fits ACP
+
+The Responses API is stateful and so is ACP; chat completions is not, and pays for
+it. Everything here follows from that one alignment — see
+[sessions.js.hint#conversation_unit](./sessions.js.hint) for the retention side.
+
+# invariant Pure translation, like openai.js {#pure}
+
+No I/O, no clock beyond what callers pass in. Response ids come from `sessions.js`
+and timestamps from the caller, so a response object is reproducible in a test.
+
+# rule A continued turn sends only the new input {#no_replay}
+
+This is the whole advantage over chat completions and the easiest thing to undo by
+accident. The session already holds the history; resending it would make the agent
+read its own past a second time, as text, alongside its real memory of it.
+
+So `toInputBlocks` renders **only** what arrived in this request. Any change that
+reconstructs a transcript from stored responses is wrong.
+
+# rule reasoning.effort is per request, and re-applied every turn {#per_request_effort}
+
+The one genuinely per-request agent setting ACP can carry, via the `thought_level`
+config option. It is applied through `Agent.turn`'s `overrides` on every turn,
+including on a session that already exists — a caller may raise it for one hard
+question in the middle of a conversation and drop it again after.
+
+Chat completions cannot express this at all; do not try to add it there by inventing
+a field OpenAI does not have.
+
+# func parseResponsesRequest {#parse}
+
+## result
+`{model, blocks, instructions, previousResponseId, store, stream, reasoning,
+maxTokens, stop, ignored}`.
+
+## rule store defaults to true
+OpenAI stores by default, and without retention `previous_response_id` could never
+be satisfied. `store: false` closes the session with the turn.
+
+## error unsupported_parameter
+`tools`, `tool_choice`, `text` (structured output), `include`, `truncation` — the
+same style/contract split as chat completions, under this API's names. See
+[_.hint#param_policy](../_.hint).
+
+# func responseObject {#shape}
+
+## rule status comes from the ACP stop reason, and incompleteness is stated
+`max_tokens` becomes `status: "incomplete"` with
+`incomplete_details.reason: "max_output_tokens"`, never a `completed` response
+holding a truncated answer. Reasoning becomes its own `reasoning` output item ahead
+of the message, matching where OpenAI puts it.
+
+# rule The stream is ordered, and that ordering is the contract {#event_order}
+
+Unlike chat completions' uniform chunks, these events are typed and sequenced: an
+item is added before its parts and closed after them, `output_index` increases, and
+`sequence_number` is dense so a consumer can detect a gap. A stray delta for an item
+that was never opened breaks a compliant client.
+
+`ResponseStream` owns that sequencing precisely so it cannot be violated by writes
+scattered through a request handler. Switching between reasoning and message text
+closes the open item first — the two are separate output items, not one interleaved
+stream.
+
+# test responses
+
+- `input` accepts a bare string, `{role, content}` messages, and `input_text` parts
+- `instructions` become an unlabelled system preamble
+- unsupported input item types are rejected rather than silently dropped
+- `previous_response_id`, `reasoning.effort`, `max_output_tokens`, `store` are mapped
+- `tools` and `text` are 400; `temperature` is ignored and reported
+- stop reasons map to `status`, with `incomplete_details` when truncated
+- reasoning appears as its own output item before the message
+- a conversation continues in the **same** ACP session, provable by its session id
+- a chain continues from any response in it, not only the tip
+- an unknown `previous_response_id` is 404; a mismatched model is 400
+- `store: false` answers and retains nothing
+- the event stream is typed, densely sequenced, correctly nested, and ends in `[DONE]`

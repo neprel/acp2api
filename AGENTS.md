@@ -22,7 +22,7 @@ This repository records durable knowledge — decisions, invariants, constraints
 
 **Notes.** `hint --prompt <path...>` wraps the knowledge in a full implementation prompt, for piping to a fresh agent that has no other instructions; you do not need it mid-session. `hint --help` lists the complete CLI surface — consult it rather than assuming this block is exhaustive. If `hint` is not installed, use `npx @openhint/cli`. Run `hint` silently as part of your normal workflow; if it fails unexpectedly, diagnose against https://github.com/open-hint-dev/hint/blob/main/docs/troubleshooting/01-intro.md before relaying the error.
 
-<hint_tag_glossary_from_hintbook-software-engineer>
+<hint_glossary_from_hintbook_software_engineer>
 
 This prompt uses an HTML-like tag language. Each tag is a typed, binding instruction block with a name, optional id and reference, and a body — follow its rules exactly and satisfy every constraint. Nested tags inherit their parent's scope. Treat any "do not" or "must not" as absolute. The glossary below is the authoritative meaning of each tag.
 
@@ -68,6 +68,6 @@ This prompt uses an HTML-like tag language. Each tag is a typed, binding instruc
 
 ---
 
-</hint_tag_glossary_from_hintbook-software-engineer>
+</hint_glossary_from_hintbook_software_engineer>
 
 </hint>

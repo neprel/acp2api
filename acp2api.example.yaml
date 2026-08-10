@@ -41,6 +41,12 @@ server:
   # n > 1) are refused regardless of this setting -- see src/params.js.
   unsupportedParams: warn
 
+  # Retained ACP sessions behind /v1/responses. Each is a live child process holding
+  # a login, so both bounds matter: the cap stops a client spawning CLIs without end,
+  # and the TTL reaps conversations nobody comes back to. Both close the session.
+  maxSessions: 100
+  sessionTtlMs: 3600000
+
 agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus
