@@ -56,6 +56,10 @@ export class Agent {
   // hand costs this map and one notification handler.
   #sinks = new Map();
   #terminals = null; // built on demand, only when the capability is on
+  // The warm session every new one is forked from: {session, warming, warmedAt}.
+  // Null until something asks for a session, and only ever set when `warmup` is
+  // configured. See #warmBase.
+  #base = null;
 
   constructor(spec, server, log = () => {}) {
     this.#spec = spec;
@@ -269,34 +273,65 @@ export class Agent {
   }
 
   /**
-   * Opens an ACP session and configures it from the agent's own settings.
+   * The warm base every new session is forked from, warming it if needed.
    *
-   * Returned separately from `prompt` because the Responses API keeps a session
-   * alive across requests -- that is the whole point of `previous_response_id`, and
-   * the reason a continued turn sends only the new input instead of replaying the
-   * history the agent already holds.
+   * A cold session re-orients before it can do anything: it reads the project's
+   * instructions, lists the tree, greps for its bearings. That is output tokens on
+   * the calls, input tokens on their results, and all of it resident in the context
+   * of every later turn -- paid again by every new conversation. Warming one
+   * session and forking it pays it once per `ttlMs` instead.
+   *
+   * The warm-up is a REAL TURN against a real subscription. It is not free, and it
+   * is only worth having when conversations start often enough to amortise it --
+   * which is why it exists only when `warmup.prompt` is configured.
+   *
+   * Single-flight: two requests arriving cold must not warm two bases and leave one
+   * of them unreferenced and resident.
    */
-  async openSession() {
-    const { connection } = await Promise.resolve().then(() => this.#connect());
-    const ctx = connection.agent;
-    const builder = ctx.buildSession(this.#spec.cwd);
-    // Tools belong to the AGENT, not to the request: the agent runs its own tool
-    // loop, so MCP servers are declared once, when the session opens. There is no
-    // per-request equivalent, which is why OpenAI's `tools` cannot map onto this.
-    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+  async #warmBase(ctx) {
+    const warmup = this.#spec.warmup;
+    const stale = this.#base?.session && this.#base.warmedAt + warmup.ttlMs < Date.now();
+    if (stale) {
+      // The fork is a session in its own right, so retiring the parent does not
+      // reach the conversations already forked from it.
+      const old = this.#base.session;
+      this.#base = null;
+      this.#log("info", `${this.name}: warm base expired; closing ${old.id}`);
+      await this.closeSession(old).catch(() => {});
+    }
+    if (this.#base?.warming) return await this.#base.warming;
+    if (this.#base?.session) return this.#base.session;
 
+    const warming = (async () => {
+      const session = await this.#newSession(ctx);
+      this.#log("info", `${this.name}: warming base session ${session.id}`);
+      await this.turn(session, [{ type: "text", text: warmup.prompt }]);
+      return session;
+    })();
+    this.#base = { session: null, warming, warmedAt: 0 };
+    try {
+      const session = await warming;
+      this.#base = { session, warming: null, warmedAt: Date.now() };
+      return session;
+    } catch (e) {
+      // A base that failed to warm must not be cached: the next request should try
+      // again, or fall back to a cold session, rather than inherit the failure.
+      this.#base = null;
+      this.#log("warn", `${this.name}: warm-up failed (${e?.message ?? e}); sessions will start cold`);
+      throw e;
+    }
+  }
+
+  /** `session/new` plus the agent's configured options. The cold path. */
+  async #newSession(ctx) {
+    const builder = ctx.buildSession(this.#spec.cwd);
+    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
     // `toRequest()` rather than `start()`: starting returns an `ActiveSession` that
     // registers its own update handler, and this class routes updates itself so a
     // resumed session can be read the same way a new one is. The builder is still
     // what shapes the request -- `mcpServers` has a fiddly array form.
     const res = await ctx.request(acp.methods.agent.session.new, builder.toRequest());
-    const session = {
-      id: res.sessionId,
-      // Tracked on the session rather than re-read from `session/new`, because that
-      // snapshot goes stale the moment an option is set.
-      options: res.configOptions ?? [],
-      agent: this.name,
-    };
+    const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name };
     try {
       await this.#applyOptions(ctx, session, this.#spec);
     } catch (e) {
@@ -305,6 +340,46 @@ export class Agent {
     }
     return session;
   }
+
+  /**
+   * Opens an ACP session and configures it from the agent's own settings.
+   *
+   * Returned separately from `prompt` because the Responses API keeps a session
+   * alive across requests -- that is the whole point of `previous_response_id`, and
+   * the reason a continued turn sends only the new input instead of replaying the
+   * history the agent already holds.
+   *
+   * With `warmup` configured this forks a warm base instead, so the agent starts
+   * already oriented. Every failure on that path falls back to a cold session:
+   * starting cold is slower and more expensive, and it is never wrong.
+   */
+  async openSession() {
+    const { connection, init } = await Promise.resolve().then(() => this.#connect());
+    const ctx = connection.agent;
+
+    if (this.#spec.warmup && init.agentCapabilities?.sessionCapabilities?.fork) {
+      try {
+        const base = await this.#warmBase(ctx);
+        const res = await ctx.request(acp.methods.agent.session.fork, {
+          sessionId: base.id,
+          cwd: this.#spec.cwd,
+          mcpServers: ctx.buildSession(this.#spec.cwd).toRequest().mcpServers,
+        });
+        const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name };
+        // Applied again rather than assumed inherited. A fork is a new session and
+        // the protocol does not promise it carries the parent's selections; two
+        // cheap local RPCs are a better bet than a thread silently running on the
+        // wrong model.
+        await this.#applyOptions(ctx, session, this.#spec);
+        this.#log("info", `${this.name}: forked ${session.id} from warm base ${base.id}`);
+        return session;
+      } catch (e) {
+        this.#log("warn", `${this.name}: fork failed (${e?.message ?? e}); opening a cold session`);
+      }
+    }
+    return await this.#newSession(ctx);
+  }
+
 
   /**
    * Restores a session this server closed earlier, by id.
@@ -513,6 +588,10 @@ export class Agent {
     // for it, and killing the CLI would leave the build it launched running with
     // nobody left to stop it.
     this.#terminals?.releaseAll();
+    // The warm base belongs to nobody but this agent, so nothing else will close it.
+    const base = this.#base?.session;
+    this.#base = null;
+    if (base) await this.closeSession(base).catch(() => {});
     const conn = this.#conn;
     this.#conn = null;
     if (!conn) return;

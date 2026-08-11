@@ -787,3 +787,65 @@ test("a mode the agent does not offer fails loudly rather than running anyway", 
   assert.equal(res.status, 400);
   assert.match((await res.json()).error.message, /no value "yolo"/);
 });
+
+test("a warmed base is read once and forked by every conversation after it", async (t) => {
+  // The point of warming: a cold session re-orients before it can do anything --
+  // reads the instructions, lists the tree, greps for its bearings -- and every new
+  // conversation pays for that again. Warming once and forking pays it once.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        warmup: { prompt: "read the repository" },
+      },
+    ],
+  });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const seen = async (res) => JSON.parse((await res.json()).choices[0].message.content);
+
+  const first = await seen(await ask("ECHOHEARD one", "thread-w1"));
+  const second = await seen(await ask("ECHOHEARD two", "thread-w2"));
+
+  // Both threads are forks of the same base, and both start knowing what it read.
+  assert.equal(first.from, "s1", "the base is the session that was warmed");
+  assert.equal(second.from, "s1", "and it is reused rather than warmed again");
+  assert.notEqual(first.id, second.id, "each conversation still gets its own session");
+  assert.match(first.heard[0], /read the repository/, "the fork inherits the warm-up");
+  assert.match(second.heard[0], /read the repository/);
+  // And the warm-up is not repeated per conversation -- that is the whole saving.
+  assert.equal(second.heard.filter((h) => h.includes("read the repository")).length, 1);
+});
+
+test("a warm-up that fails leaves sessions cold rather than failing the request", async (t) => {
+  // Starting cold is slower and more expensive. It is never wrong, so it is what
+  // every failure on the warm path falls back to.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        warmup: { prompt: "BOOM" },
+      },
+    ],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(res.status, 200, "the caller gets an answer, not the warm-up's failure");
+  assert.equal((await res.json()).choices[0].message.content, "[fast] hi");
+});
+
+test("with no warmup configured nothing is forked", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ECHOHEARD" }] }));
+  const seen = JSON.parse((await res.json()).choices[0].message.content);
+  assert.equal(seen.from, null);
+  assert.equal(seen.heard.length, 1, "only the caller's own turn");
+});

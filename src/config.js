@@ -286,10 +286,32 @@ function normalizeAgent(a, i, server, seen) {
     // autonomous deployment sets the mode for the session and lets the agent work,
     // while a shared channel can pin it to `plan` and read what it proposes.
     mode: a.mode ?? null,
+    warmup: normalizeWarmup(a.warmup, `${at}.warmup`),
     options: a.options ?? {},
     mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
     description: a.description ?? "",
   };
+}
+
+/**
+ * Normalizes an agent's warm-up, or null when it has none.
+ *
+ * `prompt` is a real turn against a real subscription, run once per `ttlMs` and
+ * forked by every conversation started in that window. It pays for itself only
+ * when conversations start often enough, which is why there is no default: an
+ * agent without this keeps opening cold sessions, which is slower and never wrong.
+ *
+ * `ttlMs` is how long the warmed context is still true. A base that read the
+ * repository is stale the moment the repository moves, and nothing here can know
+ * when that happened -- so this is a bet the operator makes, not a fact.
+ */
+function normalizeWarmup(warmup, at) {
+  if (warmup === undefined || warmup === null) return null;
+  req(warmup && typeof warmup === "object", `${at} must be a mapping`);
+  req(typeof warmup.prompt === "string" && warmup.prompt.trim().length > 0, `${at}.prompt is required`);
+  const ttlMs = warmup.ttlMs ?? 3_600_000;
+  req(Number.isInteger(ttlMs) && ttlMs > 0, `${at}.ttlMs must be a positive integer`);
+  return { prompt: warmup.prompt, ttlMs };
 }
 
 /**

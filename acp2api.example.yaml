@@ -139,6 +139,26 @@ agents:
     # plan / acceptEdits / bypassPermissions. This is the alternative to answering
     # a permission prompt per action: decide once, for the session.
     mode: acceptEdits
+    # Warm one session and fork it, instead of starting every conversation cold.
+    #
+    # A cold session re-orients before it can do anything -- reads the project's
+    # instructions, lists the tree, greps for its bearings -- and every new
+    # conversation pays for that again. This runs the prompt ONCE and forks the
+    # result, so each conversation starts already oriented and gets its own session.
+    #
+    # The warm-up is a real turn against a real subscription. It pays for itself
+    # only when conversations start often enough, which is why there is no default.
+    # `ttlMs` is how long the warmed context is still true: a base that read the
+    # repository is stale the moment the repository moves, and nothing here can know
+    # when that happened -- the number is a bet, not a fact.
+    #
+    # Requires the agent to advertise `sessionCapabilities.fork`. If it does not, or
+    # the warm-up fails, or the fork fails, sessions simply start cold.
+    warmup:
+      prompt: >-
+        Read AGENTS.md and get your bearings in this repository. Do not change
+        anything; this is preparation, and the real request comes next.
+      ttlMs: 3600000
 
   - name: claude-sonnet
     type: claude

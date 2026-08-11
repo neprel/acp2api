@@ -22,6 +22,7 @@
  *   ESCAPE      -> asks to run outside the workspace, and reports the refusal
  *   KILLIT      -> starts something endless and kills that one command
  *   ECHOMODE    -> answers with the permission mode it was put into
+ *   ECHOHEARD   -> answers with everything it has been told, and its fork parent
  * anything else is echoed back after one thought chunk.
  */
 import { Readable, Writable } from "node:stream";
@@ -90,7 +91,7 @@ const app = acp
   .agent({ name: "fake-agent" })
   .onRequest(acp.methods.agent.initialize, () => ({
     protocolVersion: acp.PROTOCOL_VERSION,
-    agentCapabilities: { loadSession: false, sessionCapabilities: { close: {}, resume: {} } },
+    agentCapabilities: { loadSession: false, sessionCapabilities: { close: {}, resume: {}, fork: {} } },
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
@@ -129,6 +130,21 @@ const app = acp
     if (state) state.closed = true;
     return {};
   })
+  // A fork is a NEW session carrying a copy of the parent's history, which is what
+  // makes a warm base worth having: whatever the parent read, the child starts with.
+  .onRequest(acp.methods.agent.session.fork, ({ params }) => {
+    const parent = sessions.get(params.sessionId);
+    if (!parent) throw new Error(`unknown session ${params.sessionId}`);
+    const sessionId = `s${++opened}`;
+    sessions.set(sessionId, {
+      ...parent,
+      forkedFrom: params.sessionId,
+      heard: [...(parent.heard ?? [])],
+      turns: 0,
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, thoughtTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
+    });
+    return { sessionId, configOptions: optionsFor(sessions.get(sessionId)) };
+  })
   .onRequest(acp.methods.agent.session.resume, ({ params }) => {
     const state = sessions.get(params.sessionId);
     // An id this agent never issued, or one that was deleted, cannot come back.
@@ -152,6 +168,7 @@ const app = acp
     const state = sessions.get(params.sessionId);
     if (!state) throw new Error(`no such session ${params.sessionId}`);
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
+    state.heard = [...(state.heard ?? []), text];
 
     if (text.includes("QUOTA")) throw new Error("Claude usage limit reached. Your limit will reset at 3pm.");
     if (text.includes("BOOM")) throw new Error("connection reset by peer");
@@ -189,6 +206,16 @@ const app = acp
       });
       await say({ sessionUpdate: "tool_call", toolCallId: "t3", title: "Bash pytest", kind: "execute", status: "failed" });
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Answers with everything this session has ever been told, so a test can prove a
+    // fork inherited the warm base's history rather than starting blank.
+    if (text.includes("ECHOHEARD")) {
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: JSON.stringify({ id: params.sessionId, from: state.forkedFrom ?? null, heard: state.heard }) },
+      });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 

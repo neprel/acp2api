@@ -242,6 +242,27 @@ wall no retry gets past. And a turn nobody waited for — the caller hung up, or
 request timed out — no longer costs a **keyed** conversation its session: that is a
 human redirecting the agent, not a broken agent.
 
+### Starting warm instead of cold
+
+A cold session re-orients before it can do anything: it reads the project's
+instructions, lists the tree, greps for its bearings. That is real tokens, and every
+new conversation pays for it again.
+
+```yaml
+    warmup:
+      prompt: Read AGENTS.md and get your bearings. Do not change anything.
+      ttlMs: 3600000
+```
+
+acp2api runs that once, then `session/fork`s the result for every conversation, so
+each starts already oriented and still gets a session of its own. The warm-up is a
+real turn against a real subscription, run once per `ttlMs` — worth having when
+conversations start often enough to amortise it, which is why there is no default.
+
+Everything about it fails soft. No `sessionCapabilities.fork`, a warm-up that
+throws, a fork that is refused: the session simply opens cold, which is slower and
+never wrong.
+
 ### Watching a turn happen
 
 `server.progress: reasoning` narrates what the agent is doing into
