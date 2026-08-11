@@ -23,6 +23,23 @@ server:
   permission: allow
   fs: true
 
+  # Run the agent's commands HERE instead of inside it.
+  #
+  # With this on, an agent routes its shell work through `terminal/*`: the output
+  # is ours as it happens, and `terminal/kill` stops ONE command -- where the only
+  # other stop is `session/cancel`, which ends the whole turn.
+  #
+  # It is a transfer of responsibility, not an added feature. Containment,
+  # timeouts, output bounds and process reaping stop being the agent's problem and
+  # become this bridge's. Off by default for that reason: an agent that sandboxes
+  # its own execution stops doing so the moment this is on.
+  terminal: false
+  maxTerminals: 8
+  terminalOutputBytes: 1048576
+  # Wall clock for one command; 0 disables it. The agent decides when to stop
+  # waiting, this decides when to stop running.
+  terminalTimeoutMs: 1800000
+
   # Narrate what the agent is doing -- its tool calls, its edits, its plan -- so a
   # turn that runs for minutes is legible while it runs: off | reasoning.
   #

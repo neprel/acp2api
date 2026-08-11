@@ -4,6 +4,7 @@ import { dirname, relative, resolve, isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { Progress } from "./progress.js";
+import { Terminals } from "./terminal.js";
 
 /** Thrown for anything the HTTP layer should report with a specific status. */
 export class AgentError extends Error {
@@ -54,11 +55,21 @@ export class Agent {
   // which would rule out `session/resume` and `session/fork` entirely. Routing by
   // hand costs this map and one notification handler.
   #sinks = new Map();
+  #terminals = null; // built on demand, only when the capability is on
 
   constructor(spec, server, log = () => {}) {
     this.#spec = spec;
     this.#server = server;
     this.#log = log;
+    if (server.terminal) {
+      this.#terminals = new Terminals({
+        cwd: spec.cwd,
+        max: server.maxTerminals,
+        outputByteLimit: server.terminalOutputBytes,
+        timeoutMs: server.terminalTimeoutMs,
+        log,
+      });
+    }
   }
 
   get name() {
@@ -90,6 +101,48 @@ export class Agent {
         }
         return { outcome: { outcome: "cancelled" } };
       });
+
+    const terminals = this.#terminals;
+    // A refusal has to be legible to the AGENT, which is the only thing that can
+    // adapt to it. An ordinary thrown Error reaches it as a bare "Internal error"
+    // with the reason stripped, so it retries the same forbidden thing.
+    const legible = (fn) => {
+      try {
+        return fn();
+      } catch (e) {
+        const detail = e?.message ?? String(e);
+        throw /unknown terminal/.test(detail)
+          ? acp.RequestError.resourceNotFound(detail)
+          : acp.RequestError.invalidParams(detail);
+      }
+    };
+    if (terminals) {
+      // Advertising `terminal` moves execution here: the agent stops running its
+      // own commands and asks instead. Every guard the agent used to apply is now
+      // this client's job -- see terminal.js.
+      app
+        .onRequest(acp.methods.client.terminal.create, ({ params }) =>
+          legible(() => ({ terminalId: terminals.create(params) })),
+        )
+        .onRequest(acp.methods.client.terminal.output, ({ params }) =>
+          legible(() => terminals.output(params.terminalId)),
+        )
+        .onRequest(acp.methods.client.terminal.waitForExit, async ({ params }) =>
+          await legible(() => terminals.waitForExit(params.terminalId)),
+        )
+        .onRequest(acp.methods.client.terminal.kill, ({ params }) =>
+          legible(() => {
+            terminals.kill(params.terminalId);
+            return {};
+          }),
+        )
+        // Release is idempotent on purpose: an agent tidying up after a terminal
+        // that already went is doing the right thing and must not be punished.
+        .onRequest(acp.methods.client.terminal.release, ({ params }) => {
+          terminals.release(params.terminalId);
+          return {};
+        });
+    }
 
     if (!fsEnabled) return app;
     return app
@@ -140,6 +193,10 @@ export class Agent {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {
           fs: { readTextFile: this.#server.fs, writeTextFile: this.#server.fs },
+          // Declaring this is what makes the agent route its shell work through
+          // us. It is a transfer of responsibility, not an extra feature: from
+          // here on, containment, timeouts and reaping are ours.
+          ...(this.#terminals ? { terminal: true } : {}),
           // `plan_update` and `plan_removed` are sent ONLY to a client that asks for
           // them; without this the agent falls back to resending the whole plan, or
           // to sending nothing, and it looks like an agent that never plans. Asked
@@ -448,6 +505,10 @@ export class Agent {
 
   async close() {
     this.#closing = true;
+    // Before the agent goes: a command it started outlives the process that asked
+    // for it, and killing the CLI would leave the build it launched running with
+    // nobody left to stop it.
+    this.#terminals?.releaseAll();
     const conn = this.#conn;
     this.#conn = null;
     if (!conn) return;

@@ -66,6 +66,23 @@ const DEFAULTS = {
   requestTimeoutMs: 600_000,
   permission: "allow",
   fs: true,
+  // Run the agent's commands HERE instead of inside it.
+  //
+  // Advertising ACP's `terminal` capability makes an agent route its shell work
+  // through this bridge: the output is ours as it happens, and `terminal/kill`
+  // stops one command instead of `session/cancel` ending the whole turn.
+  //
+  // It is a transfer of responsibility rather than an added feature. Containment,
+  // timeouts, output bounds and process reaping stop being the agent's problem and
+  // become this one's -- see src/terminal.js. Off by default because an agent that
+  // was sandboxing its own execution stops doing so the moment this is on.
+  terminal: false,
+  maxTerminals: 8,
+  terminalOutputBytes: 1_048_576,
+  // Wall clock for a single command. A command nobody kills and nobody waits for
+  // outlives the turn, the session and the conversation; the agent decides when to
+  // stop waiting, this decides when to stop running. 0 disables the bound.
+  terminalTimeoutMs: 1_800_000,
   // What to do with OpenAI parameters ACP cannot carry. `warn` is the default and
   // the only sane one: every client library sends `temperature` unasked, so `error`
   // would reject almost every request in the wild. See src/params.js for why some
@@ -185,6 +202,16 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
   req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
+  req(typeof s.terminal === "boolean", "server.terminal must be true or false");
+  req(Number.isInteger(s.maxTerminals) && s.maxTerminals > 0, "server.maxTerminals must be a positive integer");
+  req(
+    Number.isInteger(s.terminalOutputBytes) && s.terminalOutputBytes > 0,
+    "server.terminalOutputBytes must be a positive integer",
+  );
+  req(
+    Number.isInteger(s.terminalTimeoutMs) && s.terminalTimeoutMs >= 0,
+    "server.terminalTimeoutMs must be a non-negative integer",
+  );
   req(
     typeof s.maxContextFill === "number" && s.maxContextFill >= 0 && s.maxContextFill <= 1,
     `server.maxContextFill must be a fraction between 0 and 1, got ${s.maxContextFill}`,

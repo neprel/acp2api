@@ -259,6 +259,30 @@ comes back as the assistant's own words on the next turn. Off by default, so a
 caller already rendering reasoning as prose does not suddenly start showing tool
 traffic.
 
+### Running the agent's commands yourself
+
+`server.terminal: true` advertises ACP's `terminal` capability, and an agent that
+sees it routes its shell work through the bridge instead of running it itself. Two
+things follow: the output is yours as it happens, and `terminal/kill` stops **one**
+command — where the only other stop is `session/cancel`, which ends the whole turn
+and everything it had built up.
+
+This is a transfer of responsibility, not an extra feature. Containment, timeouts,
+output bounds and process reaping stop being the agent's problem and become the
+bridge's:
+
+- commands run inside `server.cwd`, the same boundary `fs/*` uses, and a `cwd`
+  outside it is refused with a reason the agent can read;
+- each command is its own process group, so a kill takes the build a shell
+  started and not just the shell;
+- output keeps the last `terminalOutputBytes`, cut at a character boundary;
+- `terminalTimeoutMs` bounds a command nobody kills and nobody waits for;
+- `maxTerminals` bounds how many run at once, and everything is reaped when the
+  agent shuts down — before the CLI is killed, or its children outlive it.
+
+Off by default, because an agent that was sandboxing its own execution stops doing
+so the moment this is on.
+
 ### /v1/responses is the better fit
 
 The Responses API is stateful and so is ACP, which makes the mapping direct rather

@@ -723,3 +723,39 @@ test("a session the agent cannot resume becomes a fresh one, not an error", asyn
   assert.equal(res.status, 200, "a lost session is answered, not turned into a 502");
   assert.doesNotMatch(await said(res), /^s1/, "and answered from a session that exists");
 });
+
+test("with the terminal capability on, the agent's commands run here", async (t) => {
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "SHELL" }] }));
+  const seen = JSON.parse((await res.json()).choices[0].message.content);
+  assert.equal(seen.exit.exitCode, 0);
+  assert.equal(seen.truncated, false);
+  assert.match(seen.output, /out-/, "stdout reaches the agent");
+  assert.match(seen.output, /err/, "and stderr does too, in the same stream");
+  assert.ok(seen.exitStatus, "output reports the exit status once the command has finished");
+});
+
+test("a command asking to run outside the workspace is refused, not run", async (t) => {
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ESCAPE" }] }));
+  const said = (await res.json()).choices[0].message.content;
+  assert.match(said, /^REFUSED:.*outside workspace/);
+});
+
+test("one command can be stopped without ending the turn", async (t) => {
+  // The reason the capability is worth owning: session/cancel is the only other
+  // stop, and it takes the whole turn -- plan, open files and all -- with it.
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "KILLIT" }] }));
+  assert.equal(res.status, 200, "the turn survives the command it killed");
+  const exit = JSON.parse((await res.json()).choices[0].message.content);
+  assert.ok(exit.signal || exit.exitCode !== 0, `expected a killed process, got ${JSON.stringify(exit)}`);
+});
+
+test("without the capability the agent is never offered a terminal", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "SHELL" }] }));
+  // The fixture asks anyway; an unadvertised capability must answer "no such
+  // method" rather than quietly running the command.
+  assert.match((await res.json()).choices[0].message.content, /^REFUSED:/);
+});

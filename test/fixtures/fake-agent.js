@@ -7,11 +7,20 @@
  * `session/set_config_option` round trip and real streamed updates. It has no
  * dependency beyond the SDK, so the suite runs offline and burns no subscription.
  *
- * Prompt text drives the behaviour, so a test can ask for the failure it wants:
- *   QUOTA   -> fails the way an exhausted subscription does (429 path)
- *   BOOM    -> fails with an unrelated error (must stay 502, not 429)
- *   HANG    -> never finishes on its own (cancellation path)
- *   REFUSE  -> completes with stopReason "refusal"
+ * Prompt text drives the behaviour, so a test can ask for the case it wants:
+ *   QUOTA       -> fails the way an exhausted subscription does (429 path)
+ *   BOOM        -> fails with an unrelated error (must stay 502, not 429)
+ *   HANG        -> never finishes on its own (cancellation path)
+ *   REFUSE      -> completes with stopReason "refusal"
+ *   COUNT       -> streams word by word, so max_tokens and stop have somewhere to cut
+ *   ECHOSESSION -> answers with its own session id (continuity, parking, resume)
+ *   ECHOMCP     -> answers with the mcpServers it was given
+ *   WORK        -> a plan, a diff and a failed tool (the progress renderer)
+ *   FILL        -> reports a context window 95% used (retirement)
+ *   AMNESIA     -> forgets its own session, so a later resume fails
+ *   SHELL       -> drives the client terminal end to end
+ *   ESCAPE      -> asks to run outside the workspace, and reports the refusal
+ *   KILLIT      -> starts something endless and kills that one command
  * anything else is echoed back after one thought chunk.
  */
 import { Readable, Writable } from "node:stream";
@@ -180,6 +189,71 @@ const app = acp
     if (text.includes("AMNESIA")) {
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
       sessions.delete(params.sessionId);
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Drives the client terminal the way a real agent does: create, wait, read,
+    // release. Answers with what it saw, so a test can assert the whole round trip
+    // rather than that a handler exists.
+    if (text.includes("SHELL")) {
+      try {
+        const { terminalId } = await client.request(acp.methods.client.terminal.create, {
+          sessionId: params.sessionId,
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('out-'); process.stderr.write('err')"],
+        });
+        const exit = await client.request(acp.methods.client.terminal.waitForExit, {
+          sessionId: params.sessionId,
+          terminalId,
+        });
+        const seen = await client.request(acp.methods.client.terminal.output, {
+          sessionId: params.sessionId,
+          terminalId,
+        });
+        await client.request(acp.methods.client.terminal.release, { sessionId: params.sessionId, terminalId });
+        await say({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: JSON.stringify({ exit, ...seen }) },
+        });
+      } catch (e) {
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `REFUSED: ${e.data ?? e.message}` } });
+      }
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Asks to run somewhere outside the workspace, which the client must refuse.
+    if (text.includes("ESCAPE")) {
+      try {
+        await client.request(acp.methods.client.terminal.create, {
+          sessionId: params.sessionId,
+          command: process.execPath,
+          args: ["-e", "0"],
+          cwd: "/",
+        });
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ALLOWED" } });
+      } catch (e) {
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `REFUSED: ${e.data ?? e.message}` } });
+      }
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Starts something that never ends, then stops that ONE command -- the thing
+    // session/cancel cannot do without ending the turn as well.
+    if (text.includes("KILLIT")) {
+      const { terminalId } = await client.request(acp.methods.client.terminal.create, {
+        sessionId: params.sessionId,
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+      });
+      await client.request(acp.methods.client.terminal.kill, { sessionId: params.sessionId, terminalId });
+      const exit = await client.request(acp.methods.client.terminal.waitForExit, {
+        sessionId: params.sessionId,
+        terminalId,
+      });
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: JSON.stringify(exit) },
+      });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
