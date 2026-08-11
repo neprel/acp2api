@@ -42,6 +42,27 @@ const optionsFor = (state) => [
   { id: "verbose", name: "Verbose", type: "boolean", currentValue: state.verbose },
 ];
 
+/**
+ * Bills one turn against the session's running totals and returns them.
+ *
+ * Every turn costs the same 11 in / 22 out / 3 thought, so a caller reading the
+ * numbers as per-turn sees an identical figure each time and a caller reading them
+ * as session totals sees them grow — which is exactly the confusion the bridge has
+ * to resolve. The first turn writes the prompt cache and later turns read it, so
+ * the cache counters move too.
+ */
+function chargeTurn(state) {
+  state.turns += 1;
+  const u = state.usage;
+  u.inputTokens += 11;
+  u.outputTokens += 22;
+  u.thoughtTokens += 3;
+  if (state.turns === 1) u.cachedWriteTokens += 11;
+  else u.cachedReadTokens += 10;
+  u.totalTokens = u.inputTokens + u.outputTokens;
+  return { ...u };
+}
+
 const app = acp
   .agent({ name: "fake-agent" })
   .onRequest(acp.methods.agent.initialize, () => ({
@@ -54,7 +75,24 @@ const app = acp
     // session closes, or a test asserting "this is a different session" passes by
     // accident when the id happens to come round again.
     const sessionId = `s${++opened}`;
-    const state = { model: "fast", effort: "low", verbose: false, mcp: params.mcpServers ?? [] };
+    const state = {
+      model: "fast",
+      effort: "low",
+      verbose: false,
+      mcp: params.mcpServers ?? [],
+      // ACP token counters are totals for the SESSION, not for a turn, and a real
+      // agent accumulates them across every prompt. The fixture does the same so
+      // the bridge's per-turn arithmetic is exercised rather than assumed.
+      turns: 0,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        thoughtTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+    };
     sessions.set(sessionId, state);
     return { sessionId, configOptions: optionsFor(state) };
   })
@@ -122,7 +160,7 @@ const app = acp
     }
     return {
       stopReason: text.includes("REFUSE") ? "refusal" : "end_turn",
-      usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33, thoughtTokens: 3 },
+      usage: chargeTurn(state),
     };
   });
 

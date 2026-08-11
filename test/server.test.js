@@ -256,6 +256,57 @@ test("a named conversation replays nothing it has already heard", async (t) => {
   assert.ok(!seen.includes("one"), `expected only the new turn, got ${JSON.stringify(seen)}`);
 });
 
+test("a continued conversation bills each turn, not the session so far", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const usageOf = async (res) => (await res.json()).usage;
+
+  // The fixture charges an identical 11/22/3 per turn and reports the running
+  // SESSION total, the way a real ACP agent does. Passed through unchanged, turn
+  // two would claim to have cost twice what turn one did.
+  const first = await usageOf(await ask("one", "thread-a"));
+  const second = await usageOf(await ask("two", "thread-a"));
+
+  assert.equal(first.prompt_tokens, 11);
+  assert.equal(first.completion_tokens, 22);
+  assert.equal(second.prompt_tokens, 11, "turn two must not re-bill turn one's input");
+  assert.equal(second.completion_tokens, 22);
+  assert.equal(second.total_tokens, 33);
+});
+
+test("cache reads reach the caller, because they are the only proof continuity paid off", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const usageOf = async (res) => (await res.json()).usage;
+
+  const first = await usageOf(await ask("one", "thread-b"));
+  const second = await usageOf(await ask("two", "thread-b"));
+
+  // The first turn writes the cache and reads nothing; the second reads it.
+  assert.equal(first.prompt_tokens_details.cached_tokens, 0);
+  assert.equal(first.prompt_tokens_details.cache_creation_tokens, 11);
+  assert.equal(second.prompt_tokens_details.cached_tokens, 10);
+  assert.equal(second.prompt_tokens_details.cache_creation_tokens, 0);
+});
+
+test("a fresh conversation is billed in full, with no baseline to subtract", async (t) => {
+  const call = await start(t);
+  const one = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  const two = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  // Two unrelated requests, two sessions: each pays its own first turn in full,
+  // and neither may come out as zero because the other had already reported.
+  assert.equal((await one.json()).usage.prompt_tokens, 11);
+  assert.equal((await two.json()).usage.prompt_tokens, 11);
+});
+
 test("different keys are different conversations", async (t) => {
   const call = await start(t);
   const ask = (content, key) =>

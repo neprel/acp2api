@@ -170,15 +170,69 @@ first, then reasoning, then raw ids — and the list is re-read from each
 Resolving all ids up front looks equivalent and is not: it fails with
 `unknown config option "effort"` on a config that is merely contradictory.
 
-# good One process per agent, one session per request {#lifecycle}
+# good One process per agent, one live session per conversation {#lifecycle}
 
 Spawning `claude-agent-acp` costs seconds, so the child process is lazily started
-and kept. The ACP **session** is per request, because an OpenAI chat completion is
-stateless and carries its whole history in `messages` — reusing a session would
-replay that history on top of the agent's own.
+and kept.
+
+The session was originally per REQUEST, because an OpenAI chat completion is
+stateless and carries its whole history in `messages` — reusing one would replay
+that history on top of the agent's own. `continuity` (1.2.0) and the caller-supplied
+key (1.4.0) changed that: a session now spans a conversation, and is held live in
+[src/sessions.js.hint](src/sessions.js.hint) for as long as its TTL allows.
+
+**Holding it live is a choice, and not the only one** — see
+[#unused_surface](#unused_surface). A stored session id plus `session/resume` keeps
+a conversation continuous across a restart and costs no resident process.
 
 `close()` is terminal. Without that, a request arriving during shutdown respawns a
 CLI that nothing is left to reap, and the process never exits.
+
+# rule The protocol surface this bridge does not use {#unused_surface}
+
+Taken on 2026-08-11 by loading the SDK and both adapters and printing what they
+advertise. Recorded because reading the docs understates it and reading this
+source overstates how much of ACP is in play.
+
+**Session lifecycle.** Both adapters advertise `loadSession: true` and
+`sessionCapabilities: { resume, list, close, delete, fork, additionalDirectories }`
+(`codex-acp` minus `fork`). `session/load` replays the whole transcript back as
+`session/update` notifications; `session/resume` restores the session and its MCP
+connections and replays nothing — **`resume` is the one a rendering bridge wants**,
+or every reconnect re-emits the history as fresh output.
+
+`claude-agent-acp` fingerprints `cwd` + `mcpServers` and compares on load/resume,
+so a stored id is only valid while an agent's config is unchanged. Any persistence
+scheme must key on that or fail closed.
+
+**`session/update` has thirteen kinds; this bridge reads two.** Beyond
+`agent_message_chunk` and `agent_thought_chunk`: `tool_call` / `tool_call_update`
+(received, then dropped by design — see
+[src/agent.js.hint#tool_calls_are_progress](src/agent.js.hint)), `plan` /
+`plan_update` / `plan_removed` (the incremental pair requires the client to
+advertise `plan: {}`), `usage_update` (cost during the turn), `session_info_update`
+(the agent's own title), `available_commands_update`, `current_mode_update`,
+`config_option_update`, `user_message_chunk` (echo of what the agent heard, behind
+`--replay-user-messages`).
+
+**A tool call is already structured.** `kind` ∈ `read | edit | delete | move |
+search | execute | think | fetch | switch_mode | other`, `status` ∈ `pending |
+in_progress | completed | failed`, and `content[]` entries are `content`,
+`diff { path, oldText, newText }` or `terminal { terminalId }`. Anything rendering
+progress should read those rather than parse tool names.
+
+**`terminal/*` is a client capability this bridge does not advertise.** It declares
+`fs` only. Advertising `terminal: true` moves command execution into the bridge:
+live output, and `terminal/kill` stops one command instead of the turn. It also
+moves sandboxing, timeouts and process reaping here — the `server.cwd` containment
+that guards the `fs` handlers has no equivalent for exec and would have to be
+written.
+
+`elicitation/create` (a typed agent-initiated question, the one pause that can
+carry free text), `session/set_mode`, and `_meta` on nearly every message are all
+unused. The SDK also ships `http-stream`, `ws-stream`, `server-sse` and
+`ws-server`, so ACP is not stdio-only — but `claude-agent-acp` exposes no HTTP
+flag, so a networked agent needs a wrapper this project does not have.
 
 # rule No human answers a permission prompt
 

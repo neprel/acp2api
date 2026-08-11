@@ -67,6 +67,22 @@ it alive.
 requests, and it applies TTL first and the cap second — expiry is about
 abandonment, the cap is about pressure, and they are not the same question.
 
+**Neither is about the cost of the session itself, and that is the gap.** A TTL
+bounds resident processes; it does not bound a transcript. A conversation that is
+continued every few minutes for a week is exactly the one this rule keeps alive,
+and exactly the one that walks into Claude Code's own compaction (a model call out
+of the same subscription) and then into `terminal_reason=prompt_too_long`, which
+no retry cures. `usage_update` reports `used` and `size` — the context window
+filling — so retirement can be decided on how full a session is rather than on how
+long since anyone spoke. Raising the TTL without adding that is trading a bound we
+have for one we do not.
+
+Related: the cache is no reason to hold a session resident. Prompt caching lives on
+the provider's side with its own TTL, refreshed by use; a live child process warms
+nothing. What continuity actually buys is that the agent does not re-orient from
+scratch — see [_.hint#unused_surface](../_.hint) for `session/resume`, which buys
+the same thing without the resident process.
+
 # func prune {#prune}
 
 ## arg agents

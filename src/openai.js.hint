@@ -82,6 +82,31 @@ picks the model, so no tokenizer here can be correct. `max_tokens` is a budget, 
 an accountant. Do not replace this with a real tokenizer without also deciding which
 model's tokenizer it is supposed to be.
 
+# rule ACP usage is per SESSION; a response reports per TURN {#usage_is_cumulative}
+
+The ACP schema defines these counters as totals — "Sum of all token types across
+session", "Total input tokens across all turns" — and `claude-agent-acp` keeps an
+`accumulatedUsage` on the session to produce them. That was indistinguishable from
+per-turn while a session served exactly one request, and stopped being so the
+moment `continuity` let a session span a whole conversation: passed through
+unchanged, every response bills the caller for the entire thread again, and
+anything that sums responses counts the first turn once per turn that followed.
+
+So `deltaUsage(usage, before)` subtracts what the session last reported, and
+`sessions.usageBaseline` / `rememberUsage` hold that baseline per conversation.
+`settleUsage` in `server.js` is the single place both happen, and it must run
+**exactly once per turn** — a second call would find the baseline already advanced
+and report zero.
+
+A counter that moved BACKWARDS is read as the counter itself, not as a negative
+delta: that means the agent re-based its own accounting, and no consumer can do
+anything with a negative token count.
+
+`cachedReadTokens` is reported as `prompt_tokens_details.cached_tokens` — a subset
+of `prompt_tokens` in OpenAI's model, not an addition to it. It is the only
+evidence a caller ever gets that continuing a session saved anything, which is why
+it is worth carrying at all.
+
 # rule Response builders never invent fields {#response_shape}
 
 `completion`, `chunk` and `usageChunk` emit exactly what OpenAI emits, plus

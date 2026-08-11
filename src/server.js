@@ -5,6 +5,7 @@ import { ParamReporter } from "./params.js";
 import {
   chunk,
   completion,
+  deltaUsage,
   errorBody,
   makeLimiter,
   newCompletionId,
@@ -251,7 +252,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
     if (clientGone) return res.end();
     if (timedOut && !stream) throw timeoutError(request.model, config);
 
-    const response = shape(turn);
+    const response = shape(settleUsage(sessions, convId, turn));
     // `store: false` means the caller will never continue from this id, so the
     // session it opened has no future -- keeping it would retain a live login.
     if (request.store) sessions.record(convId, id, response);
@@ -378,7 +379,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       // a router downstream would count as success.
       if (timedOut) throw timeout();
       remember(sessions, convId, prefix, turn.text);
-      return send(res, 200, completion({ ...meta, ...turn, ignored }));
+      return send(res, 200, completion({ ...meta, ...settleUsage(sessions, convId, turn), ignored }));
     }
 
     // Headers go out only once the turn is under way. Sending them earlier would
@@ -415,11 +416,12 @@ async function handleCompletion(req, res, registry, config, log, params, session
     if (timedOut && !started) throw timeout();
 
     remember(sessions, convId, prefix, turn.text);
+    const settled = settleUsage(sessions, convId, turn);
     start(); // an empty turn still owes the client a well-formed stream
     // Mid-stream there is no status left to change, so say "length": the answer is
     // genuinely truncated, and that is the closest honest finish_reason.
     write(res, chunk({ ...meta, delta: {}, finishReason: timedOut ? "length" : finishOf(turn.stopReason) }));
-    if (includeUsage && turn.usage) write(res, usageChunk({ ...meta, usage: turn.usage }));
+    if (includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (e) {
@@ -456,6 +458,22 @@ async function handleCompletion(req, res, registry, config, log, params, session
 function remember(sessions, convId, prefix, text) {
   if (!convId) return;
   sessions.extendPrefix(convId, [...prefix, fingerprint({ role: "assistant", content: text })]);
+}
+
+/**
+ * Replaces a turn's CUMULATIVE session counters with what this turn alone cost, and
+ * moves the session's baseline forward.
+ *
+ * ACP counts tokens across the whole session, and a retained session serves many
+ * requests, so passing the counters through unchanged would bill every response for
+ * the entire conversation so far. Call this exactly once per turn, before the
+ * response is shaped -- calling it twice would report a delta of zero.
+ */
+function settleUsage(sessions, convId, turn) {
+  if (!convId || !turn?.usage) return turn;
+  const usage = deltaUsage(turn.usage, sessions.usageBaseline(convId));
+  sessions.rememberUsage(convId, turn.usage);
+  return { ...turn, usage };
 }
 
 const finishOf = (stopReason) =>

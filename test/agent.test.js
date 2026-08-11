@@ -40,7 +40,16 @@ test("a prompt turn streams reasoning and text, then reports usage", async (t) =
   assert.equal(turn.text, "[fast] hello");
   assert.equal(turn.reasoning, "thinking(low)");
   assert.equal(turn.stopReason, "end_turn");
-  assert.deepEqual(turn.usage, { inputTokens: 11, outputTokens: 22, totalTokens: 33, thoughtTokens: 3 });
+  // Raw ACP counters, passed through untouched: these are SESSION totals, and
+  // turning them into what one turn cost belongs to the server, not to this layer.
+  assert.deepEqual(turn.usage, {
+    inputTokens: 11,
+    outputTokens: 22,
+    totalTokens: 33,
+    thoughtTokens: 3,
+    cachedReadTokens: 0,
+    cachedWriteTokens: 11,
+  });
   // Streamed incrementally, with the tool call reported as progress rather than
   // folded into the answer.
   assert.deepEqual(events, [
