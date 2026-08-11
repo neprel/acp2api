@@ -218,6 +218,92 @@ forking on each such change would mean never continuing anything.
 The header name is `server.conversationHeader`; set it to `""` to ignore it.
 Requests without it fall back to prefix matching.
 
+### Going quiet does not lose the work
+
+A conversation nobody has continued past `sessionTtlMs` is **parked**, not ended:
+it closes its ACP session — freeing the child process and the login it holds — and
+keeps the session id. The next message restores it with `session/resume`, and the
+agent still has every file it read and every plan it made.
+
+```
+fake: session conv_msp… parked: sess_01H…
+fake: resumed sess_01H… [mattermost:channel:c8f3…]
+```
+
+So the bounds mean what they should: `maxSessions` caps resident sessions,
+`sessionTtlMs` decides when to give one back, and `forgetTtlMs` — a day by default
+— is what finally forgets a conversation. An agent that cannot resume is not a
+problem: the revive fails and the caller gets a fresh session with its history
+replayed, which is what would have happened anyway.
+
+Two other things end a session. `maxContextFill` retires one that has used up its
+context window, because the alternative is the agent's own compaction and then a
+wall no retry gets past. And a turn nobody waited for — the caller hung up, or the
+request timed out — no longer costs a **keyed** conversation its session: that is a
+human redirecting the agent, not a broken agent.
+
+### Starting warm instead of cold
+
+A cold session re-orients before it can do anything: it reads the project's
+instructions, lists the tree, greps for its bearings. That is real tokens, and every
+new conversation pays for it again.
+
+```yaml
+    warmup:
+      prompt: Read AGENTS.md and get your bearings. Do not change anything.
+      ttlMs: 3600000
+```
+
+acp2api runs that once, then `session/fork`s the result for every conversation, so
+each starts already oriented and still gets a session of its own. The warm-up is a
+real turn against a real subscription, run once per `ttlMs` — worth having when
+conversations start often enough to amortise it, which is why there is no default.
+
+Everything about it fails soft. No `sessionCapabilities.fork`, a warm-up that
+throws, a fork that is refused: the session simply opens cold, which is slower and
+never wrong.
+
+### Watching a turn happen
+
+`server.progress: reasoning` narrates what the agent is doing into
+`reasoning_content`, next to the thinking already there:
+
+```
+▸ plan 1/3 — patch the compose file
+› Edit compose.yaml
+± compose.yaml +2/-1
+✗ Bash pytest
+```
+
+Never into the answer: a trace written into the text becomes part of the text, and
+comes back as the assistant's own words on the next turn. Off by default, so a
+caller already rendering reasoning as prose does not suddenly start showing tool
+traffic.
+
+### Running the agent's commands yourself
+
+`server.terminal: true` advertises ACP's `terminal` capability, and an agent that
+sees it routes its shell work through the bridge instead of running it itself. Two
+things follow: the output is yours as it happens, and `terminal/kill` stops **one**
+command — where the only other stop is `session/cancel`, which ends the whole turn
+and everything it had built up.
+
+This is a transfer of responsibility, not an extra feature. Containment, timeouts,
+output bounds and process reaping stop being the agent's problem and become the
+bridge's:
+
+- commands run inside `server.cwd`, the same boundary `fs/*` uses, and a `cwd`
+  outside it is refused with a reason the agent can read;
+- each command is its own process group, so a kill takes the build a shell
+  started and not just the shell;
+- output keeps the last `terminalOutputBytes`, cut at a character boundary;
+- `terminalTimeoutMs` bounds a command nobody kills and nobody waits for;
+- `maxTerminals` bounds how many run at once, and everything is reaped when the
+  agent shuts down — before the CLI is killed, or its children outlive it.
+
+Off by default, because an agent that was sandboxing its own execution stops doing
+so the moment this is on.
+
 ### /v1/responses is the better fit
 
 The Responses API is stateful and so is ACP, which makes the mapping direct rather

@@ -194,7 +194,7 @@ test("the event stream is typed, ordered and terminated", async (t) => {
   assert.equal(events.at(-1).response.output_text, "[fast] hello");
 });
 
-test("the store closes a conversation on expiry and on eviction", async () => {
+test("the store parks a conversation on expiry and on eviction", async () => {
   const closed = [];
   const agents = new Map([["a", { closeSession: (s) => closed.push(s.id) }]]);
   let clock = 1000;
@@ -206,8 +206,13 @@ test("the store closes a conversation on expiry and on eviction", async () => {
   const c2 = store.open("a", { id: "s2" });
   store.record(c2, "resp_2", {});
   await store.prune(agents);
+
+  // The expensive half went: the ACP session was closed and its login freed. The
+  // conversation did NOT go -- it still resolves, carrying the id to resume from.
   assert.deepEqual(closed, ["s1"]);
-  assert.equal(store.find("resp_1"), null);
+  const parked = store.find("resp_1");
+  assert.equal(parked.session, null, "a parked conversation holds no live session");
+  assert.equal(parked.sessionId, "s1", "and keeps the id that can restore it");
 
   // Eviction is by LAST USE, not by age: c2 is the oldest conversation here, but
   // continuing it must save it from the cap while a newer idle one goes instead.
@@ -221,7 +226,47 @@ test("the store closes a conversation on expiry and on eviction", async () => {
   store.find("resp_2");
   await store.prune(agents);
   assert.deepEqual(closed, ["s1", "s3"]);
-  assert.equal(store.size, 2);
+});
+
+test("the cap counts resident sessions, not conversations", async () => {
+  // Parked conversations hold no process, so a store full of them is not under the
+  // pressure the cap exists to relieve. Counting them would evict live work to make
+  // room for records.
+  const closed = [];
+  const agents = new Map([["a", { closeSession: (s) => closed.push(s.id) }]]);
+  let clock = 1000;
+  const store = new SessionStore({ max: 2, ttlMs: 100, now: () => clock });
+
+  const old = store.open("a", { id: "s1" });
+  store.record(old, "resp_1", {});
+  clock += 200;
+  await store.prune(agents); // s1 parks
+  assert.deepEqual(closed, ["s1"]);
+
+  store.record(store.open("a", { id: "s2" }), "resp_2", {});
+  store.record(store.open("a", { id: "s3" }), "resp_3", {});
+  await store.prune(agents);
+  // Two live sessions and one parked record: the cap of 2 is met, and nothing else
+  // was taken to make room for a conversation that costs nothing.
+  assert.deepEqual(closed, ["s1"]);
+});
+
+test("a conversation nobody returns to is eventually forgotten, not parked forever", async () => {
+  const closed = [];
+  const agents = new Map([["a", { closeSession: (s) => closed.push(s.id) }]]);
+  let clock = 1000;
+  const store = new SessionStore({ ttlMs: 100, forgetTtlMs: 1000, now: () => clock });
+
+  const c1 = store.open("a", { id: "s1" });
+  store.record(c1, "resp_1", {});
+  clock += 200;
+  await store.prune(agents);
+  // `find` refreshes the conversation, so the forget bound runs from here.
+  assert.ok(store.find("resp_1"), "still a conversation, just parked");
+
+  clock += 1001;
+  await store.prune(agents);
+  assert.equal(store.find("resp_1"), null, "past the forget bound it is genuinely gone");
 });
 
 test("forgetting one response of a chain keeps the conversation alive", async () => {

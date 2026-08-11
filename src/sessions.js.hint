@@ -57,6 +57,35 @@ Reuse is logged. Silence would be the failure mode otherwise: a caller whose
 preamble carries a timestamp would never match, continuity would quietly never
 happen, and nothing would say so.
 
+# rule Going quiet costs a session, never a conversation {#parking}
+
+A conversation past its TTL is **parked**, not closed: `session/close` gives back
+the ACP session — with the login and the memory it was holding — and the record
+keeps `sessionId`, so the next message restores it with `session/resume`.
+
+This is the difference between a thread going quiet for an hour and a thread
+losing everything it had read. It also re-points the two old bounds at what they
+were always really about: `maxSessions` counts RESIDENT sessions, so a store full
+of parked records is not under the pressure the cap exists to relieve, and
+`sessionTtlMs` decides when to give a session back rather than when to forget.
+`forgetTtlMs` is what finally drops the record.
+
+**`resume`, not `load`.** `session/load` replays the whole transcript back as
+`session/update` notifications, which this bridge would re-emit as fresh output on
+every revive. `resume` restores the session and its MCP connections and replays
+nothing.
+
+**Parking is unconditional and self-correcting.** Asking an agent whether it can
+resume means starting its process during a prune to find out. Instead every idle
+conversation parks; an agent that cannot resume simply fails the revive,
+`resumeSession` returns null, and the caller opens a fresh session. A failed revive
+is a COLD conversation, never an error — the whole history is replayed into the new
+session, which is why `server.js` decides the prompt blocks after the revive
+attempt and not before.
+
+**What is never done: `session/delete`.** Dropping our record must not destroy the
+agent's own stored transcript. Whose history that is, is the agent's business.
+
 # rule Eviction is by last use, never by age {#lru}
 
 A long conversation someone is actively continuing must outlive an abandoned one
@@ -66,6 +95,30 @@ it alive.
 `prune` runs before every new conversation, so the store cannot grow between
 requests, and it applies TTL first and the cap second — expiry is about
 abandonment, the cap is about pressure, and they are not the same question.
+
+**Neither is about the SIZE of the session, and that is a third question.** A TTL
+bounds resident processes; it does not bound a transcript. A conversation continued
+every few minutes for a week is exactly the one these rules keep alive, and exactly
+the one that walks into the agent's own compaction (a model call out of the same
+subscription) and then into a context window no retry recovers.
+
+So `maxContextFill` retires on fullness, read from `usage_update`'s `used`/`size`.
+Three properties make it safe rather than clever:
+
+- **Silence is not evidence of room.** An agent that never sends `usage_update`
+  leaves `fill` null and keeps its sessions. Guessing would retire healthy sessions
+  on every agent that does not implement the update.
+- **The last reading wins, not the highest.** A compaction genuinely frees room, and
+  a session that just compacted must not stay retired for a peak it came down from.
+- **Retirement and closure are separate steps.** `matchKey` and `matchPrefix` stop
+  offering a full session immediately; `prune` closes it on the next open. So the
+  caller gets a fresh session under the same key on the very next turn, and the old
+  one is not left holding a login for a conversation nobody can continue.
+
+Related: the cache is no reason to hold a session resident. Prompt caching lives on
+the provider's side with its own TTL, refreshed by use; a live child process warms
+nothing. What continuity actually buys is that the agent does not re-orient from
+scratch.
 
 # func prune {#prune}
 

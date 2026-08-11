@@ -66,6 +66,23 @@ const DEFAULTS = {
   requestTimeoutMs: 600_000,
   permission: "allow",
   fs: true,
+  // Run the agent's commands HERE instead of inside it.
+  //
+  // Advertising ACP's `terminal` capability makes an agent route its shell work
+  // through this bridge: the output is ours as it happens, and `terminal/kill`
+  // stops one command instead of `session/cancel` ending the whole turn.
+  //
+  // It is a transfer of responsibility rather than an added feature. Containment,
+  // timeouts, output bounds and process reaping stop being the agent's problem and
+  // become this one's -- see src/terminal.js. Off by default because an agent that
+  // was sandboxing its own execution stops doing so the moment this is on.
+  terminal: false,
+  maxTerminals: 8,
+  terminalOutputBytes: 1_048_576,
+  // Wall clock for a single command. A command nobody kills and nobody waits for
+  // outlives the turn, the session and the conversation; the agent decides when to
+  // stop waiting, this decides when to stop running. 0 disables the bound.
+  terminalTimeoutMs: 1_800_000,
   // What to do with OpenAI parameters ACP cannot carry. `warn` is the default and
   // the only sane one: every client library sends `temperature` unasked, so `error`
   // would reject almost every request in the wild. See src/params.js for why some
@@ -76,6 +93,17 @@ const DEFAULTS = {
   // spawning CLIs forever, and the TTL reaps conversations nobody returns to.
   maxSessions: 100,
   sessionTtlMs: 3_600_000,
+  // When a conversation stops being a conversation at all.
+  //
+  // `sessionTtlMs` no longer ends anything: past it a conversation is PARKED --
+  // it closes its ACP session, gives back the login and the memory, and keeps the
+  // id, so the next message restores it with `session/resume` and the agent still
+  // holds everything it had read. This is the bound that actually forgets, and it
+  // can be generous because a parked conversation costs one map entry.
+  //
+  // Clamped up to `sessionTtlMs`: forgetting sooner than parking would mean the
+  // park never happens.
+  forgetTtlMs: 86_400_000,
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
@@ -90,6 +118,31 @@ const DEFAULTS = {
   //
   // Empty string disables it. Prefix matching stays as the fallback either way.
   conversationHeader: "x-conversation-id",
+  // Whether the agent's own activity -- its tool calls and its plan -- is narrated
+  // back to the caller, and where.
+  //
+  //   off        the default. Only the answer and the agent's thinking travel.
+  //   reasoning  activity is rendered as short notes in `reasoning_content`,
+  //              alongside the thinking already there.
+  //
+  // It goes in the reasoning channel and never in the text, because a trace written
+  // into the answer BECOMES the answer -- "running bash" would end up in what the
+  // caller quotes, stores and replies to. `off` by default so a caller that has been
+  // rendering reasoning as prose does not silently start showing tool traffic.
+  progress: "off",
+  // How full a session's context window may get before it stops being reused, as a
+  // fraction. 0 disables the check.
+  //
+  // The TTL above bounds how long a session sits idle and says nothing about how
+  // large it has grown. The conversation continuity works hardest to keep -- one
+  // continued every few minutes for days -- is exactly the one that grows into the
+  // agent's own compaction, which is a model call out of the same subscription, and
+  // then into a context window it cannot recover from at all. Retiring on fullness
+  // costs one cold session; not retiring costs the conversation.
+  //
+  // Read from `usage_update`, which not every agent sends. An agent that stays
+  // silent leaves the check inactive rather than being guessed at.
+  maxContextFill: 0.85,
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -148,10 +201,26 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
+  req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
+  req(typeof s.terminal === "boolean", "server.terminal must be true or false");
+  req(Number.isInteger(s.maxTerminals) && s.maxTerminals > 0, "server.maxTerminals must be a positive integer");
+  req(
+    Number.isInteger(s.terminalOutputBytes) && s.terminalOutputBytes > 0,
+    "server.terminalOutputBytes must be a positive integer",
+  );
+  req(
+    Number.isInteger(s.terminalTimeoutMs) && s.terminalTimeoutMs >= 0,
+    "server.terminalTimeoutMs must be a non-negative integer",
+  );
+  req(
+    typeof s.maxContextFill === "number" && s.maxContextFill >= 0 && s.maxContextFill <= 1,
+    `server.maxContextFill must be a fraction between 0 and 1, got ${s.maxContextFill}`,
+  );
   req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();
   req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
+  req(Number.isInteger(s.forgetTtlMs) && s.forgetTtlMs > 0, "server.forgetTtlMs must be a positive integer");
 
   const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;
   req(Array.isArray(patterns), "server.limitPatterns must be a list of regex strings");
@@ -188,6 +257,11 @@ function normalizeAgent(a, i, server, seen) {
   req(a.env === undefined || (a.env && typeof a.env === "object"), `${at}.env must be a mapping`);
   req(a.mcpServers === undefined || Array.isArray(a.mcpServers), `${at}.mcpServers must be a list`);
   req(a.options === undefined || (a.options && typeof a.options === "object"), `${at}.options must be a mapping of configOption id to value`);
+  // Not validated against a list of names: the values are the AGENT's vocabulary,
+  // and an id we do not recognise today is one it may add tomorrow. A wrong one
+  // fails at session setup with the agent's own wording, which is more useful than
+  // a guess made here.
+  req(a.mode === undefined || typeof a.mode === "string", `${at}.mode must be a string`);
 
   return {
     name: a.name,
@@ -198,15 +272,46 @@ function normalizeAgent(a, i, server, seen) {
     // Resolved through the same rules as server.cwd so an agent can be pinned to
     // its own workspace (e.g. one repo per agent) without absolute paths.
     cwd: a.cwd ? (isAbsolute(a.cwd) ? a.cwd : resolve(server.cwd, a.cwd)) : server.cwd,
-    // `model` and `reasoning` are set by SEMANTIC CATEGORY, not by id: claude calls
-    // its reasoning selector `effort` and codex calls it `reasoning_effort`, but both
-    // report category `thought_level`. `options` addresses anything else by raw id.
+    // `model`, `reasoning` and `mode` are set by SEMANTIC CATEGORY, not by id:
+    // claude calls its reasoning selector `effort` and codex calls it
+    // `reasoning_effort`, but both report category `thought_level`. `options`
+    // addresses anything else by raw id.
     model: a.model ?? null,
     reasoning: a.reasoning ?? null,
+    // The agent's permission mode -- how much it may do without asking. Names are
+    // the agent's own (`plan`, `acceptEdits`, `bypassPermissions` on claude), so
+    // this is a passthrough by category rather than a vocabulary of ours.
+    //
+    // It is the alternative to answering a permission prompt per action: an
+    // autonomous deployment sets the mode for the session and lets the agent work,
+    // while a shared channel can pin it to `plan` and read what it proposes.
+    mode: a.mode ?? null,
+    warmup: normalizeWarmup(a.warmup, `${at}.warmup`),
     options: a.options ?? {},
     mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
     description: a.description ?? "",
   };
+}
+
+/**
+ * Normalizes an agent's warm-up, or null when it has none.
+ *
+ * `prompt` is a real turn against a real subscription, run once per `ttlMs` and
+ * forked by every conversation started in that window. It pays for itself only
+ * when conversations start often enough, which is why there is no default: an
+ * agent without this keeps opening cold sessions, which is slower and never wrong.
+ *
+ * `ttlMs` is how long the warmed context is still true. A base that read the
+ * repository is stale the moment the repository moves, and nothing here can know
+ * when that happened -- so this is a bet the operator makes, not a fact.
+ */
+function normalizeWarmup(warmup, at) {
+  if (warmup === undefined || warmup === null) return null;
+  req(warmup && typeof warmup === "object", `${at} must be a mapping`);
+  req(typeof warmup.prompt === "string" && warmup.prompt.trim().length > 0, `${at}.prompt is required`);
+  const ttlMs = warmup.ttlMs ?? 3_600_000;
+  req(Number.isInteger(ttlMs) && ttlMs > 0, `${at}.ttlMs must be a positive integer`);
+  return { prompt: warmup.prompt, ttlMs };
 }
 
 /**

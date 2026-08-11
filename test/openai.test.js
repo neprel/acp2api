@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chunk, completion, parseChatRequest, RequestError, toPromptBlocks } from "../src/openai.js";
+import { chunk, completion, deltaUsage, parseChatRequest, RequestError, toPromptBlocks } from "../src/openai.js";
 
 test("a single user turn is passed through with no scaffolding", () => {
   assert.deepEqual(toPromptBlocks([{ role: "user", content: "hi" }]), [{ type: "text", text: "hi" }]);
@@ -174,6 +174,50 @@ test("usage maps ACP token counts to OpenAI names", () => {
     total_tokens: 33,
     completion_tokens_details: { reasoning_tokens: 3 },
   });
+});
+
+test("cache counters map onto prompt_tokens_details", () => {
+  const c = completion({
+    id: "c1",
+    model: "m",
+    created: 7,
+    text: "x",
+    stopReason: "end_turn",
+    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33, cachedReadTokens: 9, cachedWriteTokens: 2 },
+  });
+  // A subset of prompt_tokens in OpenAI's model, not an addition to it.
+  assert.deepEqual(c.usage.prompt_tokens_details, { cached_tokens: 9, cache_creation_tokens: 2 });
+  assert.equal(c.usage.prompt_tokens, 11);
+});
+
+test("deltaUsage subtracts the totals a session already reported", () => {
+  const before = { inputTokens: 11, outputTokens: 22, totalTokens: 33, cachedReadTokens: 0 };
+  const now = { inputTokens: 22, outputTokens: 44, totalTokens: 66, cachedReadTokens: 10 };
+  assert.deepEqual(deltaUsage(now, before), {
+    inputTokens: 11,
+    outputTokens: 22,
+    totalTokens: 33,
+    cachedReadTokens: 10,
+  });
+});
+
+test("deltaUsage on a first turn reports the counters as they arrived", () => {
+  const now = { inputTokens: 11, outputTokens: 22, totalTokens: 33 };
+  assert.deepEqual(deltaUsage(now, null), now);
+  assert.equal(deltaUsage(null, null), null);
+});
+
+test("a counter that went backwards is read as a reset, not as a negative turn", () => {
+  // An agent that re-bases its own accounting mid-session would otherwise produce
+  // a negative token count, which no consumer can do anything sensible with.
+  const before = { inputTokens: 100, outputTokens: 200, totalTokens: 300 };
+  const now = { inputTokens: 5, outputTokens: 6, totalTokens: 11 };
+  assert.deepEqual(deltaUsage(now, before), now);
+});
+
+test("deltaUsage carries no field the agent did not report", () => {
+  const d = deltaUsage({ inputTokens: 3, outputTokens: 4, totalTokens: 7 }, null);
+  assert.deepEqual(Object.keys(d).sort(), ["inputTokens", "outputTokens", "totalTokens"]);
 });
 
 test("chunk is a well-formed streaming delta", () => {

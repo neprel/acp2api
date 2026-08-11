@@ -199,17 +199,60 @@ export function makeLimiter({ maxTokens, stop }) {
   };
 }
 
+/** The ACP usage counters this bridge reads, and the shape `deltaUsage` returns. */
+const USAGE_FIELDS = [
+  "totalTokens",
+  "inputTokens",
+  "outputTokens",
+  "thoughtTokens",
+  "cachedReadTokens",
+  "cachedWriteTokens",
+];
+
 /**
- * ACP reports cumulative session token counts, not per-turn ones. With a session
- * per request the two coincide, so they map straight across; `null` when the agent
- * omits usage (it is an unstable part of the spec and most agents do).
+ * Subtracts the session totals already reported from the ones just received.
+ *
+ * ACP usage counters are cumulative **across the session** -- "Total input tokens
+ * across all turns" -- and a retained session now spans many requests, so passing
+ * them straight through would report the whole conversation's spend as the cost of
+ * its latest turn. Every consumer that sums responses would then count the first
+ * turn once per turn that followed it.
+ *
+ * `before` is what the same session last reported, or nullish for its first turn.
+ * A counter that went BACKWARDS is not clamped away silently -- it means the agent
+ * reset or re-based its accounting, and the honest reading of a reset counter is
+ * the counter itself, not a negative delta.
+ */
+export function deltaUsage(usage, before) {
+  if (!usage) return null;
+  const out = {};
+  for (const f of USAGE_FIELDS) {
+    const now = usage[f];
+    if (now == null) continue;
+    const prev = before?.[f] ?? 0;
+    out[f] = now >= prev ? now - prev : now;
+  }
+  return out;
+}
+
+/**
+ * One turn's counters in OpenAI's shape. `null` when the agent omits usage -- it is
+ * an unstable part of the spec and most agents do.
+ *
+ * `cached_tokens` is the only evidence a caller ever gets that continuing a session
+ * saved anything, so it is reported whenever the agent supplies it. It is a SUBSET
+ * of `prompt_tokens` in OpenAI's model, not an addition to it.
  */
 function toUsage(usage) {
   if (!usage) return null;
+  const details = {};
+  if (usage.cachedReadTokens != null) details.cached_tokens = usage.cachedReadTokens;
+  if (usage.cachedWriteTokens != null) details.cache_creation_tokens = usage.cachedWriteTokens;
   return {
     prompt_tokens: usage.inputTokens ?? 0,
     completion_tokens: usage.outputTokens ?? 0,
     total_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+    ...(Object.keys(details).length > 0 ? { prompt_tokens_details: details } : {}),
     ...(usage.thoughtTokens != null
       ? { completion_tokens_details: { reasoning_tokens: usage.thoughtTokens } }
       : {}),

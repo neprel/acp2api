@@ -23,6 +23,54 @@ server:
   permission: allow
   fs: true
 
+  # Run the agent's commands HERE instead of inside it.
+  #
+  # With this on, an agent routes its shell work through `terminal/*`: the output
+  # is ours as it happens, and `terminal/kill` stops ONE command -- where the only
+  # other stop is `session/cancel`, which ends the whole turn.
+  #
+  # It is a transfer of responsibility, not an added feature. Containment,
+  # timeouts, output bounds and process reaping stop being the agent's problem and
+  # become this bridge's. Off by default for that reason: an agent that sandboxes
+  # its own execution stops doing so the moment this is on.
+  terminal: false
+  maxTerminals: 8
+  terminalOutputBytes: 1048576
+  # Wall clock for one command; 0 disables it. The agent decides when to stop
+  # waiting, this decides when to stop running.
+  terminalTimeoutMs: 1800000
+
+  # Narrate what the agent is doing -- its tool calls, its edits, its plan -- so a
+  # turn that runs for minutes is legible while it runs: off | reasoning.
+  #
+  # `reasoning` renders each as a short note in `reasoning_content`, next to the
+  # thinking already there. It is never put in the answer: a trace written into the
+  # text becomes part of the text, and comes back as the assistant's own words on
+  # the next turn.
+  #
+  #   ▸ plan 1/3 — patch the compose file
+  #   › Edit compose.yaml
+  #   ± compose.yaml +2/-1
+  #   ✗ Bash pytest
+  #
+  # Off by default so a caller already rendering reasoning as prose does not
+  # suddenly start showing tool traffic.
+  progress: reasoning
+
+  # Retire a session once this much of its context window is in use, as a fraction.
+  # 0 turns the check off.
+  #
+  # sessionTtlMs below bounds how long a session sits idle; it says nothing about
+  # how big it has grown. A conversation continued every few minutes for days is
+  # exactly the one continuity keeps alive, and exactly the one that grows into the
+  # agent's own compaction -- a model call out of the same subscription -- and then
+  # into a context window no retry recovers. Retiring costs one cold session; not
+  # retiring costs the conversation.
+  #
+  # Read from `usage_update`. An agent that never sends it keeps its sessions:
+  # silence is not evidence of room, and guessing would retire healthy ones.
+  maxContextFill: 0.85
+
   # Agents can think for a long time. Past this the caller gets 504 rather than a
   # truncated 200 that a router would count as a success.
   requestTimeoutMs: 900000
@@ -41,11 +89,23 @@ server:
   # n > 1) are refused regardless of this setting -- see src/params.js.
   unsupportedParams: warn
 
-  # Retained ACP sessions behind /v1/responses. Each is a live child process holding
-  # a login, so both bounds matter: the cap stops a client spawning CLIs without end,
-  # and the TTL reaps conversations nobody comes back to. Both close the session.
+  # Retained ACP sessions. Each is a live child process holding a login, so both
+  # bounds matter: the cap stops a client spawning CLIs without end, and the TTL
+  # gives back the sessions nobody has come back to.
+  #
+  # Neither of them FORGETS anything any more. Past the TTL a conversation is
+  # PARKED: it closes its ACP session -- freeing the login and the memory -- and
+  # keeps the id, so the next message restores it with `session/resume` and the
+  # agent still holds every file it had read and every plan it had made. The cap
+  # counts resident sessions only; a parked conversation costs one map entry.
   maxSessions: 100
   sessionTtlMs: 3600000
+
+  # When a conversation stops being one at all, and the next message genuinely
+  # starts over. Generous on purpose -- a thread picked up the next morning should
+  # still continue. Clamped up to sessionTtlMs, since forgetting before parking
+  # would mean never parking.
+  forgetTtlMs: 86400000
 
   # Reuse the session that already heard the start of an incoming history and send
   # only what is new. The OpenAI API asks every client to be stateless, so without
@@ -74,6 +134,31 @@ agents:
     type: claude # bundled adapter: @agentclientprotocol/claude-agent-acp
     model: opus[1m] # set on the option whose CATEGORY is "model"
     reasoning: high # set on the option whose CATEGORY is "thought_level"
+    # Set on the option whose CATEGORY is "mode": how much the agent may do
+    # without asking. The values are the agent's own vocabulary -- claude offers
+    # plan / acceptEdits / bypassPermissions. This is the alternative to answering
+    # a permission prompt per action: decide once, for the session.
+    mode: acceptEdits
+    # Warm one session and fork it, instead of starting every conversation cold.
+    #
+    # A cold session re-orients before it can do anything -- reads the project's
+    # instructions, lists the tree, greps for its bearings -- and every new
+    # conversation pays for that again. This runs the prompt ONCE and forks the
+    # result, so each conversation starts already oriented and gets its own session.
+    #
+    # The warm-up is a real turn against a real subscription. It pays for itself
+    # only when conversations start often enough, which is why there is no default.
+    # `ttlMs` is how long the warmed context is still true: a base that read the
+    # repository is stale the moment the repository moves, and nothing here can know
+    # when that happened -- the number is a bet, not a fact.
+    #
+    # Requires the agent to advertise `sessionCapabilities.fork`. If it does not, or
+    # the warm-up fails, or the fork fails, sessions simply start cold.
+    warmup:
+      prompt: >-
+        Read AGENTS.md and get your bearings in this repository. Do not change
+        anything; this is preparation, and the real request comes next.
+      ttlMs: 3600000
 
   - name: claude-sonnet
     type: claude

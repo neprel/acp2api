@@ -256,6 +256,57 @@ test("a named conversation replays nothing it has already heard", async (t) => {
   assert.ok(!seen.includes("one"), `expected only the new turn, got ${JSON.stringify(seen)}`);
 });
 
+test("a continued conversation bills each turn, not the session so far", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const usageOf = async (res) => (await res.json()).usage;
+
+  // The fixture charges an identical 11/22/3 per turn and reports the running
+  // SESSION total, the way a real ACP agent does. Passed through unchanged, turn
+  // two would claim to have cost twice what turn one did.
+  const first = await usageOf(await ask("one", "thread-a"));
+  const second = await usageOf(await ask("two", "thread-a"));
+
+  assert.equal(first.prompt_tokens, 11);
+  assert.equal(first.completion_tokens, 22);
+  assert.equal(second.prompt_tokens, 11, "turn two must not re-bill turn one's input");
+  assert.equal(second.completion_tokens, 22);
+  assert.equal(second.total_tokens, 33);
+});
+
+test("cache reads reach the caller, because they are the only proof continuity paid off", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const usageOf = async (res) => (await res.json()).usage;
+
+  const first = await usageOf(await ask("one", "thread-b"));
+  const second = await usageOf(await ask("two", "thread-b"));
+
+  // The first turn writes the cache and reads nothing; the second reads it.
+  assert.equal(first.prompt_tokens_details.cached_tokens, 0);
+  assert.equal(first.prompt_tokens_details.cache_creation_tokens, 11);
+  assert.equal(second.prompt_tokens_details.cached_tokens, 10);
+  assert.equal(second.prompt_tokens_details.cache_creation_tokens, 0);
+});
+
+test("a fresh conversation is billed in full, with no baseline to subtract", async (t) => {
+  const call = await start(t);
+  const one = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  const two = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  // Two unrelated requests, two sessions: each pays its own first turn in full,
+  // and neither may come out as zero because the other had already reported.
+  assert.equal((await one.json()).usage.prompt_tokens, 11);
+  assert.equal((await two.json()).usage.prompt_tokens, 11);
+});
+
 test("different keys are different conversations", async (t) => {
   const call = await start(t);
   const ask = (content, key) =>
@@ -483,4 +534,318 @@ test("an agent error carrying no status still yields a 500-class response", asyn
   const res = await call("/v1/chat/completions", chat({ model: "stub", messages: [{ role: "user", content: "x" }] }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error.message, "upstream said no");
+});
+
+test("progress is off by default: activity never reaches the caller", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "WORK" }] }));
+  const msg = (await res.json()).choices[0].message;
+  assert.equal(msg.content, "done");
+  assert.equal(msg.reasoning_content, "thinking(low)");
+});
+
+test("progress narrates tool calls, diffs and the plan into reasoning", async (t) => {
+  const call = await start(t, { server: { progress: "reasoning" } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "WORK" }] }));
+  const msg = (await res.json()).choices[0].message;
+
+  // The answer is untouched: a trace written into the text becomes the answer.
+  assert.equal(msg.content, "done");
+
+  const notes = msg.reasoning_content;
+  assert.match(notes, /thinking\(low\)/, "the agent's own thinking still comes through");
+  assert.match(notes, /▸ plan 1\/3 — patch the compose file/);
+  assert.match(notes, /› Edit compose\.yaml/);
+  assert.match(notes, /± compose\.yaml \+2\/-1/);
+  assert.match(notes, /✗ Bash pytest/);
+  // Started once, not once per update.
+  assert.equal(notes.match(/› Edit compose\.yaml/g).length, 1);
+});
+
+test("progress streams as it happens, not as a summary at the end", async (t) => {
+  const call = await start(t, { server: { progress: "reasoning" } });
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "WORK" }], stream: true }),
+  );
+  const body = await res.text();
+  const deltas = body
+    .split("\n")
+    .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+    .map((l) => JSON.parse(l.slice(6)).choices[0].delta);
+
+  const reasoning = deltas.map((d) => d.reasoning_content ?? "");
+  assert.ok(reasoning.join("").includes("› Edit compose.yaml"), "notes arrive as reasoning deltas");
+
+  // The point of streaming progress is that it is live. A note about the last tool
+  // must be on the wire before the first character of the answer, not batched after.
+  const lastNote = reasoning.findLastIndex((r) => r.includes("Bash pytest"));
+  const firstAnswer = deltas.findIndex((d) => d.content);
+  assert.ok(lastNote >= 0 && firstAnswer >= 0, "expected both a note and an answer");
+  assert.ok(lastNote < firstAnswer, `note at ${lastNote} should precede answer at ${firstAnswer}`);
+});
+
+test("a named session outlives a turn nobody waited for", async (t) => {
+  // This is steering on the wire: a turn is abandoned mid-flight and the next
+  // message is the correction. If the session went with the abandoned turn, the
+  // correction would reach an agent that had forgotten everything it had read --
+  // which is exactly the work the human was trying not to waste.
+  const call = await start(t, { server: { requestTimeoutMs: 400 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-y")), /^s1/);
+
+  const abandoned = await ask("HANG", "thread-y");
+  assert.equal(abandoned.status, 504);
+  await abandoned.json();
+
+  assert.match(
+    await said(await ask("ECHOSESSION two", "thread-y")),
+    /^s1/,
+    "the correction must land in the session that did the work",
+  );
+});
+
+test("a named session does NOT outlive a turn the agent itself failed", async (t) => {
+  // A broken agent is not a redirected one. Keeping the session here would offer
+  // the next request a conversation whose state nobody can account for.
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-z")), /^s1/);
+  assert.equal((await ask("BOOM", "thread-z")).status, 502);
+  assert.match(await said(await ask("ECHOSESSION two", "thread-z")), /^s2/);
+});
+
+test("a session that has filled its context window is retired, not reused", async (t) => {
+  // A TTL bounds idleness and says nothing about size. The conversation continuity
+  // works hardest to keep is the one that grows into the agent's own compaction and
+  // then into a context it cannot recover from -- so fullness has to end a session
+  // even when someone is still actively using it.
+  const call = await start(t, { server: { maxContextFill: 0.8 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("FILL", "thread-f")), /^s1/);
+  assert.match(
+    await said(await ask("ECHOSESSION next", "thread-f")),
+    /^s2/,
+    "a 95%-full session must not be handed the next turn",
+  );
+});
+
+test("retirement is off when no ceiling is configured", async (t) => {
+  const call = await start(t, { server: { maxContextFill: 0 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("FILL", "thread-g")), /^s1/);
+  assert.match(await said(await ask("ECHOSESSION next", "thread-g")), /^s1/);
+});
+
+test("an agent that never reports usage keeps its sessions", async (t) => {
+  // Silence is not evidence of room. Guessing would retire healthy sessions on
+  // every agent that does not implement usage_update.
+  const call = await start(t, { server: { maxContextFill: 0.1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-h")), /^s1/);
+  assert.match(await said(await ask("ECHOSESSION two", "thread-h")), /^s1/);
+});
+
+test("a thread that went quiet resumes its session instead of starting cold", async (t) => {
+  // The point of parking: an idle conversation gives back the expensive half -- the
+  // resident session and the login it holds -- and keeps the id. Coming back must
+  // land in the SAME agent session, still holding whatever it had read.
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-p")), /^s1/);
+  // A TTL of 1ms means the next request's prune parks it first.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(
+    await said(await ask("ECHOSESSION two", "thread-p")),
+    /^s1/,
+    "a parked thread must come back to its own session, not a new one",
+  );
+});
+
+test("a session the agent cannot resume becomes a fresh one, not an error", async (t) => {
+  // Resume is best effort. An id the agent has lost means this conversation is
+  // cold now -- which is a cold answer, not a failed request.
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  // AMNESIA makes the agent forget its own session, the way a real one does once
+  // its stored transcript is gone.
+  assert.match(await said(await ask("AMNESIA", "thread-q")), /^s1/);
+  // The body can reach the client a tick before the request's own cleanup marks
+  // the conversation idle, and `prune` skips a busy one on purpose.
+  await new Promise((r) => setTimeout(r, 30));
+  // An unrelated thread opens a session, and the prune that precedes it parks the
+  // first -- parking is what puts thread-q on the resume path at all.
+  await ask("ECHOSESSION other", "thread-r");
+
+  const res = await ask("ECHOSESSION two", "thread-q");
+  assert.equal(res.status, 200, "a lost session is answered, not turned into a 502");
+  assert.doesNotMatch(await said(res), /^s1/, "and answered from a session that exists");
+});
+
+test("with the terminal capability on, the agent's commands run here", async (t) => {
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "SHELL" }] }));
+  const seen = JSON.parse((await res.json()).choices[0].message.content);
+  assert.equal(seen.exit.exitCode, 0);
+  assert.equal(seen.truncated, false);
+  assert.match(seen.output, /out-/, "stdout reaches the agent");
+  assert.match(seen.output, /err/, "and stderr does too, in the same stream");
+  assert.ok(seen.exitStatus, "output reports the exit status once the command has finished");
+});
+
+test("a command asking to run outside the workspace is refused, not run", async (t) => {
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ESCAPE" }] }));
+  const said = (await res.json()).choices[0].message.content;
+  assert.match(said, /^REFUSED:.*outside workspace/);
+});
+
+test("one command can be stopped without ending the turn", async (t) => {
+  // The reason the capability is worth owning: session/cancel is the only other
+  // stop, and it takes the whole turn -- plan, open files and all -- with it.
+  const call = await start(t, { server: { terminal: true } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "KILLIT" }] }));
+  assert.equal(res.status, 200, "the turn survives the command it killed");
+  const exit = JSON.parse((await res.json()).choices[0].message.content);
+  assert.ok(exit.signal || exit.exitCode !== 0, `expected a killed process, got ${JSON.stringify(exit)}`);
+});
+
+test("without the capability the agent is never offered a terminal", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "SHELL" }] }));
+  // The fixture asks anyway; an unadvertised capability must answer "no such
+  // method" rather than quietly running the command.
+  assert.match((await res.json()).choices[0].message.content, /^REFUSED:/);
+});
+
+test("the session mode is selected by category, like model and reasoning", async (t) => {
+  // The autonomy control: set once for the session rather than answered per action.
+  // The fixture's option is called `permission-mode`, so an implementation that
+  // matched on the id would miss it -- exactly the way claude and codex differ.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        mode: "acceptEdits",
+      },
+    ],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ECHOMODE" }] }));
+  assert.equal((await res.json()).choices[0].message.content, "acceptEdits");
+});
+
+test("a mode the agent does not offer fails loudly rather than running anyway", async (t) => {
+  const call = await start(t, {
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], mode: "yolo" }],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /no value "yolo"/);
+});
+
+test("a warmed base is read once and forked by every conversation after it", async (t) => {
+  // The point of warming: a cold session re-orients before it can do anything --
+  // reads the instructions, lists the tree, greps for its bearings -- and every new
+  // conversation pays for that again. Warming once and forking pays it once.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        warmup: { prompt: "read the repository" },
+      },
+    ],
+  });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const seen = async (res) => JSON.parse((await res.json()).choices[0].message.content);
+
+  const first = await seen(await ask("ECHOHEARD one", "thread-w1"));
+  const second = await seen(await ask("ECHOHEARD two", "thread-w2"));
+
+  // Both threads are forks of the same base, and both start knowing what it read.
+  assert.equal(first.from, "s1", "the base is the session that was warmed");
+  assert.equal(second.from, "s1", "and it is reused rather than warmed again");
+  assert.notEqual(first.id, second.id, "each conversation still gets its own session");
+  assert.match(first.heard[0], /read the repository/, "the fork inherits the warm-up");
+  assert.match(second.heard[0], /read the repository/);
+  // And the warm-up is not repeated per conversation -- that is the whole saving.
+  assert.equal(second.heard.filter((h) => h.includes("read the repository")).length, 1);
+});
+
+test("a warm-up that fails leaves sessions cold rather than failing the request", async (t) => {
+  // Starting cold is slower and more expensive. It is never wrong, so it is what
+  // every failure on the warm path falls back to.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        warmup: { prompt: "BOOM" },
+      },
+    ],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(res.status, 200, "the caller gets an answer, not the warm-up's failure");
+  assert.equal((await res.json()).choices[0].message.content, "[fast] hi");
+});
+
+test("with no warmup configured nothing is forked", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ECHOHEARD" }] }));
+  const seen = JSON.parse((await res.json()).choices[0].message.content);
+  assert.equal(seen.from, null);
+  assert.equal(seen.heard.length, 1, "only the caller's own turn");
 });

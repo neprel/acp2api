@@ -5,6 +5,7 @@ import { ParamReporter } from "./params.js";
 import {
   chunk,
   completion,
+  deltaUsage,
   errorBody,
   makeLimiter,
   newCompletionId,
@@ -58,6 +59,8 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   const sessions = new SessionStore({
     max: config.server.maxSessions,
     ttlMs: config.server.sessionTtlMs,
+    forgetTtlMs: config.server.forgetTtlMs,
+    maxContextFill: config.server.maxContextFill,
     log,
   });
 
@@ -212,6 +215,17 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
   let session = conversation?.session ?? null;
   let opened = false;
   try {
+    // Parked: the conversation gave back its session while nobody was continuing
+    // it, and kept the id. `previous_response_id` still resolves, so restore it
+    // rather than answering the caller from a stranger.
+    if (!session && conversation?.sessionId) {
+      session = await agent.resumeSession(conversation.sessionId);
+      if (session) sessions.revive(convId, session);
+      else {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    }
     if (!session) {
       session = await agent.openSession();
       opened = true;
@@ -251,7 +265,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
     if (clientGone) return res.end();
     if (timedOut && !stream) throw timeoutError(request.model, config);
 
-    const response = shape(turn);
+    const response = shape(settleUsage(sessions, convId, turn));
     // `store: false` means the caller will never continue from this id, so the
     // session it opened has no future -- keeping it would retain a live login.
     if (request.store) sessions.record(convId, id, response);
@@ -342,7 +356,10 @@ async function handleCompletion(req, res, registry, config, log, params, session
     : (callerKey && sessions.matchKey(model, callerKey)) || sessions.matchPrefix(model, systemId, prefix);
   let convId = match?.convId ?? null;
   let session = match?.session ?? null;
-  const opened = !session;
+  // Which kind of continuity found it. `matchKey` returns the session's prefix and
+  // `matchPrefix` does not, so this is the discriminator -- and it decides whether a
+  // turn nobody waited for may leave the session standing. See the catch below.
+  const keyed = Boolean(match?.prefix);
 
   // `matchPrefix` found the session BY its prefix, so `matched` is exact.
   // `matchKey` did not look at the history at all -- a keyed caller may resend a
@@ -350,22 +367,43 @@ async function handleCompletion(req, res, registry, config, log, params, session
   // turn. Comparing here covers both: the first replays nothing, the second
   // replays nothing because nothing matches.
   const heard = match?.prefix ? commonPrefix(match.prefix, prefix) : (match?.matched ?? 0);
-
-  // Only the turns the session has not heard. The preamble goes with the session,
-  // so it is sent once, when the session opens.
   const fresh = turns.slice(heard);
-  const blocks = toPromptBlocks(
-    opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
-  );
+  // Declared out here because the catch reads it: a session opened by THIS request
+  // has no id pointing at it and must never be left behind.
+  let opened = false;
 
   try {
+    // A parked conversation kept its id and gave back its session. Restoring it is
+    // what makes going quiet cost nothing: the agent still holds everything it read
+    // and planned, and only the new turn is sent. A resume that fails is not an
+    // error -- it means this conversation is cold now, and the whole history has to
+    // be replayed into a fresh session, which is why `blocks` is decided AFTER.
+    if (!session && match?.sessionId) {
+      session = await agent.resumeSession(match.sessionId);
+      if (session) {
+        sessions.revive(convId, session);
+        log("info", `${model}: resumed ${match.sessionId}${callerKey ? ` [${callerKey}]` : ""}`);
+      } else {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    }
+
+    opened = !session;
+    // Only the turns the session has not heard -- unless it is a fresh session,
+    // which has heard nothing at all. The preamble goes with the session, so it is
+    // sent once, when the session opens.
+    const blocks = toPromptBlocks(
+      opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
+    );
+
     if (opened) {
       await sessions.prune(registry);
       session = await agent.openSession();
       convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null });
       log("info", `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}`);
     } else {
-      const how = callerKey && match.prefix ? `keyed [${callerKey}]` : "by prefix";
+      const how = keyed ? `keyed [${callerKey}]` : "by prefix";
       log("info", `${model}: continuing session ${how}, ${fresh.length} new of ${prefix.length} message(s)`);
     }
     sessions.setBusy(convId, true);
@@ -378,7 +416,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       // a router downstream would count as success.
       if (timedOut) throw timeout();
       remember(sessions, convId, prefix, turn.text);
-      return send(res, 200, completion({ ...meta, ...turn, ignored }));
+      return send(res, 200, completion({ ...meta, ...settleUsage(sessions, convId, turn), ignored }));
     }
 
     // Headers go out only once the turn is under way. Sending them earlier would
@@ -415,18 +453,34 @@ async function handleCompletion(req, res, registry, config, log, params, session
     if (timedOut && !started) throw timeout();
 
     remember(sessions, convId, prefix, turn.text);
+    const settled = settleUsage(sessions, convId, turn);
     start(); // an empty turn still owes the client a well-formed stream
     // Mid-stream there is no status left to change, so say "length": the answer is
     // genuinely truncated, and that is the closest honest finish_reason.
     write(res, chunk({ ...meta, delta: {}, finishReason: timedOut ? "length" : finishOf(turn.stopReason) }));
-    if (includeUsage && turn.usage) write(res, usageChunk({ ...meta, usage: turn.usage }));
+    if (includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (e) {
     // A session that never answered has heard messages nobody can account for, so
     // it must not be offered to the next request. A brand new one goes entirely.
-    if (convId) await sessions.discard(convId, registry);
-    convId = null;
+    //
+    // With one exception, and it is the whole of steering. When the caller HANGS UP
+    // or we stop waiting, nothing is wrong with the agent -- a human redirected it,
+    // and the next message is the correction. Throwing the session away there
+    // discards exactly the work worth keeping: the files it had read, the plan it
+    // had built. So a session that already existed and was found BY KEY stays.
+    //
+    // Only by key. A prefix-matched session is found by claiming its recorded
+    // history describes what the agent heard, and after an unanswered turn that
+    // claim is false; continuing on it would be a lie about the conversation. A key
+    // makes no claim about content, so an abandoned turn cannot invalidate it -- and
+    // the unheard turns are simply resent, since `remember` never ran.
+    const abandoned = clientGone || timedOut;
+    if (convId && !(keyed && !opened && abandoned)) {
+      await sessions.discard(convId, registry);
+      convId = null;
+    }
     if (clientGone) {
       log("warn", `${model}: client disconnected`);
       return res.end();
@@ -456,6 +510,26 @@ async function handleCompletion(req, res, registry, config, log, params, session
 function remember(sessions, convId, prefix, text) {
   if (!convId) return;
   sessions.extendPrefix(convId, [...prefix, fingerprint({ role: "assistant", content: text })]);
+}
+
+/**
+ * Replaces a turn's CUMULATIVE session counters with what this turn alone cost, and
+ * moves the session's baseline forward.
+ *
+ * ACP counts tokens across the whole session, and a retained session serves many
+ * requests, so passing the counters through unchanged would bill every response for
+ * the entire conversation so far. Call this exactly once per turn, before the
+ * response is shaped -- calling it twice would report a delta of zero.
+ */
+function settleUsage(sessions, convId, turn) {
+  if (!convId || !turn) return turn;
+  // How full the window is describes the SESSION, so it is recorded even when the
+  // turn reported no token counts at all.
+  if (turn.context) sessions.rememberContext(convId, turn.context);
+  if (!turn.usage) return turn;
+  const usage = deltaUsage(turn.usage, sessions.usageBaseline(convId));
+  sessions.rememberUsage(convId, turn.usage);
+  return { ...turn, usage };
 }
 
 const finishOf = (stopReason) =>

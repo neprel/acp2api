@@ -82,6 +82,60 @@ The agent's own tool calls are surfaced through `onEvent` and never appended to
 caller to execute and answer. Anything that makes them look like the latter is
 wrong; see [_.hint#mcp_tools](../_.hint).
 
+# rule This module routes session updates itself {#own_routing}
+
+`#sinks` maps a session id to the turn currently reading it, filled by one
+`session/update` handler on the client app; `turn()` sends `session/prompt` as a
+plain request and returns when it resolves.
+
+The SDK's `ActiveSession` does exactly this and cannot be used, because the only
+way to obtain one is `session/new`: its constructor and `attachSession` are both
+private. A session restored with `session/resume` would therefore have no way to
+receive its updates — which would rule out parking, reviving and forking
+altogether. Twenty lines here buys the whole session lifecycle.
+
+Two properties this relies on, both true of the SDK's dispatch and neither obvious:
+
+- **Order.** Notifications and the response travel the same stream and are handled
+  in order, so everything the agent sent before answering has already run by the
+  time the request resolves.
+- **Nothing after the answer.** Updates arriving once the turn has ended belong to
+  no turn and are dropped — the sink is removed in `finally` precisely so a late
+  chunk cannot land in the NEXT turn's accumulator. This matches what the SDK's
+  queue did: `nextUpdate()` also stopped at the prompt response.
+
+# rule A warm base is forked, never used {#warm_base}
+
+`warmup.prompt` opens one session, runs that prompt in it, and every conversation
+afterwards is a `session/fork` of it. What that buys is the re-orientation a cold
+session pays before it can do anything — reading the project's instructions,
+listing the tree, grepping for its bearings — which every new conversation
+otherwise pays again.
+
+Four things hold this together, and each of them is load-bearing:
+
+- **The base never serves a turn.** It is forked, and the fork is what the caller
+  gets. Prompting the base directly would put one conversation's history into
+  every conversation started after it.
+- **Single-flight.** Two requests arriving cold must not warm two bases and leave
+  one resident with nothing pointing at it. `#base.warming` is the promise both
+  wait on.
+- **Every failure falls back to cold.** No fork capability, a warm-up that throws,
+  a fork that is refused — all of them open an ordinary session. Starting cold is
+  slower and more expensive and it is never WRONG, which makes it the only correct
+  fallback. A failed warm-up is also not cached: the next request tries again.
+- **Options are re-applied to the fork.** The protocol does not promise a fork
+  carries the parent's selections, and two cheap local RPCs beat a thread silently
+  running on the wrong model.
+
+**It costs a real turn of a real subscription**, once per `ttlMs`, plus one
+resident session for as long as the agent lives. It is worth having when
+conversations start often enough to amortise that, and not otherwise — hence no
+default.
+
+`ttlMs` is a bet the operator makes. A base that read the repository is stale the
+moment the repository moves, and nothing here can know when that happened.
+
 # invariant A dead child never takes the server down {#respawn}
 
 The `exit` handler drops the memoized connection so the next request respawns rather

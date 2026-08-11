@@ -1,0 +1,62 @@
+# goal Make a running turn legible without changing what the turn returns
+
+An ACP agent says what it is doing — `tool_call`, `tool_call_update`, `plan` — and a
+chat completion has no field for any of it. This renders those updates as short
+notes so a human watching a channel can see a twenty-minute turn progressing instead
+of a typing indicator.
+
+# invariant Notes are never part of the answer {#never_content}
+
+They travel in `reasoning_content`, alongside the thinking already there, and never
+in `text`. A trace written into the answer BECOMES the answer: "running bash" ends
+up in what the caller quotes, stores, and replies to, and on the next turn it comes
+back as an assistant message the agent has to read as its own words.
+
+This is the same reasoning that keeps `tool_call` events out of the text in
+[agent.js.hint#tool_calls_are_progress](agent.js.hint) — rendering them changes
+where they go, not what they are.
+
+# rule Report transitions, not states {#transitions}
+
+ACP repeats itself. `tool_call_update` fires for every status change and usually
+carries the whole call again; `plan_update` fires per entry transition and most of
+those leave the summary identical. A renderer without memory narrates the same work
+three or four times, which is worse than silence — the reader stops trusting the
+column.
+
+So `Progress` remembers: a tool call is worth a note when it is first SEEN and when
+it FAILS, a plan when its summary line actually changes. Success gets no note; the
+next line implies it.
+
+**One instance per turn.** Sharing one across turns is the failure that looks like a
+feature working: the second turn goes quiet about anything the first mentioned.
+
+`tool_call` and `tool_call_update` are deliberately handled by the same path.
+Agents do not agree on which one opens a call — some send an update first, and the
+bundled fixture's initial `tool_call` already carries a terminal status — so first
+sighting is the only reliable start signal.
+
+# rule A diff is measured, never pasted {#diff_shape}
+
+`ToolCallContent` of type `diff` carries `oldText` and `newText` in full, and a
+legitimate edit can be a whole-file rewrite. Pasting that into a progress note
+buries every other line of the turn in a chat window.
+
+`diffShape` counts instead: strip the common head and tail, report `+added/-removed`
+against the path. It is a line count and not a real diff algorithm, which is enough
+to say how big an edit was and costs nothing. `oldText: null` means a new file, so
+every line counts as an addition.
+
+# rule Every note is one line {#one_line}
+
+`oneLine` collapses whitespace and clips, because these are read in a column next to
+everything else the reader is doing. A tool title containing a newline would
+otherwise break the shape of the whole trace.
+
+# test progress
+
+- a tool call is noted once, however many updates repeat it
+- a failed tool call is noted; a completed one is not
+- a diff becomes `± path +N/-M`, and a new file counts every line as added
+- an unchanged plan summary produces nothing on the second update
+- an update kind this module does not render returns null rather than throwing

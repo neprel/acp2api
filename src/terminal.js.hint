@@ -1,0 +1,93 @@
+# goal Run the agent's commands here, so they can be watched and stopped
+
+ACP lets a client offer `terminal/*`, and an agent that sees the capability routes
+its shell work through the client instead of running it itself. Two things follow,
+and neither is convenience: the output is ours as it happens, so a long turn can be
+watched; and `terminal/kill` stops ONE command, where the only other stop available
+is `session/cancel`, which ends the whole turn and everything it had built up.
+
+# decision Advertising `terminal` is a transfer of responsibility {#ownership}
+
+The moment `clientCapabilities.terminal` is true, the agent stops sandboxing,
+bounding and reaping its own execution — it asks instead. Everything it used to do
+is now this module's job, and a gap here is a gap in the whole deployment rather
+than a missing feature.
+
+Hence: `server.cwd` containment (the same rule `fs/*` uses), a cap on concurrent
+commands, an output ceiling, a wall-clock timeout, and reaping on agent shutdown.
+`server.terminal` defaults to **false** for exactly this reason — turning it on is
+a decision about who is responsible, not a preference.
+
+**Do not mistake the cwd check for a sandbox.** It bounds where a command STARTS,
+not what it can reach: `cd /etc` inside the command is not this module's business,
+and nothing here inspects the command line. The real boundary is whatever the
+process runs in — a container, a user account, a jail. This is the same honesty
+`fs/*` needs and gets less often: `within()` stops a path argument, not a program.
+
+# rule Kill the process group, never the child {#process_group}
+
+Commands are spawned `detached: true` so `process.kill(-pid)` can take the whole
+tree. A shell that started a build leaves the build running when only the shell is
+signalled, and that orphan holds the workspace and the CPU with nothing left to
+stop it. The fallback to `child.kill()` is for the case where the group is already
+gone, not an equivalent path.
+
+`release` kills too. Release is the agent saying it no longer cares about a
+command; a still-running command nobody cares about is precisely the orphan this
+module exists to prevent.
+
+# rule Truncate from the beginning, at a character boundary {#tail}
+
+Both halves are the protocol's, and both matter. A build's LAST lines are the ones
+that say what happened, so the tail is what is kept. And the retained output must
+still be a valid string even if that means keeping slightly less than asked for —
+a byte-exact cut splits a multi-byte character and hands the agent a replacement
+character where a path used to be.
+
+`Tail` therefore skips any UTF-8 continuation bytes (`10xxxxxx`) left at the front
+after a cut. It collapses to a single buffer when it overflows rather than dropping
+whole chunks, because a single write larger than the limit has to be cut inside
+itself.
+
+# rule stdout and stderr are one stream {#one_stream}
+
+That is what a terminal is. Keeping them apart would reorder a command's own
+interleaving of progress and errors, which is often the only thing that says where
+it went wrong.
+
+Neither is inherited from this process: a child writing onto our stdout would
+corrupt the ACP stream itself, since that is what stdout IS here.
+
+# rule A refusal must be legible to the agent {#legible_refusal}
+
+The agent is the only thing that can adapt to a refusal, and a plain thrown Error
+reaches it as a bare "Internal error" with the reason stripped — so it retries the
+same forbidden thing. `agent.js` maps these to `RequestError.invalidParams` (or
+`resourceNotFound` for an unknown terminal id) with the message as `data`.
+
+Errors here are therefore written to be READ by a model: "cwd outside workspace:
+/etc", not "EACCES".
+
+# bad Never let a command outlive what asked for it {#no_orphans}
+
+Three exits, and all three are needed:
+
+- `terminalTimeoutMs` — a command nobody kills and nobody waits for otherwise
+  outlives the turn, the session and the conversation. The agent decides when to
+  stop waiting; this decides when to stop running.
+- `release` / `releaseAll` — reaps on the agent's say-so and on shutdown, before
+  the CLI is killed. Killing the CLI first would leave its build running.
+- a settled `done` promise on spawn failure — an agent waiting on the exit of a
+  command that never started would wait for the life of the session.
+
+# test terminal
+
+- the tail keeps the end of the output and reports truncation
+- truncation never produces a replacement character
+- a single write larger than the limit is cut inside itself
+- stdout and stderr both arrive, in one stream
+- `exitStatus` is absent while running and present once finished
+- a cwd outside the workspace is refused
+- the concurrent-command cap is enforced
+- releasing a running command kills it
+- a spawn failure settles the wait rather than hanging it
