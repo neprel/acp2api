@@ -72,11 +72,23 @@ server:
   # n > 1) are refused regardless of this setting -- see src/params.js.
   unsupportedParams: warn
 
-  # Retained ACP sessions behind /v1/responses. Each is a live child process holding
-  # a login, so both bounds matter: the cap stops a client spawning CLIs without end,
-  # and the TTL reaps conversations nobody comes back to. Both close the session.
+  # Retained ACP sessions. Each is a live child process holding a login, so both
+  # bounds matter: the cap stops a client spawning CLIs without end, and the TTL
+  # gives back the sessions nobody has come back to.
+  #
+  # Neither of them FORGETS anything any more. Past the TTL a conversation is
+  # PARKED: it closes its ACP session -- freeing the login and the memory -- and
+  # keeps the id, so the next message restores it with `session/resume` and the
+  # agent still holds every file it had read and every plan it had made. The cap
+  # counts resident sessions only; a parked conversation costs one map entry.
   maxSessions: 100
   sessionTtlMs: 3600000
+
+  # When a conversation stops being one at all, and the next message genuinely
+  # starts over. Generous on purpose -- a thread picked up the next morning should
+  # still continue. Clamped up to sessionTtlMs, since forgetting before parking
+  # would mean never parking.
+  forgetTtlMs: 86400000
 
   # Reuse the session that already heard the start of an incoming history and send
   # only what is new. The OpenAI API asks every client to be stateless, so without

@@ -82,6 +82,28 @@ The agent's own tool calls are surfaced through `onEvent` and never appended to
 caller to execute and answer. Anything that makes them look like the latter is
 wrong; see [_.hint#mcp_tools](../_.hint).
 
+# rule This module routes session updates itself {#own_routing}
+
+`#sinks` maps a session id to the turn currently reading it, filled by one
+`session/update` handler on the client app; `turn()` sends `session/prompt` as a
+plain request and returns when it resolves.
+
+The SDK's `ActiveSession` does exactly this and cannot be used, because the only
+way to obtain one is `session/new`: its constructor and `attachSession` are both
+private. A session restored with `session/resume` would therefore have no way to
+receive its updates — which would rule out parking, reviving and forking
+altogether. Twenty lines here buys the whole session lifecycle.
+
+Two properties this relies on, both true of the SDK's dispatch and neither obvious:
+
+- **Order.** Notifications and the response travel the same stream and are handled
+  in order, so everything the agent sent before answering has already run by the
+  time the request resolves.
+- **Nothing after the answer.** Updates arriving once the turn has ended belong to
+  no turn and are dropped — the sink is removed in `finally` precisely so a late
+  chunk cannot land in the NEXT turn's accumulator. This matches what the SDK's
+  queue did: `nextUpdate()` also stopped at the prompt response.
+
 # invariant A dead child never takes the server down {#respawn}
 
 The `exit` handler drops the memoized connection so the next request respawns rather

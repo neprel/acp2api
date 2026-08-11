@@ -67,7 +67,7 @@ const app = acp
   .agent({ name: "fake-agent" })
   .onRequest(acp.methods.agent.initialize, () => ({
     protocolVersion: acp.PROTOCOL_VERSION,
-    agentCapabilities: { loadSession: false, sessionCapabilities: { close: {} } },
+    agentCapabilities: { loadSession: false, sessionCapabilities: { close: {}, resume: {} } },
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
@@ -96,9 +96,22 @@ const app = acp
     sessions.set(sessionId, state);
     return { sessionId, configOptions: optionsFor(state) };
   })
+  // `session/close` frees resources; it is not `session/delete`. So the state stays
+  // put and only stops being active -- which is what makes a parked session
+  // resumable, and what this fixture has to model for the bridge to be tested
+  // honestly.
   .onRequest(acp.methods.agent.session.close, ({ params }) => {
-    sessions.delete(params.sessionId);
+    const state = sessions.get(params.sessionId);
+    if (state) state.closed = true;
     return {};
+  })
+  .onRequest(acp.methods.agent.session.resume, ({ params }) => {
+    const state = sessions.get(params.sessionId);
+    // An id this agent never issued, or one that was deleted, cannot come back.
+    if (!state) throw new Error(`unknown session ${params.sessionId}`);
+    state.closed = false;
+    state.resumed = (state.resumed ?? 0) + 1;
+    return { sessionId: params.sessionId, configOptions: optionsFor(state) };
   })
   .onRequest(acp.methods.agent.session.setConfigOption, ({ params }) => {
     const state = sessions.get(params.sessionId);
@@ -159,6 +172,14 @@ const app = acp
     if (text.includes("FILL")) {
       await say({ sessionUpdate: "usage_update", used: 95, size: 100 });
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Forgets its own session on the way out, so a later `session/resume` fails the
+    // way a real agent's would once its stored transcript is gone.
+    if (text.includes("AMNESIA")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
+      sessions.delete(params.sessionId);
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 

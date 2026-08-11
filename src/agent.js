@@ -46,6 +46,14 @@ export class Agent {
   #log;
   #conn = null; // in-flight or established connection promise
   #closing = false;
+  // sessionId -> the turn currently reading that session's updates.
+  //
+  // The SDK's own `ActiveSession` does this routing, and cannot be used here: its
+  // constructor is private and the only way to obtain one is `session/new`. A
+  // session RESUMED by id therefore has no way to receive its updates through it,
+  // which would rule out `session/resume` and `session/fork` entirely. Routing by
+  // hand costs this map and one notification handler.
+  #sinks = new Map();
 
   constructor(spec, server, log = () => {}) {
     this.#spec = spec;
@@ -66,6 +74,12 @@ export class Agent {
     const cwd = this.#spec.cwd;
     const app = acp
       .client({ name: "acp2api" })
+      // One handler for every session on this agent, fanning out by id. An update
+      // for a session with no turn reading it is dropped on purpose: it belongs to
+      // a turn that has already ended, and there is nobody left to tell.
+      .onNotification(acp.methods.client.session.update, ({ params }) => {
+        this.#sinks.get(params.sessionId)?.(params.update);
+      })
       // No human is watching, so every permission prompt must be answered from
       // config. Match on `kind` rather than option id: ids are agent-specific.
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
@@ -210,13 +224,16 @@ export class Agent {
     // per-request equivalent, which is why OpenAI's `tools` cannot map onto this.
     for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
 
-    const active = await builder.start();
+    // `toRequest()` rather than `start()`: starting returns an `ActiveSession` that
+    // registers its own update handler, and this class routes updates itself so a
+    // resumed session can be read the same way a new one is. The builder is still
+    // what shapes the request -- `mcpServers` has a fiddly array form.
+    const res = await ctx.request(acp.methods.agent.session.new, builder.toRequest());
     const session = {
-      id: active.sessionId,
-      active,
+      id: res.sessionId,
       // Tracked on the session rather than re-read from `session/new`, because that
       // snapshot goes stale the moment an option is set.
-      options: active.newSessionResponse.configOptions ?? [],
+      options: res.configOptions ?? [],
       agent: this.name,
     };
     try {
@@ -228,11 +245,49 @@ export class Agent {
     return session;
   }
 
+  /**
+   * Restores a session this server closed earlier, by id.
+   *
+   * `session/resume` and not `session/load`: load replays the entire transcript
+   * back as `session/update` notifications, which a bridge that renders updates
+   * would re-emit as fresh output on every reconnect. Resume restores the session
+   * and its MCP connections and replays nothing, which is what a continuation
+   * wants.
+   *
+   * Returns null when the agent cannot resume -- it does not advertise the
+   * capability, or the id is gone. Null means "open a new one", never an error:
+   * a conversation whose session cannot be restored is a cold conversation, not a
+   * failed request.
+   */
+  async resumeSession(sessionId) {
+    if (!sessionId) return null;
+    const conn = await Promise.resolve().then(() => this.#connect());
+    if (!conn.init.agentCapabilities?.sessionCapabilities?.resume) return null;
+    const ctx = conn.connection.agent;
+    const builder = ctx.buildSession(this.#spec.cwd);
+    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+    const { cwd, mcpServers } = builder.toRequest();
+    try {
+      // The agent fingerprints cwd + mcpServers and compares them on resume, so
+      // both are sent exactly as `session/new` sent them. A config change between
+      // the two is precisely the case that should NOT resume.
+      const res = await ctx.request(acp.methods.agent.session.resume, { sessionId, cwd, mcpServers });
+      return {
+        id: res?.sessionId ?? sessionId,
+        options: res?.configOptions ?? [],
+        agent: this.name,
+      };
+    } catch (e) {
+      this.#log("info", `${this.name}: cannot resume ${sessionId} (${e?.message ?? e}); opening a new session`);
+      return null;
+    }
+  }
+
   /** Ends a session and stops routing its updates. Safe to call twice. */
   async closeSession(session) {
     if (!session || session.closed) return;
     session.closed = true;
-    session.active.dispose();
+    this.#sinks.delete(session.id);
     const conn = this.#conn && (await this.#conn.catch(() => null));
     if (!conn?.init.agentCapabilities?.sessionCapabilities?.close) return;
     await conn.connection.agent
@@ -271,7 +326,6 @@ export class Agent {
   async turn(session, blocks, { signal, onEvent = () => {}, limit = null, overrides = null } = {}) {
     const { connection } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
-    const active = session.active;
 
     const onAbort = () => {
       ctx.notify(acp.methods.agent.session.cancel, { sessionId: session.id }).catch(() => {});
@@ -296,31 +350,18 @@ export class Agent {
         onEvent({ type: "reasoning", delta });
       };
       let context = null; // {used, size} from the last usage_update, if any
-      active.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
 
-      for (;;) {
-        const message = await active.nextUpdate();
-        if (message.kind === "stop") {
-          return {
-            text,
-            reasoning,
-            // A turn cancelled by `limit` reports `cancelled`, which would reach the
-            // caller as an ordinary "stop". Report what actually happened instead.
-            stopReason: cut ?? message.stopReason,
-            usage: message.response.usage ?? null,
-            // How full this SESSION's context window is, when the agent says so.
-            // Deliberately not part of the OpenAI response: it describes the
-            // session rather than the turn, and it is the only warning anyone gets
-            // before the agent runs out of context for good.
-            context,
-          };
-        }
-        // Once cut, drain to the stop message without accumulating anything more.
-        // Cancellation is not instant -- the agent keeps sending for a moment, and
-        // appending that would undo the truncation the caller asked for.
-        if (cut) continue;
+      // Updates arrive as notifications on the same stream as the response, and
+      // JSON-RPC keeps them in order, so everything the agent sent before it
+      // answered has been handled by the time the request below resolves. Anything
+      // it sends AFTER answering belongs to no turn and is dropped -- which is the
+      // behaviour this had when the SDK's queue did the routing.
+      const onUpdate = (u) => {
+        // Once cut, ignore everything to the end. Cancellation is not instant --
+        // the agent keeps sending for a moment, and appending that would undo the
+        // truncation the caller asked for.
+        if (cut) return;
 
-        const u = message.update;
         if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text") {
           const before = text.length;
           text += u.content.text;
@@ -332,7 +373,7 @@ export class Agent {
             text = verdict.text;
             if (text.length > before) onEvent({ type: "text", delta: text.slice(before) });
             onAbort();
-            continue;
+            return;
           }
           onEvent({ type: "text", delta: u.content.text });
         } else if (u.sessionUpdate === "agent_thought_chunk" && u.content?.type === "text") {
@@ -353,10 +394,32 @@ export class Agent {
           // it, and a session that just compacted has room again.
           context = { used: Number(u.used) || 0, size: Number(u.size) };
         }
-      }
+      };
+
+      this.#sinks.set(session.id, onUpdate);
+      const response = await ctx.request(acp.methods.agent.session.prompt, {
+        sessionId: session.id,
+        prompt: blocks,
+      });
+      return {
+        text,
+        reasoning,
+        // A turn cancelled by `limit` reports `cancelled`, which would reach the
+        // caller as an ordinary "stop". Report what actually happened instead.
+        stopReason: cut ?? response.stopReason,
+        usage: response.usage ?? null,
+        // How full this SESSION's context window is, when the agent says so.
+        // Deliberately not part of the OpenAI response: it describes the session
+        // rather than the turn, and it is the only warning anyone gets before the
+        // agent runs out of context for good.
+        context,
+      };
     } catch (e) {
       throw this.#classify(e);
     } finally {
+      // Stop reading this session's updates. Leaving the sink in place would let a
+      // late chunk from this turn land in the next one's accumulator.
+      this.#sinks.delete(session.id);
       // The signal outlives the turn -- on a retained session it belongs to one
       // request while the session serves many, so a leaked listener would cancel
       // somebody else's turn.

@@ -59,6 +59,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   const sessions = new SessionStore({
     max: config.server.maxSessions,
     ttlMs: config.server.sessionTtlMs,
+    forgetTtlMs: config.server.forgetTtlMs,
     maxContextFill: config.server.maxContextFill,
     log,
   });
@@ -214,6 +215,17 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
   let session = conversation?.session ?? null;
   let opened = false;
   try {
+    // Parked: the conversation gave back its session while nobody was continuing
+    // it, and kept the id. `previous_response_id` still resolves, so restore it
+    // rather than answering the caller from a stranger.
+    if (!session && conversation?.sessionId) {
+      session = await agent.resumeSession(conversation.sessionId);
+      if (session) sessions.revive(convId, session);
+      else {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    }
     if (!session) {
       session = await agent.openSession();
       opened = true;
@@ -344,7 +356,6 @@ async function handleCompletion(req, res, registry, config, log, params, session
     : (callerKey && sessions.matchKey(model, callerKey)) || sessions.matchPrefix(model, systemId, prefix);
   let convId = match?.convId ?? null;
   let session = match?.session ?? null;
-  const opened = !session;
   // Which kind of continuity found it. `matchKey` returns the session's prefix and
   // `matchPrefix` does not, so this is the discriminator -- and it decides whether a
   // turn nobody waited for may leave the session standing. See the catch below.
@@ -356,22 +367,43 @@ async function handleCompletion(req, res, registry, config, log, params, session
   // turn. Comparing here covers both: the first replays nothing, the second
   // replays nothing because nothing matches.
   const heard = match?.prefix ? commonPrefix(match.prefix, prefix) : (match?.matched ?? 0);
-
-  // Only the turns the session has not heard. The preamble goes with the session,
-  // so it is sent once, when the session opens.
   const fresh = turns.slice(heard);
-  const blocks = toPromptBlocks(
-    opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
-  );
+  // Declared out here because the catch reads it: a session opened by THIS request
+  // has no id pointing at it and must never be left behind.
+  let opened = false;
 
   try {
+    // A parked conversation kept its id and gave back its session. Restoring it is
+    // what makes going quiet cost nothing: the agent still holds everything it read
+    // and planned, and only the new turn is sent. A resume that fails is not an
+    // error -- it means this conversation is cold now, and the whole history has to
+    // be replayed into a fresh session, which is why `blocks` is decided AFTER.
+    if (!session && match?.sessionId) {
+      session = await agent.resumeSession(match.sessionId);
+      if (session) {
+        sessions.revive(convId, session);
+        log("info", `${model}: resumed ${match.sessionId}${callerKey ? ` [${callerKey}]` : ""}`);
+      } else {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    }
+
+    opened = !session;
+    // Only the turns the session has not heard -- unless it is a fresh session,
+    // which has heard nothing at all. The preamble goes with the session, so it is
+    // sent once, when the session opens.
+    const blocks = toPromptBlocks(
+      opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
+    );
+
     if (opened) {
       await sessions.prune(registry);
       session = await agent.openSession();
       convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null });
       log("info", `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}`);
     } else {
-      const how = callerKey && match.prefix ? `keyed [${callerKey}]` : "by prefix";
+      const how = keyed ? `keyed [${callerKey}]` : "by prefix";
       log("info", `${model}: continuing session ${how}, ${fresh.length} new of ${prefix.length} message(s)`);
     }
     sessions.setBusy(convId, true);

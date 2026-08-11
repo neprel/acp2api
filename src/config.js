@@ -76,6 +76,17 @@ const DEFAULTS = {
   // spawning CLIs forever, and the TTL reaps conversations nobody returns to.
   maxSessions: 100,
   sessionTtlMs: 3_600_000,
+  // When a conversation stops being a conversation at all.
+  //
+  // `sessionTtlMs` no longer ends anything: past it a conversation is PARKED --
+  // it closes its ACP session, gives back the login and the memory, and keeps the
+  // id, so the next message restores it with `session/resume` and the agent still
+  // holds everything it had read. This is the bound that actually forgets, and it
+  // can be generous because a parked conversation costs one map entry.
+  //
+  // Clamped up to `sessionTtlMs`: forgetting sooner than parking would mean the
+  // park never happens.
+  forgetTtlMs: 86_400_000,
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
@@ -182,6 +193,7 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();
   req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
+  req(Number.isInteger(s.forgetTtlMs) && s.forgetTtlMs > 0, "server.forgetTtlMs must be a positive integer");
 
   const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;
   req(Array.isArray(patterns), "server.limitPatterns must be a list of regex strings");

@@ -675,3 +675,51 @@ test("an agent that never reports usage keeps its sessions", async (t) => {
   assert.match(await said(await ask("ECHOSESSION one", "thread-h")), /^s1/);
   assert.match(await said(await ask("ECHOSESSION two", "thread-h")), /^s1/);
 });
+
+test("a thread that went quiet resumes its session instead of starting cold", async (t) => {
+  // The point of parking: an idle conversation gives back the expensive half -- the
+  // resident session and the login it holds -- and keeps the id. Coming back must
+  // land in the SAME agent session, still holding whatever it had read.
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-p")), /^s1/);
+  // A TTL of 1ms means the next request's prune parks it first.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(
+    await said(await ask("ECHOSESSION two", "thread-p")),
+    /^s1/,
+    "a parked thread must come back to its own session, not a new one",
+  );
+});
+
+test("a session the agent cannot resume becomes a fresh one, not an error", async (t) => {
+  // Resume is best effort. An id the agent has lost means this conversation is
+  // cold now -- which is a cold answer, not a failed request.
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  // AMNESIA makes the agent forget its own session, the way a real one does once
+  // its stored transcript is gone.
+  assert.match(await said(await ask("AMNESIA", "thread-q")), /^s1/);
+  // The body can reach the client a tick before the request's own cleanup marks
+  // the conversation idle, and `prune` skips a busy one on purpose.
+  await new Promise((r) => setTimeout(r, 30));
+  // An unrelated thread opens a session, and the prune that precedes it parks the
+  // first -- parking is what puts thread-q on the resume path at all.
+  await ask("ECHOSESSION other", "thread-r");
+
+  const res = await ask("ECHOSESSION two", "thread-q");
+  assert.equal(res.status, 200, "a lost session is answered, not turned into a 502");
+  assert.doesNotMatch(await said(res), /^s1/, "and answered from a session that exists");
+});
