@@ -344,6 +344,10 @@ async function handleCompletion(req, res, registry, config, log, params, session
   let convId = match?.convId ?? null;
   let session = match?.session ?? null;
   const opened = !session;
+  // Which kind of continuity found it. `matchKey` returns the session's prefix and
+  // `matchPrefix` does not, so this is the discriminator -- and it decides whether a
+  // turn nobody waited for may leave the session standing. See the catch below.
+  const keyed = Boolean(match?.prefix);
 
   // `matchPrefix` found the session BY its prefix, so `matched` is exact.
   // `matchKey` did not look at the history at all -- a keyed caller may resend a
@@ -427,8 +431,23 @@ async function handleCompletion(req, res, registry, config, log, params, session
   } catch (e) {
     // A session that never answered has heard messages nobody can account for, so
     // it must not be offered to the next request. A brand new one goes entirely.
-    if (convId) await sessions.discard(convId, registry);
-    convId = null;
+    //
+    // With one exception, and it is the whole of steering. When the caller HANGS UP
+    // or we stop waiting, nothing is wrong with the agent -- a human redirected it,
+    // and the next message is the correction. Throwing the session away there
+    // discards exactly the work worth keeping: the files it had read, the plan it
+    // had built. So a session that already existed and was found BY KEY stays.
+    //
+    // Only by key. A prefix-matched session is found by claiming its recorded
+    // history describes what the agent heard, and after an unanswered turn that
+    // claim is false; continuing on it would be a lie about the conversation. A key
+    // makes no claim about content, so an abandoned turn cannot invalidate it -- and
+    // the unheard turns are simply resent, since `remember` never ran.
+    const abandoned = clientGone || timedOut;
+    if (convId && !(keyed && !opened && abandoned)) {
+      await sessions.discard(convId, registry);
+      convId = null;
+    }
     if (clientGone) {
       log("warn", `${model}: client disconnected`);
       return res.end();

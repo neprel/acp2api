@@ -584,3 +584,45 @@ test("progress streams as it happens, not as a summary at the end", async (t) =>
   assert.ok(lastNote >= 0 && firstAnswer >= 0, "expected both a note and an answer");
   assert.ok(lastNote < firstAnswer, `note at ${lastNote} should precede answer at ${firstAnswer}`);
 });
+
+test("a named session outlives a turn nobody waited for", async (t) => {
+  // This is steering on the wire: a turn is abandoned mid-flight and the next
+  // message is the correction. If the session went with the abandoned turn, the
+  // correction would reach an agent that had forgotten everything it had read --
+  // which is exactly the work the human was trying not to waste.
+  const call = await start(t, { server: { requestTimeoutMs: 400 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-y")), /^s1/);
+
+  const abandoned = await ask("HANG", "thread-y");
+  assert.equal(abandoned.status, 504);
+  await abandoned.json();
+
+  assert.match(
+    await said(await ask("ECHOSESSION two", "thread-y")),
+    /^s1/,
+    "the correction must land in the session that did the work",
+  );
+});
+
+test("a named session does NOT outlive a turn the agent itself failed", async (t) => {
+  // A broken agent is not a redirected one. Keeping the session here would offer
+  // the next request a conversation whose state nobody can account for.
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-z")), /^s1/);
+  assert.equal((await ask("BOOM", "thread-z")).status, 502);
+  assert.match(await said(await ask("ECHOSESSION two", "thread-z")), /^s2/);
+});

@@ -53,6 +53,30 @@ It has heard messages nobody can account for, so offering it to the next request
 would put the agent in a conversation that half-happened. See
 [sessions.js.hint#continuity](./sessions.js.hint).
 
+## rule A turn nobody waited for does not cost a KEYED session {#abandon_keeps_keyed}
+The exception to the invariant above, and the whole of steering. When the caller
+hangs up or the request times out, nothing is wrong with the agent: a human
+redirected it, and the next message is the correction. Discarding there throws away
+precisely what was worth keeping — the files it had read, the plan it had built —
+and the correction lands on a cold agent.
+
+So a session that **already existed** and was found **by key** survives
+`clientGone` or `timedOut`. Everything else still goes: a brand new session has no
+id pointing at it, and a quota or agent failure is a broken agent rather than a
+redirected one.
+
+Only by key, and the asymmetry is the point. A prefix match asserts that the
+session's recorded history describes what the agent heard; after an unanswered turn
+that assertion is false, so continuing on it would be a lie about the conversation.
+A key asserts nothing about content, so an abandoned turn cannot invalidate it. The
+unheard turns are simply resent — `remember` never ran — which is the conservative
+answer rather than a clever one.
+
+Verified against the request timeout, which is deterministic. The client-hangup half
+takes the same branch but is awkward to drive from a test harness that keeps
+connections alive; check it on a live deployment rather than assuming the test
+covers it.
+
 ## invariant Timeout and disconnect are tracked separately
 They need opposite answers: a timeout owes the caller 504, a vanished client owes it
 nothing. One flag for both produces a 504 written to a closed socket, or a silent
