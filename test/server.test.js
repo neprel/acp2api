@@ -626,3 +626,52 @@ test("a named session does NOT outlive a turn the agent itself failed", async (t
   assert.equal((await ask("BOOM", "thread-z")).status, 502);
   assert.match(await said(await ask("ECHOSESSION two", "thread-z")), /^s2/);
 });
+
+test("a session that has filled its context window is retired, not reused", async (t) => {
+  // A TTL bounds idleness and says nothing about size. The conversation continuity
+  // works hardest to keep is the one that grows into the agent's own compaction and
+  // then into a context it cannot recover from -- so fullness has to end a session
+  // even when someone is still actively using it.
+  const call = await start(t, { server: { maxContextFill: 0.8 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("FILL", "thread-f")), /^s1/);
+  assert.match(
+    await said(await ask("ECHOSESSION next", "thread-f")),
+    /^s2/,
+    "a 95%-full session must not be handed the next turn",
+  );
+});
+
+test("retirement is off when no ceiling is configured", async (t) => {
+  const call = await start(t, { server: { maxContextFill: 0 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("FILL", "thread-g")), /^s1/);
+  assert.match(await said(await ask("ECHOSESSION next", "thread-g")), /^s1/);
+});
+
+test("an agent that never reports usage keeps its sessions", async (t) => {
+  // Silence is not evidence of room. Guessing would retire healthy sessions on
+  // every agent that does not implement usage_update.
+  const call = await start(t, { server: { maxContextFill: 0.1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-h")), /^s1/);
+  assert.match(await said(await ask("ECHOSESSION two", "thread-h")), /^s1/);
+});

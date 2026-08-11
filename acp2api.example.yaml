@@ -40,6 +40,20 @@ server:
   # suddenly start showing tool traffic.
   progress: reasoning
 
+  # Retire a session once this much of its context window is in use, as a fraction.
+  # 0 turns the check off.
+  #
+  # sessionTtlMs below bounds how long a session sits idle; it says nothing about
+  # how big it has grown. A conversation continued every few minutes for days is
+  # exactly the one continuity keeps alive, and exactly the one that grows into the
+  # agent's own compaction -- a model call out of the same subscription -- and then
+  # into a context window no retry recovers. Retiring costs one cold session; not
+  # retiring costs the conversation.
+  #
+  # Read from `usage_update`. An agent that never sends it keeps its sessions:
+  # silence is not evidence of room, and guessing would retire healthy ones.
+  maxContextFill: 0.85
+
   # Agents can think for a long time. Past this the caller gets 504 rather than a
   # truncated 200 that a router would count as a success.
   requestTimeoutMs: 900000

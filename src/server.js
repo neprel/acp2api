@@ -59,6 +59,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   const sessions = new SessionStore({
     max: config.server.maxSessions,
     ttlMs: config.server.sessionTtlMs,
+    maxContextFill: config.server.maxContextFill,
     log,
   });
 
@@ -489,7 +490,11 @@ function remember(sessions, convId, prefix, text) {
  * response is shaped -- calling it twice would report a delta of zero.
  */
 function settleUsage(sessions, convId, turn) {
-  if (!convId || !turn?.usage) return turn;
+  if (!convId || !turn) return turn;
+  // How full the window is describes the SESSION, so it is recorded even when the
+  // turn reported no token counts at all.
+  if (turn.context) sessions.rememberContext(convId, turn.context);
+  if (!turn.usage) return turn;
   const usage = deltaUsage(turn.usage, sessions.usageBaseline(convId));
   sessions.rememberUsage(convId, turn.usage);
   return { ...turn, usage };

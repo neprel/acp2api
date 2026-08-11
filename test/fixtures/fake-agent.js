@@ -154,6 +154,14 @@ const app = acp
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
+    // Reports a context window nearly used up, so a test can drive retirement
+    // without having to actually fill one.
+    if (text.includes("FILL")) {
+      await say({ sessionUpdate: "usage_update", used: 95, size: 100 });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
     if (text.includes("HANG")) {
       await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
       return { stopReason: "cancelled" };

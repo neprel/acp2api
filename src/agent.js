@@ -295,6 +295,7 @@ export class Agent {
         reasoning += delta;
         onEvent({ type: "reasoning", delta });
       };
+      let context = null; // {used, size} from the last usage_update, if any
       active.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
 
       for (;;) {
@@ -307,6 +308,11 @@ export class Agent {
             // caller as an ordinary "stop". Report what actually happened instead.
             stopReason: cut ?? message.stopReason,
             usage: message.response.usage ?? null,
+            // How full this SESSION's context window is, when the agent says so.
+            // Deliberately not part of the OpenAI response: it describes the
+            // session rather than the turn, and it is the only warning anyone gets
+            // before the agent runs out of context for good.
+            context,
           };
         }
         // Once cut, drain to the stop message without accumulating anything more.
@@ -341,6 +347,11 @@ export class Agent {
         } else if (progress && (u.sessionUpdate === "plan" || u.sessionUpdate === "plan_update")) {
           const note = progress.note(u);
           if (note) narrate(note);
+        } else if (u.sessionUpdate === "usage_update" && Number.isFinite(u.size) && u.size > 0) {
+          // The only signal before a session runs out of context for good. Kept as
+          // the last reading rather than the largest: a compaction genuinely shrinks
+          // it, and a session that just compacted has room again.
+          context = { used: Number(u.used) || 0, size: Number(u.size) };
         }
       }
     } catch (e) {

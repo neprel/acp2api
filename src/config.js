@@ -102,6 +102,19 @@ const DEFAULTS = {
   // caller quotes, stores and replies to. `off` by default so a caller that has been
   // rendering reasoning as prose does not silently start showing tool traffic.
   progress: "off",
+  // How full a session's context window may get before it stops being reused, as a
+  // fraction. 0 disables the check.
+  //
+  // The TTL above bounds how long a session sits idle and says nothing about how
+  // large it has grown. The conversation continuity works hardest to keep -- one
+  // continued every few minutes for days -- is exactly the one that grows into the
+  // agent's own compaction, which is a model call out of the same subscription, and
+  // then into a context window it cannot recover from at all. Retiring on fullness
+  // costs one cold session; not retiring costs the conversation.
+  //
+  // Read from `usage_update`, which not every agent sends. An agent that stays
+  // silent leaves the check inactive rather than being guessed at.
+  maxContextFill: 0.85,
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -161,6 +174,10 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
   req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
+  req(
+    typeof s.maxContextFill === "number" && s.maxContextFill >= 0 && s.maxContextFill <= 1,
+    `server.maxContextFill must be a fraction between 0 and 1, got ${s.maxContextFill}`,
+  );
   req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();

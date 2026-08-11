@@ -205,6 +205,23 @@ or every reconnect re-emits the history as fresh output.
 so a stored id is only valid while an agent's config is unchanged. Any persistence
 scheme must key on that or fail closed.
 
+**But the SDK gives no way to use them yet, and that is the blocker.** Checked
+against 1.3.0, the newest published: `ActiveSession` has a private constructor,
+`attachSession` is private, and `AgentContext` exposes only `request` and `notify`.
+There is no public path from a session id to an `ActiveSession`, which is what
+`turn()` reads updates from. `session/resume` can be CALLED — it is just a request
+— but the updates it produces have nowhere to land.
+
+Using it therefore means this bridge routing `session/update` itself: one
+app-level notification handler fanning out by `sessionId` to per-session queues,
+replacing `active.prompt()` / `active.nextUpdate()`. That is a rewrite of the most
+delicate loop here, and it has one known hazard worth planning for before starting:
+agents may emit a final `agent_message_chunk` AFTER the `session/prompt` response
+resolves, so a naive `await request(...)` drops the tail of the answer. The
+`ActiveSession` queue is what currently absorbs that.
+
+Do not start it as a side effect of some other change.
+
 **`session/update` has thirteen kinds; this bridge reads five.** Read:
 `agent_message_chunk`, `agent_thought_chunk`, `tool_call` / `tool_call_update` and
 `plan` / `plan_update` — the last four rendered as progress notes by
