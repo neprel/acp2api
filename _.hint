@@ -205,15 +205,22 @@ or every reconnect re-emits the history as fresh output.
 so a stored id is only valid while an agent's config is unchanged. Any persistence
 scheme must key on that or fail closed.
 
-**`session/update` has thirteen kinds; this bridge reads two.** Beyond
-`agent_message_chunk` and `agent_thought_chunk`: `tool_call` / `tool_call_update`
-(received, then dropped by design — see
-[src/agent.js.hint#tool_calls_are_progress](src/agent.js.hint)), `plan` /
-`plan_update` / `plan_removed` (the incremental pair requires the client to
-advertise `plan: {}`), `usage_update` (cost during the turn), `session_info_update`
-(the agent's own title), `available_commands_update`, `current_mode_update`,
-`config_option_update`, `user_message_chunk` (echo of what the agent heard, behind
+**`session/update` has thirteen kinds; this bridge reads five.** Read:
+`agent_message_chunk`, `agent_thought_chunk`, `tool_call` / `tool_call_update` and
+`plan` / `plan_update` — the last four rendered as progress notes by
+[src/progress.js.hint](src/progress.js.hint) when `server.progress` is on, and
+still never allowed into the answer.
+
+Unread: `plan_removed`, `usage_update` (context fill and cost DURING the turn — the
+signal a retirement rule wants), `session_info_update` (the title the agent writes
+itself), `available_commands_update`, `current_mode_update`, `config_option_update`,
+`user_message_chunk` (echo of what the agent actually heard, behind
 `--replay-user-messages`).
+
+**Incremental plans are client-gated.** `plan_update` and `plan_removed` are sent
+only to a client that advertises `plan: {}` in its capabilities. Omit it and the
+agent either resends whole plans or sends none, which reads as an agent that does
+not plan.
 
 **A tool call is already structured.** `kind` ∈ `read | edit | delete | move |
 search | execute | think | fetch | switch_mode | other`, `status` ∈ `pending |

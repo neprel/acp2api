@@ -3,6 +3,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, relative, resolve, isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { Progress } from "./progress.js";
 
 /** Thrown for anything the HTTP layer should report with a specific status. */
 export class AgentError extends Error {
@@ -123,7 +124,14 @@ export class Agent {
       const connection = this.#clientApp().connect(stream);
       const init = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: this.#server.fs, writeTextFile: this.#server.fs } },
+        clientCapabilities: {
+          fs: { readTextFile: this.#server.fs, writeTextFile: this.#server.fs },
+          // `plan_update` and `plan_removed` are sent ONLY to a client that asks for
+          // them; without this the agent falls back to resending the whole plan, or
+          // to sending nothing, and it looks like an agent that never plans. Asked
+          // for only when there is something to render it with.
+          ...(this.#server.progress === "reasoning" ? { plan: {} } : {}),
+        },
       });
       this.#log("info", `${name}: ${init.agentInfo?.name ?? command} v${init.agentInfo?.version ?? "?"} ready`);
       return { child, connection, init };
@@ -276,6 +284,17 @@ export class Agent {
       let text = "";
       let reasoning = "";
       let cut = null; // stop reason imposed by `limit`, once it fires
+      // One per turn: the notes are transitions, and a shared instance would go
+      // quiet about work the previous turn happened to mention.
+      const progress = this.#server.progress === "reasoning" ? new Progress() : null;
+      // Progress notes travel in the reasoning channel, so they need the same
+      // accumulate-and-emit that a thought chunk gets, and a blank line between a
+      // note and prose that neither of them owns.
+      const narrate = (note) => {
+        const delta = reasoning === "" ? `${note}\n` : `\n${note}\n`;
+        reasoning += delta;
+        onEvent({ type: "reasoning", delta });
+      };
       active.prompt(blocks).catch(() => {}); // the rejection surfaces via nextUpdate()
 
       for (;;) {
@@ -317,6 +336,11 @@ export class Agent {
           // Progress only. These are the agent's OWN tool calls, already executed by
           // it -- not OpenAI `tool_calls` for the caller to run and answer.
           onEvent({ type: "tool_call", id: u.toolCallId, title: u.title, status: u.status, kind: u.kind });
+          const note = progress?.note(u);
+          if (note) narrate(note);
+        } else if (progress && (u.sessionUpdate === "plan" || u.sessionUpdate === "plan_update")) {
+          const note = progress.note(u);
+          if (note) narrate(note);
         }
       }
     } catch (e) {

@@ -124,6 +124,36 @@ const app = acp
     await say({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking(${state.effort})` } });
     await say({ sessionUpdate: "tool_call", toolCallId: "t1", title: "noop", status: "completed", kind: "other" });
 
+    // A turn with visible activity: a plan that advances, an edit that carries a
+    // real diff, and a tool that fails. Enough for the progress renderer to be
+    // exercised against the shapes an agent actually sends.
+    if (text.includes("WORK")) {
+      await say({
+        sessionUpdate: "plan",
+        entries: [
+          { content: "read the config", status: "completed", priority: "high" },
+          { content: "patch the compose file", status: "in_progress", priority: "high" },
+          { content: "restart", status: "pending", priority: "medium" },
+        ],
+      });
+      await say({
+        sessionUpdate: "tool_call",
+        toolCallId: "t2",
+        title: "Edit compose.yaml",
+        kind: "edit",
+        status: "in_progress",
+      });
+      await say({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t2",
+        status: "completed",
+        content: [{ type: "diff", path: "compose.yaml", oldText: "a\nb\nc\n", newText: "a\nB1\nB2\nc\n" }],
+      });
+      await say({ sessionUpdate: "tool_call", toolCallId: "t3", title: "Bash pytest", kind: "execute", status: "failed" });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
     if (text.includes("HANG")) {
       await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
       return { stopReason: "cancelled" };

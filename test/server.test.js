@@ -535,3 +535,52 @@ test("an agent error carrying no status still yields a 500-class response", asyn
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error.message, "upstream said no");
 });
+
+test("progress is off by default: activity never reaches the caller", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "WORK" }] }));
+  const msg = (await res.json()).choices[0].message;
+  assert.equal(msg.content, "done");
+  assert.equal(msg.reasoning_content, "thinking(low)");
+});
+
+test("progress narrates tool calls, diffs and the plan into reasoning", async (t) => {
+  const call = await start(t, { server: { progress: "reasoning" } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "WORK" }] }));
+  const msg = (await res.json()).choices[0].message;
+
+  // The answer is untouched: a trace written into the text becomes the answer.
+  assert.equal(msg.content, "done");
+
+  const notes = msg.reasoning_content;
+  assert.match(notes, /thinking\(low\)/, "the agent's own thinking still comes through");
+  assert.match(notes, /▸ plan 1\/3 — patch the compose file/);
+  assert.match(notes, /› Edit compose\.yaml/);
+  assert.match(notes, /± compose\.yaml \+2\/-1/);
+  assert.match(notes, /✗ Bash pytest/);
+  // Started once, not once per update.
+  assert.equal(notes.match(/› Edit compose\.yaml/g).length, 1);
+});
+
+test("progress streams as it happens, not as a summary at the end", async (t) => {
+  const call = await start(t, { server: { progress: "reasoning" } });
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "WORK" }], stream: true }),
+  );
+  const body = await res.text();
+  const deltas = body
+    .split("\n")
+    .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+    .map((l) => JSON.parse(l.slice(6)).choices[0].delta);
+
+  const reasoning = deltas.map((d) => d.reasoning_content ?? "");
+  assert.ok(reasoning.join("").includes("› Edit compose.yaml"), "notes arrive as reasoning deltas");
+
+  // The point of streaming progress is that it is live. A note about the last tool
+  // must be on the wire before the first character of the answer, not batched after.
+  const lastNote = reasoning.findLastIndex((r) => r.includes("Bash pytest"));
+  const firstAnswer = deltas.findIndex((d) => d.content);
+  assert.ok(lastNote >= 0 && firstAnswer >= 0, "expected both a note and an answer");
+  assert.ok(lastNote < firstAnswer, `note at ${lastNote} should precede answer at ${firstAnswer}`);
+});

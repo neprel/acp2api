@@ -90,6 +90,18 @@ const DEFAULTS = {
   //
   // Empty string disables it. Prefix matching stays as the fallback either way.
   conversationHeader: "x-conversation-id",
+  // Whether the agent's own activity -- its tool calls and its plan -- is narrated
+  // back to the caller, and where.
+  //
+  //   off        the default. Only the answer and the agent's thinking travel.
+  //   reasoning  activity is rendered as short notes in `reasoning_content`,
+  //              alongside the thinking already there.
+  //
+  // It goes in the reasoning channel and never in the text, because a trace written
+  // into the answer BECOMES the answer -- "running bash" would end up in what the
+  // caller quotes, stores and replies to. `off` by default so a caller that has been
+  // rendering reasoning as prose does not silently start showing tool traffic.
+  progress: "off",
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -148,6 +160,7 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
+  req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
   req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();

@@ -23,6 +23,23 @@ server:
   permission: allow
   fs: true
 
+  # Narrate what the agent is doing -- its tool calls, its edits, its plan -- so a
+  # turn that runs for minutes is legible while it runs: off | reasoning.
+  #
+  # `reasoning` renders each as a short note in `reasoning_content`, next to the
+  # thinking already there. It is never put in the answer: a trace written into the
+  # text becomes part of the text, and comes back as the assistant's own words on
+  # the next turn.
+  #
+  #   ▸ plan 1/3 — patch the compose file
+  #   › Edit compose.yaml
+  #   ± compose.yaml +2/-1
+  #   ✗ Bash pytest
+  #
+  # Off by default so a caller already rendering reasoning as prose does not
+  # suddenly start showing tool traffic.
+  progress: reasoning
+
   # Agents can think for a long time. Past this the caller gets 504 rather than a
   # truncated 200 that a router would count as a success.
   requestTimeoutMs: 900000
