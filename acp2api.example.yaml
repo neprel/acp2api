@@ -54,6 +54,20 @@ server:
   # gets a fresh session. Set false for a strictly stateless server.
   continuity: true
 
+  # The header a caller can use to NAME its conversation, instead of leaving
+  # acp2api to infer it from the history.
+  #
+  # Prefix matching only helps callers that resend a growing transcript. A caller
+  # that keeps the transcript on its own side -- an agent framework, a chat
+  # gateway -- hands over one rolled-up turn per request, so no two requests share
+  # a prefix and nothing can ever match. A stable key fixes that, and survives
+  # what prefix matching cannot: an edited system prompt, a trimmed history, a
+  # compacted transcript.
+  #
+  # Send any stable string: a thread id, a chat id, a session id. Set "" to ignore
+  # the header. Prefix matching stays the fallback either way.
+  conversationHeader: x-conversation-id
+
 agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus

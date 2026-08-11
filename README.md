@@ -186,6 +186,38 @@ happens here. A diverging history (edited, branched, trimmed) or a changed syste
 prompt still gets a fresh session, because neither is a continuation. Disable with
 `server.continuity: false`.
 
+### Naming a conversation, when inferring it cannot work
+
+Prefix matching has a hard limit worth stating plainly: it only helps a caller that
+resends a growing transcript. A caller that keeps the transcript on its own side —
+an agent framework, a chat gateway — hands over **one rolled-up turn per request**.
+No two requests share a prefix, nothing ever matches, and every message gets a cold
+agent. No amount of tuning changes that.
+
+Such a caller can name the conversation instead:
+
+```
+POST /v1/chat/completions
+x-conversation-id: mattermost:channel:c8f3…:thread:9ab1…
+```
+
+Any stable string will do — a thread id, a chat id, a session id. Same key, same
+ACP session:
+
+```
+claude-haiku: new session for 1 message(s) [mattermost:channel:c8f3…]
+claude-haiku: continuing session keyed [mattermost:channel:c8f3…], 1 new of 1 message(s)
+```
+
+A key is stronger evidence of identity than a prefix, so it also survives what
+prefix matching deliberately refuses: an edited system prompt, a trimmed history, a
+compacted transcript. That is the point — a real caller rewrites its own preamble
+constantly (injected memory, a user profile, the date the thread started), and
+forking on each such change would mean never continuing anything.
+
+The header name is `server.conversationHeader`; set it to `""` to ignore it.
+Requests without it fall back to prefix matching.
+
 ### /v1/responses is the better fit
 
 The Responses API is stateful and so is ACP, which makes the mapping direct rather

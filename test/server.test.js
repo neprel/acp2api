@@ -224,6 +224,90 @@ test("a changed system prompt is a different brief, not a continuation", async (
   assert.match(await said(await ask([sys("be verbose"), ...history])), /^s2/);
 });
 
+test("a named conversation continues where prefix matching cannot", async (t) => {
+  const call = await start(t);
+  // The shape a framework like Hermes sends: it keeps the transcript on its own
+  // side and hands over ONE rolled-up turn per request. Nothing about message two
+  // extends message one, so `matchPrefix` has nothing to find -- which is exactly
+  // the case a caller-supplied key exists for.
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-a")), /^s1/);
+  assert.match(await said(await ask("ECHOSESSION two", "thread-a")), /^s1/);
+});
+
+test("a named conversation replays nothing it has already heard", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  await ask("one", "thread-a");
+  const seen = await said(await ask("two", "thread-a"));
+  assert.match(seen, /two/);
+  assert.ok(!seen.includes("one"), `expected only the new turn, got ${JSON.stringify(seen)}`);
+});
+
+test("different keys are different conversations", async (t) => {
+  const call = await start(t);
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-a")), /^s1/);
+  // Same text, different thread. Joining them would put one channel's agent into
+  // another channel's conversation.
+  assert.match(await said(await ask("ECHOSESSION one", "thread-b")), /^s2/);
+});
+
+test("a key outranks a changed system prompt", async (t) => {
+  const call = await start(t);
+  const ask = (sys, content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({
+        model: "fake",
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content },
+        ],
+      }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("be terse", "ECHOSESSION one", "thread-a")), /^s1/);
+  // Under prefix matching a changed preamble MUST fork -- it is the only evidence
+  // of identity available. A key is better evidence, and a real caller rewrites
+  // its preamble constantly: injected memory, a profile, the date the thread
+  // started. Forking on that would mean never continuing anything.
+  assert.match(await said(await ask("be verbose", "ECHOSESSION two", "thread-a")), /^s1/);
+});
+
+test('conversationHeader: "" turns naming off', async (t) => {
+  const call = await start(t, { server: { conversationHeader: "" } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  assert.match(await said(await ask("ECHOSESSION one", "thread-a")), /^s1/);
+  // The header is now just a header, and prefix matching cannot save this shape.
+  assert.match(await said(await ask("ECHOSESSION two", "thread-a")), /^s2/);
+});
+
 test("continuity: false restores a fresh session per request", async (t) => {
   const call = await start(t, { server: { continuity: false } });
   const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));

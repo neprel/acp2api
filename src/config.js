@@ -80,6 +80,16 @@ const DEFAULTS = {
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
   continuity: true,
+  // The request header that names a conversation outright, when the caller can
+  // send one. Continuity by prefix works only for callers that resend a growing
+  // history; a caller that keeps the transcript on its own side and sends one
+  // rolled-up turn per request has no growing prefix to match, and there is
+  // nothing a session store can do about that. A stable key from the caller is
+  // the answer, and it survives what prefix matching cannot: an edited system
+  // prompt, a trimmed history, a compacted transcript.
+  //
+  // Empty string disables it. Prefix matching stays as the fallback either way.
+  conversationHeader: "x-conversation-id",
 };
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
@@ -138,6 +148,9 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
+  req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
+  // Header names are compared against Node's lower-cased `req.headers`.
+  s.conversationHeader = s.conversationHeader.toLowerCase();
   req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
 
   const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;

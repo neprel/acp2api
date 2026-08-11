@@ -14,7 +14,7 @@ import {
   usageChunk,
 } from "./openai.js";
 import { parseResponsesRequest, responseObject, ResponseStream } from "./responses.js";
-import { conversationKey, fingerprint, newResponseId, SessionStore } from "./sessions.js";
+import { commonPrefix, conversationKey, fingerprint, newResponseId, SessionStore } from "./sessions.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
@@ -330,14 +330,30 @@ async function handleCompletion(req, res, registry, config, log, params, session
   // send only what is new. Without it a stateless caller -- which is what the OpenAI
   // API asks every client to be -- restarts the agent on every message.
   const { systemId, turns, prefix } = conversationKey(body.messages);
-  const match = config.server.continuity ? sessions.matchPrefix(model, systemId, prefix) : null;
+
+  // A caller that can name its conversation gets the stronger form: the key is
+  // asked first, and prefix matching is the fallback for callers that cannot.
+  // Both are off when continuity is.
+  const callerKey = config.server.conversationHeader
+    ? String(req.headers[config.server.conversationHeader] ?? "").trim().slice(0, 512)
+    : "";
+  const match = !config.server.continuity
+    ? null
+    : (callerKey && sessions.matchKey(model, callerKey)) || sessions.matchPrefix(model, systemId, prefix);
   let convId = match?.convId ?? null;
   let session = match?.session ?? null;
   const opened = !session;
 
+  // `matchPrefix` found the session BY its prefix, so `matched` is exact.
+  // `matchKey` did not look at the history at all -- a keyed caller may resend a
+  // growing transcript, or may keep it on its own side and send one rolled-up
+  // turn. Comparing here covers both: the first replays nothing, the second
+  // replays nothing because nothing matches.
+  const heard = match?.prefix ? commonPrefix(match.prefix, prefix) : (match?.matched ?? 0);
+
   // Only the turns the session has not heard. The preamble goes with the session,
   // so it is sent once, when the session opens.
-  const fresh = turns.slice(match?.matched ?? 0);
+  const fresh = turns.slice(heard);
   const blocks = toPromptBlocks(
     opened ? body.messages : fresh.length > 0 ? fresh : turns.slice(-1),
   );
@@ -346,10 +362,11 @@ async function handleCompletion(req, res, registry, config, log, params, session
     if (opened) {
       await sessions.prune(registry);
       session = await agent.openSession();
-      convId = sessions.open(model, session, { systemId, prefix });
-      log("info", `${model}: new session for ${prefix.length} message(s)`);
+      convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null });
+      log("info", `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}`);
     } else {
-      log("info", `${model}: continuing session, ${fresh.length} new of ${prefix.length} message(s)`);
+      const how = callerKey && match.prefix ? `keyed [${callerKey}]` : "by prefix";
+      log("info", `${model}: continuing session ${how}, ${fresh.length} new of ${prefix.length} message(s)`);
     }
     sessions.setBusy(convId, true);
 
