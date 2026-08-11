@@ -759,3 +759,31 @@ test("without the capability the agent is never offered a terminal", async (t) =
   // method" rather than quietly running the command.
   assert.match((await res.json()).choices[0].message.content, /^REFUSED:/);
 });
+
+test("the session mode is selected by category, like model and reasoning", async (t) => {
+  // The autonomy control: set once for the session rather than answered per action.
+  // The fixture's option is called `permission-mode`, so an implementation that
+  // matched on the id would miss it -- exactly the way claude and codex differ.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        mode: "acceptEdits",
+      },
+    ],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ECHOMODE" }] }));
+  assert.equal((await res.json()).choices[0].message.content, "acceptEdits");
+});
+
+test("a mode the agent does not offer fails loudly rather than running anyway", async (t) => {
+  const call = await start(t, {
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], mode: "yolo" }],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /no value "yolo"/);
+});

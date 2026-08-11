@@ -257,6 +257,11 @@ function normalizeAgent(a, i, server, seen) {
   req(a.env === undefined || (a.env && typeof a.env === "object"), `${at}.env must be a mapping`);
   req(a.mcpServers === undefined || Array.isArray(a.mcpServers), `${at}.mcpServers must be a list`);
   req(a.options === undefined || (a.options && typeof a.options === "object"), `${at}.options must be a mapping of configOption id to value`);
+  // Not validated against a list of names: the values are the AGENT's vocabulary,
+  // and an id we do not recognise today is one it may add tomorrow. A wrong one
+  // fails at session setup with the agent's own wording, which is more useful than
+  // a guess made here.
+  req(a.mode === undefined || typeof a.mode === "string", `${at}.mode must be a string`);
 
   return {
     name: a.name,
@@ -267,11 +272,20 @@ function normalizeAgent(a, i, server, seen) {
     // Resolved through the same rules as server.cwd so an agent can be pinned to
     // its own workspace (e.g. one repo per agent) without absolute paths.
     cwd: a.cwd ? (isAbsolute(a.cwd) ? a.cwd : resolve(server.cwd, a.cwd)) : server.cwd,
-    // `model` and `reasoning` are set by SEMANTIC CATEGORY, not by id: claude calls
-    // its reasoning selector `effort` and codex calls it `reasoning_effort`, but both
-    // report category `thought_level`. `options` addresses anything else by raw id.
+    // `model`, `reasoning` and `mode` are set by SEMANTIC CATEGORY, not by id:
+    // claude calls its reasoning selector `effort` and codex calls it
+    // `reasoning_effort`, but both report category `thought_level`. `options`
+    // addresses anything else by raw id.
     model: a.model ?? null,
     reasoning: a.reasoning ?? null,
+    // The agent's permission mode -- how much it may do without asking. Names are
+    // the agent's own (`plan`, `acceptEdits`, `bypassPermissions` on claude), so
+    // this is a passthrough by category rather than a vocabulary of ours.
+    //
+    // It is the alternative to answering a permission prompt per action: an
+    // autonomous deployment sets the mode for the session and lets the agent work,
+    // while a shared channel can pin it to `plan` and read what it proposes.
+    mode: a.mode ?? null,
     options: a.options ?? {},
     mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
     description: a.description ?? "",

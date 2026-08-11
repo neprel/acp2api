@@ -18,6 +18,12 @@ commands, an output ceiling, a wall-clock timeout, and reaping on agent shutdown
 `server.terminal` defaults to **false** for exactly this reason — turning it on is
 a decision about who is responsible, not a preference.
 
+**Do not mistake the cwd check for a sandbox.** It bounds where a command STARTS,
+not what it can reach: `cd /etc` inside the command is not this module's business,
+and nothing here inspects the command line. The real boundary is whatever the
+process runs in — a container, a user account, a jail. This is the same honesty
+`fs/*` needs and gets less often: `within()` stops a path argument, not a program.
+
 # rule Kill the process group, never the child {#process_group}
 
 Commands are spawned `detached: true` so `process.kill(-pid)` can take the whole

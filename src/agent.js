@@ -214,13 +214,13 @@ export class Agent {
   }
 
   /**
-   * Applies `model`, `reasoning` and any raw `options` to a fresh session.
+   * Applies `model`, `reasoning`, `mode` and any raw `options` to a fresh session.
    *
-   * Selection is by semantic category (`model`, `thought_level`) because the option
-   * IDs differ between agents -- claude exposes `effort`, codex `reasoning_effort`.
-   * A requested value that the agent does not offer is a hard error: silently running
-   * on the wrong model is worse than a 400, since the caller picked this agent name
-   * precisely to get that model.
+   * Selection is by semantic category (`model`, `thought_level`, `mode`) because the
+   * option IDs differ between agents -- claude exposes `effort`, codex
+   * `reasoning_effort`. A requested value that the agent does not offer is a hard
+   * error: silently running on the wrong model is worse than a 400, since the caller
+   * picked this agent name precisely to get that model.
    */
   async #applyOptions(ctx, session, wants) {
     let opts = session.options;
@@ -232,6 +232,10 @@ export class Agent {
     const wanted = [
       ...(wants.model ? [{ category: "model", value: wants.model }] : []),
       ...(wants.reasoning ? [{ category: "thought_level", value: wants.reasoning }] : []),
+      // How much the agent may do without asking. This is the autonomy control that
+      // makes per-action permission prompts unnecessary: set the mode once, for the
+      // session, rather than answering the same question for every edit.
+      ...(wants.mode ? [{ category: "mode", value: wants.mode }] : []),
       ...Object.entries(wants.options ?? {}).map(([id, value]) => ({ id, value })),
     ];
     if (wanted.length === 0) return;

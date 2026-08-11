@@ -134,6 +134,11 @@ agents:
     type: claude # bundled adapter: @agentclientprotocol/claude-agent-acp
     model: opus[1m] # set on the option whose CATEGORY is "model"
     reasoning: high # set on the option whose CATEGORY is "thought_level"
+    # Set on the option whose CATEGORY is "mode": how much the agent may do
+    # without asking. The values are the agent's own vocabulary -- claude offers
+    # plan / acceptEdits / bypassPermissions. This is the alternative to answering
+    # a permission prompt per action: decide once, for the session.
+    mode: acceptEdits
 
   - name: claude-sonnet
     type: claude

@@ -21,6 +21,7 @@
  *   SHELL       -> drives the client terminal end to end
  *   ESCAPE      -> asks to run outside the workspace, and reports the refusal
  *   KILLIT      -> starts something endless and kills that one command
+ *   ECHOMODE    -> answers with the permission mode it was put into
  * anything else is echoed back after one thought chunk.
  */
 import { Readable, Writable } from "node:stream";
@@ -48,6 +49,19 @@ const optionsFor = (state) => [
   ...(state.model === "lite"
     ? []
     : [{ id: "effort", name: "Effort", category: "thought_level", type: "select", currentValue: state.effort, options: EFFORTS }]),
+  // A permission mode, reported under category `mode` the way claude-agent-acp
+  // does, so `mode:` in the config is exercised by category and not by id.
+  {
+    id: "permission-mode",
+    name: "Mode",
+    category: "mode",
+    type: "select",
+    currentValue: state.mode,
+    options: [
+      { value: "plan", name: "Plan" },
+      { value: "acceptEdits", name: "Accept edits" },
+    ],
+  },
   { id: "verbose", name: "Verbose", type: "boolean", currentValue: state.verbose },
 ];
 
@@ -87,6 +101,7 @@ const app = acp
     const state = {
       model: "fast",
       effort: "low",
+      mode: "plan",
       verbose: false,
       mcp: params.mcpServers ?? [],
       // ACP token counters are totals for the SESSION, not for a turn, and a real
@@ -126,6 +141,7 @@ const app = acp
     const state = sessions.get(params.sessionId);
     if (!state) throw new Error(`no such session ${params.sessionId}`);
     if (params.configId === "verbose") state.verbose = params.value;
+    else if (params.configId === "permission-mode") state.mode = params.value;
     else state[params.configId === "effort" ? "effort" : "model"] = params.value;
     return { configOptions: optionsFor(state) };
   })
@@ -173,6 +189,13 @@ const app = acp
       });
       await say({ sessionUpdate: "tool_call", toolCallId: "t3", title: "Bash pytest", kind: "execute", status: "failed" });
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Answers with the permission mode it was put into, so a test can prove `mode:`
+    // resolves by CATEGORY and not by the option id.
+    if (text.includes("ECHOMODE")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: state.mode } });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
