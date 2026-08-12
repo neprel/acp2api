@@ -267,6 +267,19 @@ test("busy: queue delivers a second message INTO the running turn", async (t) =>
   assert.match(answer, /ALSO-THIS/);
 });
 
+test("an injection that finds no running turn is refused, never run", async (t) => {
+  // The caller has to guess which model a thread is on, so a miss must be free.
+  // Falling through to the ordinary path would spend a turn of a real
+  // subscription on work nobody is waiting for.
+  const call = await start(t, { server: { busy: "queue" } });
+  const res = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ALSO-THIS" }] }),
+    headers: { "x-conversation-id": "thread-nobody-is-in", "x-acp2api-inject": "1" },
+  });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).error.code, "no_running_turn");
+});
+
 test("busy: fork keeps two concurrent turns apart, which is still the default", async (t) => {
   const call = await start(t);
   const ask = (content) =>

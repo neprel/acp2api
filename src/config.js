@@ -132,6 +132,20 @@ const DEFAULTS = {
   // completion -- it was a notification, and the answer belongs to the turn it
   // joined. `fork` by default because this changes what a concurrent request means.
   busy: "fork",
+  // The header that marks a request as an INJECTION and nothing else: join a turn
+  // already running, or do nothing at all.
+  //
+  // Without it an injection that misses -- wrong model, turn already finished,
+  // conversation never opened -- falls through to the ordinary path and starts a
+  // whole turn of its own. On a coding agent that is not a stray request: it is a
+  // spent turn of a real subscription, doing work nobody asked for, streaming to a
+  // caller that is not listening. Missing is the NORMAL case for a caller that has
+  // to guess which model a thread is running on, so it must be free.
+  //
+  // Marked requests that find nothing answer 409, which is what makes guessing
+  // safe: the caller can try the next model until one reports that it landed.
+  // Empty disables the marker entirely.
+  injectHeader: "x-acp2api-inject",
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
@@ -287,6 +301,8 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();
+  req(typeof s.injectHeader === "string", "server.injectHeader must be a string");
+  s.injectHeader = s.injectHeader.toLowerCase();
   req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
   req(Number.isInteger(s.forgetTtlMs) && s.forgetTtlMs > 0, "server.forgetTtlMs must be a positive integer");
 

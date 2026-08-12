@@ -356,6 +356,22 @@ async function handleCompletion(req, res, registry, config, log, params, session
     : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
       sessions.matchPrefix(model, systemId, prefix);
 
+  // "Join a turn already running, or do nothing." A caller that cannot know which
+  // model a thread is on has to guess, and a guess that misses must be free --
+  // otherwise it starts a whole turn of a real subscription for an answer nobody
+  // is waiting for. 409 is what lets it try the next model.
+  const injectOnly = Boolean(
+    config.server.injectHeader && String(req.headers[config.server.injectHeader] ?? "").trim(),
+  );
+  if (injectOnly && !match?.busy) {
+    clearTimeout(timer);
+    return send(
+      res,
+      409,
+      errorBody(`${model}: no turn is running for this conversation to join`, "no_running_turn"),
+    );
+  }
+
   // The named conversation is mid-turn and `busy: queue` says to join it rather
   // than start beside it. Only a KEYED caller reaches here: prefix matching cannot
   // identify a conversation whose transcript is still being written.

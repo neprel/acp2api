@@ -146,6 +146,13 @@ Outside a turn `inject` REFUSES rather than queueing, because a prompt with no s
 reading it would still run, still spend a turn of a real subscription, and be seen
 by nobody.
 
+A miss must be free. `server.injectHeader` marks a request as an injection and
+nothing else: it joins a running turn or answers **409**, and never falls through to
+the ordinary path. A caller that cannot know which model a thread is on has to
+guess, and without the marker a guess that misses starts a whole turn of a real
+subscription, doing work nobody asked for and streaming it to nobody. 409 is also
+what makes guessing usable: try the next model until one reports that it landed.
+
 Why this exists: a coding-agent turn runs for minutes behind one completion. Without
 it, correcting work that went wrong in its first thirty seconds means waiting for
 the whole thing to finish. See `server.busy` in config.js for the caller's half.
