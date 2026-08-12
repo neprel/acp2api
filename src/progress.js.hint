@@ -47,6 +47,32 @@ against the path. It is a line count and not a real diff algorithm, which is eno
 to say how big an edit was and costs nothing. `oldText: null` means a new file, so
 every line counts as an addition.
 
+# rule A tool call is many updates, and the useful parts are in different ones {#accumulate}
+
+Captured from a live `claude-agent-acp` on 2026-08-12: ONE Bash command arrives as
+six updates.
+
+| # | carries |
+| --- | --- |
+| 1 `tool_call` | `title: "Terminal"`, `rawInput: {}` — the command is still being streamed |
+| 2 `tool_call_update` | the real title and `rawInput.command`. **No status.** |
+| 3 `tool_call_update` | the same, plus a description |
+| 4 `tool_call_update` | `_meta.claudeCode.toolResponse` (stdout/stderr) |
+| 5 `tool_call_update` | `_meta.terminal_output.data`. **No status, no title.** |
+| 6 `tool_call_update` | `status: "completed"` and `_meta.terminal_exit.exit_code`. **No output, no title.** |
+
+Three consequences, and the first version of this file got all three wrong:
+
+- **Name it by the LAST title, not the first.** Taking the first names every
+  command "Terminal", which is the adapter's placeholder for one it has not
+  finished reading.
+- **Announce when the call knows what it is doing**, i.e. once `rawInput` is
+  non-empty — or when it reaches a terminal status, so nothing stays unannounced
+  forever. Announcing on first sighting prints the placeholder.
+- **Read the output and the exit code from ACCUMULATED state.** They arrive in
+  updates 5 and 6; reading either from the update that carries the status finds
+  nothing, which is why every command first looked successful and silent.
+
 # rule A command's output is tailed, in whichever shape it arrives {#terminal_output}
 
 For an `execute` call the output usually IS the interesting part, and agents send

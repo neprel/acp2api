@@ -308,37 +308,31 @@ const app = acp
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
-    // A shell command whose output comes back the way claude-agent-acp sends it
-    // WITHOUT the terminal_output capability: a fenced console block on the
-    // completed tool_call_update.
+    // Two shell commands, sent EXACTLY the way claude-agent-acp puts them on the
+    // wire -- captured from a live agent on 2026-08-12. Six updates per command,
+    // with the command, the output and the exit code in three different ones. The
+    // second command uses the fenced-console fallback an agent sends when the
+    // client did not advertise terminal_output.
     if (text.includes("RUNCMD")) {
-      await say({ sessionUpdate: "tool_call", toolCallId: "b1", title: "npm test", kind: "execute", status: "pending" });
-      await say({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "b1",
-        title: "npm test",
-        status: "failed",
-        content: [
-          {
-            type: "content",
-            content: { type: "text", text: "```console\nburied-by-the-cap\nmore noise\n1 failed, 3 passed\n```" },
-          },
-        ],
-      });
-      // And the way it sends them WITH the capability: output and exit code in
-      // _meta, content replaced by a terminal handle.
-      await say({ sessionUpdate: "tool_call", toolCallId: "b2", title: "make check", kind: "execute", status: "pending" });
-      await say({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "b2",
-        title: "make check",
-        status: "completed",
-        content: [{ type: "terminal", terminalId: "b2" }],
-        _meta: {
-          terminal_output: { terminal_id: "b2", data: "checking\nall good\n" },
-          terminal_exit: { terminal_id: "b2", exit_code: 2, signal: null },
-        },
-      });
+      const bash = async (id, command, output, exitCode) => {
+        await say({ sessionUpdate: "tool_call", toolCallId: id, title: "Terminal", kind: "execute",
+          status: "pending", rawInput: {}, content: [{ terminalId: id, type: "terminal" }],
+          _meta: { terminal_info: { terminal_id: id } } });
+        await say({ sessionUpdate: "tool_call_update", toolCallId: id, title: command, kind: "execute",
+          rawInput: { command } });
+        await say({ sessionUpdate: "tool_call_update", toolCallId: id,
+          _meta: { terminal_output: { terminal_id: id, data: output } } });
+        await say({ sessionUpdate: "tool_call_update", toolCallId: id, status: "completed",
+          content: [{ terminalId: id, type: "terminal" }],
+          _meta: { terminal_exit: { terminal_id: id, exit_code: exitCode, signal: null } } });
+      };
+      await bash("b1", "make check", "buried-by-the-cap\nchecking\nall good", 2);
+      await say({ sessionUpdate: "tool_call", toolCallId: "b2", title: "Terminal", kind: "execute",
+        status: "pending", rawInput: {} });
+      await say({ sessionUpdate: "tool_call_update", toolCallId: "b2", title: "npm test",
+        kind: "execute", rawInput: { command: "npm test" } });
+      await say({ sessionUpdate: "tool_call_update", toolCallId: "b2", status: "failed",
+        content: [{ type: "content", content: { type: "text", text: "```console\nnoise\n1 failed, 3 passed\n```" } }] });
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ran" } });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }

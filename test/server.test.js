@@ -856,11 +856,15 @@ test("a shell command's output reaches the caller in the trace", async (t) => {
   const msg = (await res.json()).choices[0].message;
 
   assert.equal(msg.content, "ran", "the answer stays the answer");
-  // Both shapes an agent may use, rendered the same way.
-  assert.match(msg.reasoning_content, /› npm test/);
-  assert.match(msg.reasoning_content, /⎿ 1 failed, 3 passed/);
-  assert.match(msg.reasoning_content, /⎿ all good/);
-  assert.match(msg.reasoning_content, /✗ make check \(exit 2\)/);
-  // Bounded: the noise above the last two lines never arrives.
-  assert.doesNotMatch(msg.reasoning_content, /buried-by-the-cap/);
+  const trace = msg.reasoning_content;
+  // Named by the command, never by the "Terminal" placeholder it opens with.
+  assert.doesNotMatch(trace, /Terminal/);
+  assert.match(trace, /› make check/);
+  assert.match(trace, /⎿ all good/);
+  assert.match(trace, /✗ make check \(exit 2\)/);
+  // The fenced-console fallback reads the same way.
+  assert.match(trace, /› npm test/);
+  assert.match(trace, /⎿ 1 failed, 3 passed/);
+  // Bounded: everything above the last two lines stays out.
+  assert.doesNotMatch(trace, /buried-by-the-cap/);
 });

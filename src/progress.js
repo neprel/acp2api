@@ -57,16 +57,24 @@ function diffShape(content) {
  */
 export function terminalResult(u) {
   const meta = u?._meta ?? {};
-  if (typeof meta.terminal_output?.data === "string") {
-    return { output: meta.terminal_output.data, exitCode: meta.terminal_exit?.exit_code ?? null };
+  let output = typeof meta.terminal_output?.data === "string" ? meta.terminal_output.data : null;
+  // The exit code arrives in an update of its OWN, carrying no output at all --
+  // so it is read independently. Requiring both together is what made every
+  // command look successful.
+  const exitCode = typeof meta.terminal_exit?.exit_code === "number" ? meta.terminal_exit.exit_code : null;
+
+  if (output === null) {
+    for (const entry of u?.content ?? []) {
+      const text = entry?.type === "content" ? entry.content?.text : null;
+      if (typeof text !== "string") continue;
+      const fenced = /^```console\n([\s\S]*?)\n?```$/.exec(text.trim());
+      if (fenced) {
+        output = fenced[1];
+        break;
+      }
+    }
   }
-  for (const entry of u?.content ?? []) {
-    const text = entry?.type === "content" ? entry.content?.text : null;
-    if (typeof text !== "string") continue;
-    const fenced = /^```console\n([\s\S]*?)\n?```$/.exec(text.trim());
-    if (fenced) return { output: fenced[1], exitCode: null };
-  }
-  return null;
+  return output === null && exitCode === null ? null : { output, exitCode };
 }
 
 /**
@@ -102,8 +110,13 @@ const oneLine = (text, max = 120) => {
  * notes for anything the first had already mentioned.
  */
 export class Progress {
-  #started = new Set();
-  #finished = new Set();
+  // id -> what we know about that call so far. A call is NOT one update: measured
+  // on the wire, a single Bash invocation arrives as six, and the pieces a reader
+  // needs are spread across them -- the command in the second, the output in the
+  // fifth, the exit code in the sixth, and none of those three carries the other
+  // two. Accumulating is the only way to say anything useful about it.
+  #calls = new Map();
+  #done = new Set();
   #plan = null;
 
   /** @param {number} outputLines how many trailing lines of command output to show */
@@ -132,27 +145,46 @@ export class Progress {
 
   #tool(u) {
     const id = u.toolCallId ?? "";
-    const label = oneLine(u.title || u.kind || "tool");
-    const lines = [];
+    if (!id || this.#done.has(id)) return null;
 
-    // The start. `tool_call` and `tool_call_update` are not reliably distinct --
-    // some agents open with an update, and the fixture's initial `tool_call`
-    // already carries a terminal status -- so the first sighting is what counts.
-    if (id && !this.#started.has(id)) {
-      this.#started.add(id);
-      lines.push(`› ${label}`);
+    const call = this.#calls.get(id) ?? { label: null, announced: false, output: null, exitCode: null };
+    this.#calls.set(id, call);
+
+    // The name improves as the agent learns it. A Bash call opens as the literal
+    // "Terminal" with an EMPTY rawInput -- the command is still being streamed --
+    // and only the next update carries it. Taking the first title would name every
+    // command "Terminal"; taking the last one names it correctly.
+    // `kind` last: it is a category, not a name, and only worth showing when the
+    // agent never says anything better.
+    const named = u.title || u.rawInput?.command || u.kind || null;
+    if (named) call.label = oneLine(named);
+    const shell = terminalResult(u);
+    if (shell?.output) call.output = shell.output;
+    if (shell?.exitCode != null) call.exitCode = shell.exitCode;
+
+    const lines = [];
+    // Announce once the call is worth announcing: a title AND some idea of what it
+    // is doing. `rawInput: {}` means the agent does not know yet either, and
+    // saying "› Terminal" then is worse than a half-second of silence. A terminal
+    // status forces the announcement regardless -- every call ends, so nothing can
+    // stay unannounced forever.
+    const known = Object.keys(u.rawInput ?? {}).length > 0;
+    if (!call.announced && call.label && (known || TERMINAL.has(u.status))) {
+      call.announced = true;
+      lines.push(`› ${call.label}`);
     }
 
-    if (TERMINAL.has(u.status) && id && !this.#finished.has(id)) {
-      this.#finished.add(id);
+    if (TERMINAL.has(u.status)) {
+      this.#done.add(id);
+      this.#calls.delete(id);
       // What a command actually printed, which for an `execute` call is usually
-      // the only part worth reading.
-      const shell = terminalResult(u);
-      if (shell?.output) lines.push(...tail(shell.output, this.outputLines).map((l) => `⎿ ${l}`));
+      // the only part worth reading. It arrived in an EARLIER update than this
+      // one, which is why it is read from the accumulated call and not from `u`.
+      if (call.output) lines.push(...tail(call.output, this.outputLines).map((l) => `⎿ ${l}`));
       // Success is implied by the next line; only a failure needs saying. An exit
       // code says more than "failed" when the agent gives us one.
-      if (u.status === "failed" || (shell && shell.exitCode)) {
-        lines.push(`✗ ${label}${shell?.exitCode ? ` (exit ${shell.exitCode})` : ""}`);
+      if (u.status === "failed" || call.exitCode) {
+        lines.push(`✗ ${call.label ?? "tool"}${call.exitCode ? ` (exit ${call.exitCode})` : ""}`);
       }
       for (const shape of (u.content ?? []).map(diffShape)) {
         if (shape) lines.push(`± ${shape.path} +${shape.added}/-${shape.removed}`);
