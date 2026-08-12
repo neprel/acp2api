@@ -88,3 +88,69 @@ test("a call with no title falls back to its kind", () => {
   const p = new Progress();
   assert.equal(p.note({ sessionUpdate: "tool_call", toolCallId: "t4", kind: "fetch", status: "pending" }), "› fetch");
 });
+
+test("a command's own output is shown, from a fenced console block", () => {
+  const p = new Progress(2);
+  p.note({ sessionUpdate: "tool_call", toolCallId: "b1", title: "npm test", kind: "execute", status: "pending" });
+  const note = p.note({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    title: "npm test",
+    status: "failed",
+    content: [{ type: "content", content: { type: "text", text: "```console\nnoise\nmore\n1 failed\n```" } }],
+  });
+  // The END of the output: a build prints a thousand lines of progress and one
+  // line of verdict.
+  assert.equal(note, "⎿ more\n⎿ 1 failed\n✗ npm test");
+});
+
+test("a command's output is shown from _meta too, with its exit code", () => {
+  const p = new Progress(4);
+  const note = p.note({
+    sessionUpdate: "tool_call",
+    toolCallId: "b2",
+    title: "make check",
+    kind: "execute",
+    status: "completed",
+    content: [{ type: "terminal", terminalId: "b2" }],
+    _meta: { terminal_output: { terminal_id: "b2", data: "checking\nall good\n" }, terminal_exit: { exit_code: 2 } },
+  });
+  assert.equal(note, "› make check\n⎿ checking\n⎿ all good\n✗ make check (exit 2)");
+});
+
+test("a zero exit code is not an error", () => {
+  const p = new Progress(1);
+  const note = p.note({
+    sessionUpdate: "tool_call",
+    toolCallId: "b3",
+    title: "ls",
+    status: "completed",
+    _meta: { terminal_output: { data: "a\nb" }, terminal_exit: { exit_code: 0 } },
+  });
+  assert.equal(note, "› ls\n⎿ b");
+});
+
+test("output lines are off when the budget is zero", () => {
+  const p = new Progress(0);
+  const note = p.note({
+    sessionUpdate: "tool_call",
+    toolCallId: "b4",
+    title: "ls",
+    status: "completed",
+    _meta: { terminal_output: { data: "a\nb" } },
+  });
+  assert.equal(note, "› ls", "the command is still named; only what it printed is withheld");
+});
+
+test("blank lines and a single very long line cannot blow up the trace", () => {
+  const p = new Progress(3);
+  const note = p.note({
+    sessionUpdate: "tool_call",
+    toolCallId: "b5",
+    title: "build",
+    status: "completed",
+    _meta: { terminal_output: { data: `\n\n${"x".repeat(500)}\n\n` } },
+  });
+  const [, out] = note.split("\n");
+  assert.ok(out.length <= 164, `expected a clipped line, got ${out.length} chars`);
+});

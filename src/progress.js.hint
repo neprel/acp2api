@@ -47,6 +47,26 @@ against the path. It is a line count and not a real diff algorithm, which is eno
 to say how big an edit was and costs nothing. `oldText: null` means a new file, so
 every line counts as an addition.
 
+# rule A command's output is tailed, in whichever shape it arrives {#terminal_output}
+
+For an `execute` call the output usually IS the interesting part, and agents send
+it two different ways depending on a capability the CLIENT declared. `terminalResult`
+reads both, so neither the flag nor its absence changes what a reader sees:
+
+- `_meta.terminal_output.data` with `_meta.terminal_exit.exit_code` — sent by
+  `claude-agent-acp` and `codex-acp` when `clientCapabilities._meta.terminal_output`
+  is advertised. The only shape that carries an exit code.
+- a ```` ```console ```` fenced block in the ordinary `content` — the same agents'
+  fallback otherwise.
+
+Only the LAST `progressOutputLines` lines are shown, because that is where a
+command says what happened: a build prints a thousand lines of progress and one
+line of verdict. The bound is not politeness — this lands in a chat post, and an
+unbounded `npm test` buries every other line of the turn.
+
+A zero exit code is not a failure. Reporting `exit 0` as `✗` would train the
+reader to ignore the mark that matters.
+
 # rule Every note is one line {#one_line}
 
 `oneLine` collapses whitespace and clips, because these are read in a column next to

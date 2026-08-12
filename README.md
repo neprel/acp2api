@@ -272,8 +272,14 @@ never wrong.
 ▸ plan 1/3 — patch the compose file
 › Edit compose.yaml
 ± compose.yaml +2/-1
-✗ Bash pytest
+› pytest -q
+⎿ 1 failed, 42 passed in 3.10s
+✗ pytest -q (exit 1)
 ```
+
+`progressOutputLines` bounds how much of a command's output is shown — the last
+few lines, because that is where a command says what happened. Both shapes agents
+send it in are read, so no capability has to be negotiated for it to appear.
 
 Never into the answer: a trace written into the text becomes part of the text, and
 comes back as the assistant's own words on the next turn. Off by default, so a

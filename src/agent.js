@@ -206,6 +206,14 @@ export class Agent {
           // to sending nothing, and it looks like an agent that never plans. Asked
           // for only when there is something to render it with.
           ...(this.#server.progress === "reasoning" ? { plan: {} } : {}),
+          // Not in the ACP schema: `claude-agent-acp` and `codex-acp` both gate a
+          // richer Bash result on this `_meta` flag, sending the command's output
+          // and its EXIT CODE as `_meta.terminal_output` / `terminal_exit` instead
+          // of a fenced console block. The block alone would do -- progress.js
+          // reads both -- but only this way is the exit code available at all.
+          ...(this.#server.progress === "reasoning"
+            ? { _meta: { terminal_output: true } }
+            : {}),
         },
       });
       this.#log("info", `${name}: ${init.agentInfo?.name ?? command} v${init.agentInfo?.version ?? "?"} ready`);
@@ -476,7 +484,8 @@ export class Agent {
       let cut = null; // stop reason imposed by `limit`, once it fires
       // One per turn: the notes are transitions, and a shared instance would go
       // quiet about work the previous turn happened to mention.
-      const progress = this.#server.progress === "reasoning" ? new Progress() : null;
+      const progress =
+        this.#server.progress === "reasoning" ? new Progress(this.#server.progressOutputLines) : null;
       // Progress notes travel in the reasoning channel, so they need the same
       // accumulate-and-emit that a thought chunk gets, and a blank line between a
       // note and prose that neither of them owns.

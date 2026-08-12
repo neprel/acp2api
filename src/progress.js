@@ -41,6 +41,48 @@ function diffShape(content) {
   return { path: content.path ?? "", added: after.length - common - tail, removed: before.length - common - tail };
 }
 
+/**
+ * What a shell command printed, and how it ended.
+ *
+ * Two shapes carry the same thing, and which one arrives depends on a capability
+ * the CLIENT declares -- so both are read rather than one being chosen:
+ *
+ *   - `_meta.terminal_output.data` plus `_meta.terminal_exit.exit_code`, sent by
+ *     `claude-agent-acp` and `codex-acp` when the client advertises
+ *     `clientCapabilities._meta.terminal_output`. This one carries the exit code.
+ *   - a ```console fenced block in the ordinary `content`, which is what the same
+ *     agents fall back to otherwise. No exit code, but the output is all there.
+ *
+ * `null` when this was not a command, or printed nothing.
+ */
+export function terminalResult(u) {
+  const meta = u?._meta ?? {};
+  if (typeof meta.terminal_output?.data === "string") {
+    return { output: meta.terminal_output.data, exitCode: meta.terminal_exit?.exit_code ?? null };
+  }
+  for (const entry of u?.content ?? []) {
+    const text = entry?.type === "content" ? entry.content?.text : null;
+    if (typeof text !== "string") continue;
+    const fenced = /^```console\n([\s\S]*?)\n?```$/.exec(text.trim());
+    if (fenced) return { output: fenced[1], exitCode: null };
+  }
+  return null;
+}
+
+/**
+ * The last `n` non-empty lines, each clipped to one line's worth.
+ *
+ * The END, because that is where a command says what happened -- a build prints
+ * a thousand lines of progress and one line of verdict. Bounded hard: this lands
+ * in a chat post next to everything else the reader is doing, and an unbounded
+ * `npm test` would bury the entire turn.
+ */
+export function tail(output, n) {
+  if (!(n > 0)) return [];
+  const lines = String(output).split("\n").map((l) => l.trimEnd()).filter((l) => l.trim() !== "");
+  return lines.slice(-n).map((l) => oneLine(l, 160));
+}
+
 /** Collapses whitespace and clips, so one note is always one line. */
 const oneLine = (text, max = 120) => {
   const flat = String(text).replace(/\s+/g, " ").trim();
@@ -63,6 +105,11 @@ export class Progress {
   #started = new Set();
   #finished = new Set();
   #plan = null;
+
+  /** @param {number} outputLines how many trailing lines of command output to show */
+  constructor(outputLines = 0) {
+    this.outputLines = outputLines;
+  }
 
   /**
    * A note for one `session/update`, or null when there is nothing new to say.
@@ -98,8 +145,15 @@ export class Progress {
 
     if (TERMINAL.has(u.status) && id && !this.#finished.has(id)) {
       this.#finished.add(id);
-      // Success is implied by the next line; only a failure needs saying.
-      if (u.status === "failed") lines.push(`✗ ${label}`);
+      // What a command actually printed, which for an `execute` call is usually
+      // the only part worth reading.
+      const shell = terminalResult(u);
+      if (shell?.output) lines.push(...tail(shell.output, this.outputLines).map((l) => `⎿ ${l}`));
+      // Success is implied by the next line; only a failure needs saying. An exit
+      // code says more than "failed" when the agent gives us one.
+      if (u.status === "failed" || (shell && shell.exitCode)) {
+        lines.push(`✗ ${label}${shell?.exitCode ? ` (exit ${shell.exitCode})` : ""}`);
+      }
       for (const shape of (u.content ?? []).map(diffShape)) {
         if (shape) lines.push(`± ${shape.path} +${shape.added}/-${shape.removed}`);
       }

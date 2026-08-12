@@ -6,6 +6,41 @@ and neither is convenience: the output is ours as it happens, so a long turn can
 watched; and `terminal/kill` stops ONE command, where the only other stop available
 is `session/cancel`, which ends the whole turn and everything it had built up.
 
+# bad Neither bundled adapter uses this, and both say so in `_meta` instead {#adapters_ignore_terminal}
+
+Measured on a live deployment, 2026-08-12: with `server.terminal: true`, asking
+Claude Code to run a command and print its own parent gave
+
+```
+    PID    PPID COMMAND
+    989     906 bash
+/usr/local/lib/.../claude-agent-sdk-linux-x64/claude
+```
+
+— the shell's parent is `claude`, not this bridge. `terminal/create` was never
+called. Reading the adapter confirms it: `claude-agent-acp` consults
+`clientCapabilities.auth`, `.elicitation` and `.session`, and **never
+`.terminal`**.
+
+What both bundled adapters do instead is a private `_meta` extension, gated on
+`clientCapabilities._meta.terminal_output`, described in their own comment as
+matching "codex-acp's streaming lifecycle":
+
+```
+1. tool_call        → _meta.terminal_info   { terminal_id }
+2. tool_call_update → _meta.terminal_output { terminal_id, data }
+3. tool_call_update → _meta.terminal_exit   { terminal_id, exit_code, signal }
+```
+
+And without that flag they fall back to a ```` ```console ```` fenced block in the
+ordinary `content` — so **the output was always reachable**, capability or not.
+`progress.js` reads both shapes.
+
+So this module is correct, tested, and inert against the two agents this package
+ships. Keep it for ACP agents that implement the spec; do NOT turn it on expecting
+to see commands, and do not conclude from a quiet log that it is working — a
+successful `terminal/create` writes no line. Check the parent process.
+
 # decision Advertising `terminal` is a transfer of responsibility {#ownership}
 
 The moment `clientCapabilities.terminal` is true, the agent stops sandboxing,

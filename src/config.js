@@ -130,6 +130,14 @@ const DEFAULTS = {
   // caller quotes, stores and replies to. `off` by default so a caller that has been
   // rendering reasoning as prose does not silently start showing tool traffic.
   progress: "off",
+  // How many trailing lines of a command's own output to show in the trace, when
+  // `progress` is on. 0 shows the command but never what it printed.
+  //
+  // The END of the output, because that is where a command says what happened: a
+  // build prints a thousand lines of progress and one line of verdict. Small on
+  // purpose -- this lands in a chat post, and an unbounded `npm test` buries the
+  // whole turn.
+  progressOutputLines: 6,
   // How full a session's context window may get before it stops being reused, as a
   // fraction. 0 disables the check.
   //
@@ -202,6 +210,10 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
   req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
+  req(
+    Number.isInteger(s.progressOutputLines) && s.progressOutputLines >= 0,
+    "server.progressOutputLines must be a non-negative integer",
+  );
   req(typeof s.terminal === "boolean", "server.terminal must be true or false");
   req(Number.isInteger(s.maxTerminals) && s.maxTerminals > 0, "server.maxTerminals must be a positive integer");
   req(

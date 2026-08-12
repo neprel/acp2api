@@ -849,3 +849,18 @@ test("with no warmup configured nothing is forked", async (t) => {
   assert.equal(seen.from, null);
   assert.equal(seen.heard.length, 1, "only the caller's own turn");
 });
+
+test("a shell command's output reaches the caller in the trace", async (t) => {
+  const call = await start(t, { server: { progress: "reasoning", progressOutputLines: 2 } });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "RUNCMD" }] }));
+  const msg = (await res.json()).choices[0].message;
+
+  assert.equal(msg.content, "ran", "the answer stays the answer");
+  // Both shapes an agent may use, rendered the same way.
+  assert.match(msg.reasoning_content, /› npm test/);
+  assert.match(msg.reasoning_content, /⎿ 1 failed, 3 passed/);
+  assert.match(msg.reasoning_content, /⎿ all good/);
+  assert.match(msg.reasoning_content, /✗ make check \(exit 2\)/);
+  // Bounded: the noise above the last two lines never arrives.
+  assert.doesNotMatch(msg.reasoning_content, /buried-by-the-cap/);
+});

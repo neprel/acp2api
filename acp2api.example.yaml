@@ -57,6 +57,11 @@ server:
   # suddenly start showing tool traffic.
   progress: reasoning
 
+  # How many trailing lines of a command's own output to put in the trace; 0 shows
+  # the command but never what it printed. The END of the output, because that is
+  # where a command says what happened.
+  progressOutputLines: 6
+
   # Retire a session once this much of its context window is in use, as a fraction.
   # 0 turns the check off.
   #

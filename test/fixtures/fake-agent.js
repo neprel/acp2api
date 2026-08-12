@@ -23,6 +23,7 @@
  *   KILLIT      -> starts something endless and kills that one command
  *   ECHOMODE    -> answers with the permission mode it was put into
  *   ECHOHEARD   -> answers with everything it has been told, and its fork parent
+ *   RUNCMD      -> two shell results, in both shapes an agent may send them
  * anything else is echoed back after one thought chunk.
  */
 import { Readable, Writable } from "node:stream";
@@ -304,6 +305,41 @@ const app = acp
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: JSON.stringify(exit) },
       });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // A shell command whose output comes back the way claude-agent-acp sends it
+    // WITHOUT the terminal_output capability: a fenced console block on the
+    // completed tool_call_update.
+    if (text.includes("RUNCMD")) {
+      await say({ sessionUpdate: "tool_call", toolCallId: "b1", title: "npm test", kind: "execute", status: "pending" });
+      await say({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "b1",
+        title: "npm test",
+        status: "failed",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "```console\nburied-by-the-cap\nmore noise\n1 failed, 3 passed\n```" },
+          },
+        ],
+      });
+      // And the way it sends them WITH the capability: output and exit code in
+      // _meta, content replaced by a terminal handle.
+      await say({ sessionUpdate: "tool_call", toolCallId: "b2", title: "make check", kind: "execute", status: "pending" });
+      await say({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "b2",
+        title: "make check",
+        status: "completed",
+        content: [{ type: "terminal", terminalId: "b2" }],
+        _meta: {
+          terminal_output: { terminal_id: "b2", data: "checking\nall good\n" },
+          terminal_exit: { terminal_id: "b2", exit_code: 2, signal: null },
+        },
+      });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ran" } });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
