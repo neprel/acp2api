@@ -121,6 +121,35 @@ message, which is not a display preference. `limit` reads the run in flight rath
 than the whole turn, since a stop sequence inside discarded commentary is not a
 stop sequence in the reply.
 
+# rule A prompt can be delivered INTO a turn already running {#inject}
+
+`inject` sends `session/prompt` on a session that is already prompting. What comes
+back is not an answer — it is whether the agent took it.
+
+The contract, measured against `claude-agent-acp` on 2026-08-12 rather than assumed:
+
+- the agent advertises it as `agentCapabilities._meta.claudeCode.promptQueueing`;
+- the RUNNING prompt returns early with `end_turn` and every usage counter at zero.
+  **That is a sentinel, not an answer** — treated as a result it truncates the turn
+  and reports zero cost for work that really happened;
+- the session carries on with both instructions in the same turn;
+- the LAST outstanding prompt returns the real result and the real cumulative usage.
+
+`turn()` therefore does not finish when its own request resolves: it drains
+`session.queued` and reports what the last one said, while the sink keeps
+accumulating throughout. To the caller of the original request the injection is
+simply part of its own answer — which is the point, because that caller is the one
+waiting, and a second HTTP response would arrive where nobody is listening.
+
+`session.queued` is the window: an array for the life of a turn, null otherwise.
+Outside a turn `inject` REFUSES rather than queueing, because a prompt with no sink
+reading it would still run, still spend a turn of a real subscription, and be seen
+by nobody.
+
+Why this exists: a coding-agent turn runs for minutes behind one completion. Without
+it, correcting work that went wrong in its first thirty seconds means waiting for
+the whole thing to finish. See `server.busy` in config.js for the caller's half.
+
 # rule This module routes session updates itself {#own_routing}
 
 `#sinks` maps a session id to the turn currently reading it, filled by one
@@ -188,6 +217,8 @@ doing that on a crash it should have retried burns a subscription for nothing. N
 phrasings belong in `server.limitPatterns` (config), not in this file.
 
 # test agent
+
+- a prompt is never queued into a session with no turn running
 
 - by default the agent's running commentary is part of the answer
 - `commentary: trace` moves what was said between tool calls into the reasoning

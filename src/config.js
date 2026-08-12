@@ -104,6 +104,34 @@ const DEFAULTS = {
   // Clamped up to `sessionTtlMs`: forgetting sooner than parking would mean the
   // park never happens.
   forgetTtlMs: 86_400_000,
+  // What a request for a conversation whose turn is STILL RUNNING should do.
+  //
+  //   fork   the default. It gets a session of its own, because two turns cannot
+  //          interleave inside one agent.
+  //   queue  it is delivered INTO the running turn, and the agent picks it up at
+  //          its next step.
+  //
+  // `queue` is what makes mid-turn steering possible at all. A coding-agent turn
+  // runs for minutes behind a single completion, so "wait for the answer and send
+  // the correction after" can mean waiting a quarter of an hour to redirect work
+  // that went the wrong way in its first thirty seconds.
+  //
+  // It rests on a capability the agent has to have: `session/prompt` on a session
+  // that is already prompting. `claude-agent-acp` advertises it as
+  // `agentCapabilities._meta.claudeCode.promptQueueing`, and MEASURED against it,
+  // the contract is:
+  //
+  //   - the running prompt returns EARLY, with `end_turn` and every usage counter
+  //     at zero -- a sentinel meaning "superseded", not an answer;
+  //   - the session carries on with both instructions in the same turn;
+  //   - the last outstanding prompt returns the real result and the real usage.
+  //
+  // So the caller of the original request keeps its response: the bridge swallows
+  // that early return and goes on accumulating until the last prompt resolves. The
+  // request that DELIVERED the injection is answered immediately with an empty
+  // completion -- it was a notification, and the answer belongs to the turn it
+  // joined. `fork` by default because this changes what a concurrent request means.
+  busy: "fork",
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
@@ -237,6 +265,7 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
     ["answer", "trace"].includes(s.commentary),
     `server.commentary must be "answer" or "trace", got ${s.commentary}`,
   );
+  req(["fork", "queue"].includes(s.busy), `server.busy must be "fork" or "queue", got ${s.busy}`);
   req(
     Number.isInteger(s.progressOutputLines) && s.progressOutputLines >= 0,
     "server.progressOutputLines must be a non-negative integer",

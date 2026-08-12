@@ -174,8 +174,40 @@ const app = acp
     if (text.includes("QUOTA")) throw new Error("Claude usage limit reached. Your limit will reset at 3pm.");
     if (text.includes("BOOM")) throw new Error("connection reset by peer");
 
+    // Prompt queueing, exactly as `claude-agent-acp` was measured to do it: a
+    // prompt arriving while one is in flight SUPERSEDES it. The running one
+    // returns immediately with `end_turn` and every usage counter at zero -- a
+    // sentinel, not an answer -- and the work carries on under the new one, which
+    // reports the real result for both. See agent.js.hint#inject.
+    if (state.inflight) {
+      state.inflight.supersede();
+      state.inflight = null;
+    }
+    let superseded = false;
+    const holder = {};
+    holder.promise = new Promise((resolve) => {
+      holder.supersede = () => { superseded = true; resolve(); };
+    });
+    state.inflight = holder;
+
     const say = (update) => client.notify(acp.methods.client.session.update, { sessionId: params.sessionId, update });
     state.abort = new AbortController();
+
+    // A turn slow enough to be injected into, which answers with EVERYTHING this
+    // session has been told. Sticky, so the injected prompt takes the same path and
+    // is the one that reports both. `superseded` is the whole point: it is what a
+    // caller must not mistake for an answer.
+    if (text.includes("SLOWTURN") || state.slow) {
+      state.slow = true;
+      await Promise.race([holder.promise, new Promise((r) => setTimeout(r, 400))]);
+      if (superseded) {
+        return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
+      }
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `HEARD:${state.heard.join("|")}` } });
+      state.inflight = null;
+      state.slow = false;
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
 
     await say({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking(${state.effort})` } });
     await say({ sessionUpdate: "tool_call", toolCallId: "t1", title: "noop", status: "completed", kind: "other" });

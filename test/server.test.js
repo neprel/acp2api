@@ -241,6 +241,66 @@ test("a named conversation continues where prefix matching cannot", async (t) =>
   assert.match(await said(await ask("ECHOSESSION two", "thread-a")), /^s1/);
 });
 
+test("busy: queue delivers a second message INTO the running turn", async (t) => {
+  const call = await start(t, { server: { busy: "queue" } });
+  const ask = (content) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": "thread-a" },
+    });
+
+  // Deliberately NOT awaited: the point is that the second request arrives while
+  // the first turn is still running, which is the only moment an injection means
+  // anything.
+  const running = ask("SLOWTURN please");
+  await new Promise((r) => setTimeout(r, 120));
+  const injected = await (await ask("ALSO-THIS")).json();
+
+  // The injection is answered immediately and empty. The answer is not its own:
+  // it belongs to the turn it joined.
+  assert.equal(injected.choices[0].message.content, "");
+
+  // And that turn's caller receives both instructions, in one answer, having
+  // waited only for the work -- not for a second round trip.
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.match(answer, /SLOWTURN please/);
+  assert.match(answer, /ALSO-THIS/);
+});
+
+test("busy: fork keeps two concurrent turns apart, which is still the default", async (t) => {
+  const call = await start(t);
+  const ask = (content) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": "thread-a" },
+    });
+
+  const running = ask("SLOWTURN please");
+  await new Promise((r) => setTimeout(r, 120));
+  const second = await (await ask("SEPARATE")).json();
+
+  // A session of its own, so it answers for itself rather than joining anything.
+  assert.match(second.choices[0].message.content, /SEPARATE/);
+  assert.ok(!second.choices[0].message.content.includes("SLOWTURN"));
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.ok(!answer.includes("SEPARATE"), `the running turn must not have heard it, got ${answer}`);
+});
+
+test("a prompt is never queued into a session with no turn running", async (t) => {
+  // It would run, cost a real turn of a real subscription, and stream its updates
+  // to nobody. `inject` reports the refusal rather than doing it quietly.
+  const agent = new Agent(
+    normalizeConfig(
+      { server: { cwd: here }, agents: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }] },
+      { baseDir: here, env: {} },
+    ).agents[0],
+    normalizeConfig({ server: { cwd: here }, agents: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }] }, { baseDir: here, env: {} }).server,
+  );
+  t.after(() => agent.close());
+  const session = await agent.openSession();
+  assert.equal(await agent.inject(session, [{ type: "text", text: "hello" }]), false);
+});
+
 test("a named conversation replays nothing it has already heard", async (t) => {
   const call = await start(t);
   const ask = (content, key) =>

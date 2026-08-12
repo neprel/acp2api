@@ -353,7 +353,37 @@ async function handleCompletion(req, res, registry, config, log, params, session
     : "";
   const match = !config.server.continuity
     ? null
-    : (callerKey && sessions.matchKey(model, callerKey)) || sessions.matchPrefix(model, systemId, prefix);
+    : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
+      sessions.matchPrefix(model, systemId, prefix);
+
+  // The named conversation is mid-turn and `busy: queue` says to join it rather
+  // than start beside it. Only a KEYED caller reaches here: prefix matching cannot
+  // identify a conversation whose transcript is still being written.
+  if (match?.busy) {
+    // Only what is new. The running turn has heard everything before it, and
+    // resending the transcript would ask the agent to answer it twice.
+    const queued = await agent.inject(match.session, toPromptBlocks(turns.slice(-1)));
+    log("info", `${model}: ${queued ? "injected into" : "could not join"} the running turn [${callerKey}]`);
+    // This request is answered NOW, so its deadline is over. Every other exit from
+    // this function clears the timer in a `finally`; leaving here without doing so
+    // held the timer -- and with it the whole event loop -- for the full request
+    // timeout after the reply had already been sent.
+    clearTimeout(timer);
+    // Answered immediately and empty, because the answer is not this request's:
+    // it belongs to the turn that was joined, and reaches whoever is waiting on
+    // it. A caller that treats this as the reply gets a blank message, which is
+    // the honest shape of "delivered, nothing to say".
+    if (!stream) {
+      return send(res, 200, completion({ ...meta, text: "", stopReason: "end_turn", usage: null }));
+    }
+    // A well-formed empty stream, because a client that asked for one is parsing
+    // SSE and a JSON body would be a protocol error on top of a blank answer.
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    write(res, chunk({ ...meta, delta: { role: "assistant", content: "" } }));
+    write(res, chunk({ ...meta, delta: {}, finishReason: "stop" }));
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  }
   let convId = match?.convId ?? null;
   let session = match?.session ?? null;
   // Which kind of continuity found it. `matchKey` returns the session's prefix and

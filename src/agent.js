@@ -576,10 +576,27 @@ export class Agent {
       };
 
       this.#sinks.set(session.id, onUpdate);
-      const response = await ctx.request(acp.methods.agent.session.prompt, {
+      // Opens the session to injection for as long as this turn runs. `inject`
+      // pushes here; nothing outside a turn may queue a prompt, because there
+      // would be no turn to fold the work into and nobody reading the updates.
+      session.queued = [];
+      let response = await ctx.request(acp.methods.agent.session.prompt, {
         sessionId: session.id,
         prompt: blocks,
       });
+      // A queued prompt ENDS this one early -- `end_turn` with every usage counter
+      // at zero, which is a sentinel and not an answer. The work did not stop; it
+      // continues in the same session with both instructions, and the last prompt
+      // outstanding is the one that reports it. So this waits for that instead,
+      // while the sink above keeps accumulating throughout: to the caller of the
+      // original request, the injection is simply part of its own answer.
+      //
+      // Re-checked rather than snapshotted, because another injection can arrive
+      // while this is awaiting the previous one.
+      while (session.queued.length > 0) {
+        response = await session.queued.shift();
+      }
+      session.queued = null;
       if (asTrace) {
         // Whatever is still held when the turn ends had no tool call after it, so
         // it is the answer. Emitted in one delta because that is genuinely when it
@@ -606,11 +623,48 @@ export class Agent {
       // Stop reading this session's updates. Leaving the sink in place would let a
       // late chunk from this turn land in the next one's accumulator.
       this.#sinks.delete(session.id);
+      // Shut the injection window even when the turn threw, so a later `inject`
+      // cannot queue a prompt into a session with nothing reading it. Anything
+      // still outstanding is settled here rather than left to reject unheard.
+      const orphans = session.queued ?? [];
+      session.queued = null;
+      for (const p of orphans) p.catch(() => {});
       // The signal outlives the turn -- on a retained session it belongs to one
       // request while the session serves many, so a leaked listener would cancel
       // somebody else's turn.
       signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * Delivers a prompt INTO a turn that is already running.
+   *
+   * The whole point is that it does not wait for an answer: the answer belongs to
+   * the turn this joins, and goes to whoever asked for that turn. What is returned
+   * says only whether the agent took it.
+   *
+   * Refused, rather than queued, when no turn is running -- `session.queued` is set
+   * for the life of a turn and null otherwise. A prompt sent outside one would run
+   * with no sink reading its updates: the work would happen, cost a real turn of a
+   * real subscription, and be seen by nobody.
+   *
+   * @param {object} session an open session, mid-turn
+   * @param {Array} blocks ACP content blocks
+   * @returns {Promise<boolean>} whether it was queued
+   */
+  async inject(session, blocks) {
+    if (!session?.queued) return false;
+    const { connection } = await Promise.resolve().then(() => this.#connect());
+    const ctx = connection.agent;
+    const p = ctx.request(acp.methods.agent.session.prompt, {
+      sessionId: session.id,
+      prompt: blocks,
+    });
+    // `turn()` awaits this and reports its result; the catch here only stops an
+    // unhandled rejection in the window before it gets there.
+    p.catch(() => {});
+    session.queued.push(p);
+    return true;
   }
 
   /**
