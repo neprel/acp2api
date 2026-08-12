@@ -147,17 +147,36 @@ export class Progress {
     const id = u.toolCallId ?? "";
     if (!id || this.#done.has(id)) return null;
 
-    const call = this.#calls.get(id) ?? { label: null, announced: false, output: null, exitCode: null };
+    const call = this.#calls.get(id) ?? {
+      label: null,
+      command: null,
+      announced: false,
+      output: null,
+      exitCode: null,
+    };
     this.#calls.set(id, call);
 
-    // The name improves as the agent learns it. A Bash call opens as the literal
-    // "Terminal" with an EMPTY rawInput -- the command is still being streamed --
-    // and only the next update carries it. Taking the first title would name every
-    // command "Terminal"; taking the last one names it correctly.
-    // `kind` last: it is a category, not a name, and only worth showing when the
-    // agent never says anything better.
-    const named = u.title || u.rawInput?.command || u.kind || null;
+    // WHY first, then WHAT. A coding agent writes a one-line reason for every
+    // command it runs -- Claude Code's Bash tool takes a `description` next to
+    // the `command` -- and that sentence is the difference between a trace you
+    // read and a wall of shell you decode.
+    //
+    // It has to be dug out of `rawInput`, because the adapter drops it: for a
+    // Bash call `claude-agent-acp` sets `title` to the COMMAND, and passes the
+    // description through in `content` only when the client did NOT ask for
+    // terminal output -- which any client that wants to show output does. So the
+    // more capable the client, the less it is told. `rawInput` carries the whole
+    // tool input regardless, so this reads it there.
+    //
+    // The name also improves as the agent learns it: a Bash call opens as the
+    // literal "Terminal" with an EMPTY rawInput -- the command is still being
+    // streamed -- and only the next update carries it. Taking the first title
+    // would name every command "Terminal"; taking the last one names it
+    // correctly. `kind` last: it is a category, not a name, and only worth
+    // showing when the agent never says anything better.
+    const named = u.rawInput?.description || u.title || u.rawInput?.command || u.kind || null;
     if (named) call.label = oneLine(named);
+    if (typeof u.rawInput?.command === "string") call.command = oneLine(u.rawInput.command);
     const shell = terminalResult(u);
     if (shell?.output) call.output = shell.output;
     if (shell?.exitCode != null) call.exitCode = shell.exitCode;
@@ -168,10 +187,30 @@ export class Progress {
     // saying "› Terminal" then is worse than a half-second of silence. A terminal
     // status forces the announcement regardless -- every call ends, so nothing can
     // stay unannounced forever.
+    // Announce once the call is worth announcing. `rawInput: {}` means the agent
+    // does not know what it is doing yet either, and saying "› Terminal" then is
+    // worse than a half-second of silence.
+    //
+    // A command waits for its `description` as well, and that is a deliberate
+    // extra beat. The tool input is streamed as it is generated, so `command`
+    // lands one update before `description` -- announcing on the first of the two
+    // would mean the reason NEVER shows, since a call is announced once. The two
+    // updates are milliseconds apart.
+    //
+    // A terminal status forces the announcement regardless, so nothing can stay
+    // unannounced forever: an execute call from an agent that sends no
+    // description at all is announced when it finishes, late but never lost.
     const known = Object.keys(u.rawInput ?? {}).length > 0;
-    if (!call.announced && call.label && (known || TERMINAL.has(u.status))) {
+    const described = u.kind !== "execute" || call.command === null || Boolean(u.rawInput?.description);
+    if (!call.announced && call.label && ((known && described) || TERMINAL.has(u.status))) {
       call.announced = true;
       lines.push(`› ${call.label}`);
+      // The command on its own line, and only when the label is something else --
+      // i.e. when a description was found. Both matter and neither replaces the
+      // other: the description says why, and the command is what you check when
+      // the answer looks wrong or the exit code is not zero. `permission denied
+      // ... /var/run/docker.sock` was read straight off one of these.
+      if (call.command && call.command !== call.label) lines.push(`$ ${call.command}`);
     }
 
     if (TERMINAL.has(u.status)) {

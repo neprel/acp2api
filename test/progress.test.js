@@ -4,17 +4,22 @@ import { Progress, tail, terminalResult } from "../src/progress.js";
 
 /**
  * One Bash call, exactly as `claude-agent-acp` puts it on the wire -- captured
- * from a live agent on 2026-08-12. Six updates for one command, and the three
- * facts a reader needs are in three DIFFERENT ones: the command in the second,
- * the output in the fifth, the exit code in the sixth. This shape is the reason
- * `Progress` accumulates instead of reading each update on its own.
+ * from a live agent on 2026-08-12. Six updates for one command, and the four
+ * facts a reader needs are in four DIFFERENT ones: the command in the second,
+ * the DESCRIPTION in the third, the output in the fifth, the exit code in the
+ * sixth. This shape is the reason `Progress` accumulates instead of reading each
+ * update on its own -- and the reason a command is not announced on the update
+ * that first names it.
+ *
+ * `description: null` drops it entirely, for an agent that sends none.
  */
-const bashWire = (id, command, { output, exitCode }) => [
+const bashWire = (id, command, { output, exitCode, description = `run ${command}` }) => [
   { sessionUpdate: "tool_call", toolCallId: id, title: "Terminal", kind: "execute", status: "pending",
     rawInput: {}, content: [{ terminalId: id, type: "terminal" }], _meta: { terminal_info: { terminal_id: id } } },
   { sessionUpdate: "tool_call_update", toolCallId: id, title: command, kind: "execute", rawInput: { command } },
   { sessionUpdate: "tool_call_update", toolCallId: id, title: command, kind: "execute",
-    rawInput: { command, description: "d" }, content: [{ terminalId: id, type: "terminal" }] },
+    rawInput: description === null ? { command } : { command, description },
+    content: [{ terminalId: id, type: "terminal" }] },
   { sessionUpdate: "tool_call_update", toolCallId: id, _meta: { claudeCode: { toolResponse: { stdout: output } } } },
   { sessionUpdate: "tool_call_update", toolCallId: id, _meta: { terminal_output: { terminal_id: id, data: output } } },
   { sessionUpdate: "tool_call_update", toolCallId: id, status: "completed",
@@ -23,18 +28,26 @@ const bashWire = (id, command, { output, exitCode }) => [
 
 const replay = (p, updates) => updates.map((u) => p.note(u)).filter(Boolean).join("\n");
 
-test("a real Bash call is named by its command, not by the placeholder it opens with", () => {
+test("a real Bash call leads with WHY, and shows the command underneath", () => {
   const p = new Progress(2);
-  const out = replay(p, bashWire("t1", "echo hi", { output: "motd\nnoise\nhi", exitCode: 0 }));
+  const out = replay(p, bashWire("t1", "echo hi", { output: "motd\nnoise\nhi", exitCode: 0, description: "greet the log" }));
   // "Terminal" is what the adapter calls a command it has not finished streaming.
   assert.doesNotMatch(out, /Terminal/);
-  assert.equal(out, "› echo hi\n⎿ noise\n⎿ hi");
+  assert.equal(out, "› greet the log\n$ echo hi\n⎿ noise\n⎿ hi");
+});
+
+test("an execute call with no description at all is named by its command", () => {
+  // The whole point of waiting a beat for a description is that it must not cost
+  // anything when none is coming.
+  const p = new Progress(1);
+  const out = replay(p, bashWire("t1b", "echo hi", { output: "hi", exitCode: 0, description: null }));
+  assert.equal(out, "› echo hi\n⎿ hi");
 });
 
 test("a non-zero exit is reported, even though it arrives without any output", () => {
   const p = new Progress(1);
-  const out = replay(p, bashWire("t2", "pytest -q", { output: "1 failed", exitCode: 1 }));
-  assert.equal(out, "› pytest -q\n⎿ 1 failed\n✗ pytest -q (exit 1)");
+  const out = replay(p, bashWire("t2", "pytest -q", { output: "1 failed", exitCode: 1, description: "run the suite" }));
+  assert.equal(out, "› run the suite\n$ pytest -q\n⎿ 1 failed\n✗ run the suite (exit 1)");
 });
 
 test("a zero exit is not an error", () => {
@@ -45,13 +58,14 @@ test("a zero exit is not an error", () => {
 
 test("a call is announced once, however many updates repeat it", () => {
   const p = new Progress(0);
-  const out = replay(p, bashWire("t4", "make", { output: "ok", exitCode: 0 }));
-  assert.equal(out.match(/› make/g).length, 1);
+  const out = replay(p, bashWire("t4", "make", { output: "ok", exitCode: 0, description: "build it" }));
+  assert.equal(out.match(/› build it/g).length, 1);
+  assert.equal(out.match(/\$ make/g).length, 1);
 });
 
 test("output lines are off when the budget is zero, but the command is still named", () => {
   const p = new Progress(0);
-  assert.equal(replay(p, bashWire("t5", "ls", { output: "a\nb", exitCode: 0 })), "› ls");
+  assert.equal(replay(p, bashWire("t5", "ls", { output: "a\nb", exitCode: 0, description: "look around" })), "› look around\n$ ls");
 });
 
 test("a tool that arrives complete is announced immediately", () => {
@@ -127,12 +141,15 @@ test("an unrendered update kind returns null rather than throwing", () => {
 });
 
 test("a title with a newline cannot break the shape of the trace", () => {
+  // One note line per fact, always: a trace is read by line, and a label that
+  // smuggles in a newline would silently forge one.
   const p = new Progress(0);
   const note = p.note({
     sessionUpdate: "tool_call", toolCallId: "w1", title: "Bash  echo one\necho two",
     status: "pending", rawInput: { command: "x" },
   });
-  assert.equal(note, "› Bash echo one echo two");
+  assert.equal(note, "› Bash echo one echo two\n$ x");
+  assert.equal(note.split("\n").length, 2);
 });
 
 test("the fenced console fallback is read when no _meta arrives", () => {

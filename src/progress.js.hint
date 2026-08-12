@@ -61,7 +61,7 @@ six updates.
 | 5 `tool_call_update` | `_meta.terminal_output.data`. **No status, no title.** |
 | 6 `tool_call_update` | `status: "completed"` and `_meta.terminal_exit.exit_code`. **No output, no title.** |
 
-Three consequences, and the first version of this file got all three wrong:
+Four consequences, and the first version of this file got the first three wrong:
 
 - **Name it by the LAST title, not the first.** Taking the first names every
   command "Terminal", which is the adapter's placeholder for one it has not
@@ -72,6 +72,39 @@ Three consequences, and the first version of this file got all three wrong:
 - **Read the output and the exit code from ACCUMULATED state.** They arrive in
   updates 5 and 6; reading either from the update that carries the status finds
   nothing, which is why every command first looked successful and silent.
+- **An `execute` call waits one more beat, for its description.** See #why_first.
+
+# rule A command is announced by WHY, and the command goes underneath {#why_first}
+
+A coding agent writes a one-line reason for every command it runs — Claude Code's
+Bash tool takes a `description` beside the `command` — and that sentence is the
+difference between a trace a person reads and a wall of shell they decode.
+
+**The adapter throws it away.** For a Bash call `claude-agent-acp` sets `title` to
+the COMMAND (`tools.js`, `title: input?.command ? input.command : "Terminal"`) and
+passes the description through in `content` **only when the client did not ask for
+terminal output**. So the more capable the client, the less it is told. `rawInput`
+carries the whole tool input either way, which is where this reads it.
+
+**It arrives one update late.** The tool input is streamed as the model writes it,
+so `command` lands in update 2 and `description` in update 3 — and a call is
+announced once. Announcing on the first of the two means the reason never appears
+at all. Hence an `execute` call whose `rawInput.command` is known still waits for
+`rawInput.description`; the two updates are milliseconds apart. The terminal-status
+backstop still applies, so an agent that sends no description ever gets its call
+announced when it finishes: late, never lost.
+
+Both lines are kept, and neither replaces the other:
+
+```
+› check what is holding the disk
+$ ssh build-host 'sudo du -shx /var/lib/docker/* | sort -h'
+⎿ 87G  /var/lib/docker/volumes
+```
+
+The description says why; the command is what an operator checks when the answer
+looks wrong or the exit code is not zero. `permission denied … /var/run/docker.sock`
+was read straight off one of these on the live fleet.
 
 # rule A command's output is tailed, in whichever shape it arrives {#terminal_output}
 
