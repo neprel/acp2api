@@ -82,6 +82,45 @@ The agent's own tool calls are surfaced through `onEvent` and never appended to
 caller to execute and answer. Anything that makes them look like the latter is
 wrong; see [_.hint#mcp_tools](../_.hint).
 
+# rule A tool call is what proves the text before it was commentary {#commentary}
+
+A coding agent narrates itself. Between its tool calls it writes a sentence about
+what it just learned and what it will do next — *"SSH works, but my account is not
+in the docker group, going through sudo"* — and all of those sentences arrive as
+ordinary `agent_message_chunk` text, indistinguishable on the wire from the answer.
+Concatenated, a real turn came back as:
+
+```
+Checking both hosts.SSH works, but my account is not in the docker group — going
+through sudo.Nothing is in a restart loop. Now the restart counters…Found the real
+problem. Gathering evidence.…Checked both hosts. In short: nothing is restarting,
+but there is a quiet breakage…
+```
+
+Nine sentences of running commentary ahead of the conclusion, in the message a
+person scrolls back to. **And every one of them was produced live**, at the moment
+it was true, which is exactly when it was worth reading.
+
+`server.commentary: "trace"` sorts them out. There is no phase marker to read —
+Codex has one, Claude Code does not — but there is a structural fact that needs
+none: **a following tool call means the agent went back to work, so what it just
+said was commentary.** Whatever is still held when the turn ends had nothing after
+it, and is the answer.
+
+Two consequences follow, and both are the point rather than side effects:
+
+- commentary reaches the caller through the REASONING channel while the turn runs,
+  next to the tool notes, in the order it happened;
+- the answer is only the answer.
+
+**Text cannot stream in this mode.** A run cannot be sent before it is known
+whether a tool call follows, and a delta once emitted cannot be pulled back out of
+the answer — so the answer is emitted in one piece at the end. That is why the
+default is `answer`: this changes what the caller receives as the assistant's
+message, which is not a display preference. `limit` reads the run in flight rather
+than the whole turn, since a stop sequence inside discarded commentary is not a
+stop sequence in the reply.
+
 # rule This module routes session updates itself {#own_routing}
 
 `#sinks` maps a session id to the turn currently reading it, filled by one
@@ -149,6 +188,11 @@ doing that on a crash it should have retried burns a subscription for nothing. N
 phrasings belong in `server.limitPatterns` (config), not in this file.
 
 # test agent
+
+- by default the agent's running commentary is part of the answer
+- `commentary: trace` moves what was said between tool calls into the reasoning
+  channel, emits it before the answer, and leaves the answer clean
+- `commentary: trace` leaves a turn that never used a tool alone
 
 - a turn streams reasoning, tool calls and text in order, and reports usage
 - model and reasoning are selected by category, not by option id

@@ -482,6 +482,12 @@ export class Agent {
       let text = "";
       let reasoning = "";
       let cut = null; // stop reason imposed by `limit`, once it fires
+      // Text seen since the last tool call. A coding agent writes a sentence
+      // before each thing it does -- "SSH works, but my account is not in the
+      // docker group, going through sudo" -- and those sentences are the running
+      // commentary of the turn, not the answer to the question. Held here until
+      // it is known which of the two this run turned out to be: see #commentary.
+      let pending = "";
       // One per turn: the notes are transitions, and a shared instance would go
       // quiet about work the previous turn happened to mention.
       const progress =
@@ -494,6 +500,10 @@ export class Agent {
         reasoning += delta;
         onEvent({ type: "reasoning", delta });
       };
+      // Whether a text run that turns out to be commentary is moved OUT of the
+      // answer and into the trace. Off by default: it changes what the caller
+      // receives as the assistant's message, which is not a display preference.
+      const asTrace = this.#server.commentary === "trace";
       let context = null; // {used, size} from the last usage_update, if any
 
       // Updates arrive as notifications on the same stream as the response, and
@@ -508,6 +518,22 @@ export class Agent {
         if (cut) return;
 
         if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text") {
+          pending += u.content.text;
+          if (asTrace) {
+            // Nothing is emitted here: a run cannot be streamed before it is known
+            // whether a tool call follows it, and a delta once sent cannot be taken
+            // back out of the answer. `limit` reads the run in flight, because that
+            // is what the answer will be -- a stop sequence inside commentary that
+            // gets discarded is not a stop sequence in the reply.
+            const verdict = limit?.(pending);
+            if (verdict) {
+              cut = verdict.stopReason;
+              pending = verdict.text;
+              onAbort();
+            }
+            return;
+          }
+
           const before = text.length;
           text += u.content.text;
           const verdict = limit?.(text);
@@ -525,6 +551,14 @@ export class Agent {
           reasoning += u.content.text;
           onEvent({ type: "reasoning", delta: u.content.text });
         } else if (u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update") {
+          // A tool call is what settles the question about the text before it: the
+          // agent went back to work, so that run was commentary on the turn and not
+          // its conclusion. Move it to the trace, where it belongs and where it is
+          // useful WHILE the turn runs, and leave the answer clean.
+          if (asTrace && pending.trim()) {
+            narrate(pending.trim());
+            pending = "";
+          }
           // Progress only. These are the agent's OWN tool calls, already executed by
           // it -- not OpenAI `tool_calls` for the caller to run and answer.
           onEvent({ type: "tool_call", id: u.toolCallId, title: u.title, status: u.status, kind: u.kind });
@@ -546,6 +580,13 @@ export class Agent {
         sessionId: session.id,
         prompt: blocks,
       });
+      if (asTrace) {
+        // Whatever is still held when the turn ends had no tool call after it, so
+        // it is the answer. Emitted in one delta because that is genuinely when it
+        // became knowable -- see the note in the message-chunk branch above.
+        text = pending.trim();
+        if (text) onEvent({ type: "text", delta: text });
+      }
       return {
         text,
         reasoning,

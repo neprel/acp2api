@@ -210,6 +210,19 @@ const app = acp
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
+    // A turn that NARRATES itself: a sentence, then work, then another sentence,
+    // then work, then the actual answer. This is what a coding agent really sends,
+    // and it is the shape `server.commentary` exists to sort out -- every run of
+    // text but the last is commentary, and only a FOLLOWING tool call says so.
+    if (text.includes("NARRATE")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Checking both hosts." } });
+      await say({ sessionUpdate: "tool_call", toolCallId: "n1", title: "ssh build-host", kind: "execute", status: "completed" });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Not in the docker group; using sudo." } });
+      await say({ sessionUpdate: "tool_call", toolCallId: "n2", title: "sudo docker ps", kind: "execute", status: "completed" });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Nothing is restarting." } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
     // Answers with everything this session has ever been told, so a test can prove a
     // fork inherited the warm base's history rather than starting blank.
     if (text.includes("ECHOHEARD")) {

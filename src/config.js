@@ -138,6 +138,29 @@ const DEFAULTS = {
   // purpose -- this lands in a chat post, and an unbounded `npm test` buries the
   // whole turn.
   progressOutputLines: 6,
+  // What to do with the sentences an agent writes BETWEEN its tool calls.
+  //
+  //   answer  the default. They are part of the assistant's message, exactly as
+  //           the agent sent them.
+  //   trace   a run of text followed by a tool call is moved into
+  //           `reasoning_content` as it happens, and left out of the answer.
+  //
+  // A coding agent narrates itself -- "SSH works, but my account is not in the
+  // docker group, going through sudo" -- and every one of those sentences ends up
+  // glued into the final message, ahead of the actual conclusion. They are the
+  // most readable account of the turn there is and the worst possible opening to
+  // an answer someone scrolls back to.
+  //
+  // What settles which is which is a TOOL CALL: the agent went back to work, so
+  // what it just said was commentary. Whatever is still unflushed when the turn
+  // ends had nothing after it, and is the answer.
+  //
+  // The cost is that text cannot stream in this mode -- a run cannot be sent
+  // before it is known whether a tool call follows, and a delta once sent cannot
+  // be pulled back out of the answer. `answer` by default for that reason, and
+  // because moving text out of the assistant's message is a change to what the
+  // caller receives rather than a display preference.
+  commentary: "answer",
   // How full a session's context window may get before it stops being reused, as a
   // fraction. 0 disables the check.
   //
@@ -210,6 +233,10 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
   req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
   req(typeof s.continuity === "boolean", "server.continuity must be true or false");
   req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
+  req(
+    ["answer", "trace"].includes(s.commentary),
+    `server.commentary must be "answer" or "trace", got ${s.commentary}`,
+  );
   req(
     Number.isInteger(s.progressOutputLines) && s.progressOutputLines >= 0,
     "server.progressOutputLines must be a non-negative integer",

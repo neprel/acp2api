@@ -226,6 +226,47 @@ test("the agent's own tool calls surface as progress, not as content", async (t)
   assert.ok(!turn.text.includes("noop"));
 });
 
+test("by default the agent's running commentary is part of the answer", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const turn = await agent.prompt([{ type: "text", text: "NARRATE" }]);
+  // Every sentence it said along the way, glued to the one that answers -- which
+  // is what a caller quotes and stores. Unpleasant, and the historical behaviour.
+  assert.equal(turn.text, "Checking both hosts.Not in the docker group; using sudo.Nothing is restarting.");
+});
+
+test("commentary: trace moves what was said between tool calls into the trace", async (t) => {
+  const agent = makeAgent({ server: { commentary: "trace", progress: "reasoning" } });
+  t.after(() => agent.close());
+  const events = [];
+  const turn = await agent.prompt([{ type: "text", text: "NARRATE" }], { onEvent: (e) => events.push(e) });
+
+  // The answer is the run nothing followed: the conclusion, on its own.
+  assert.equal(turn.text, "Nothing is restarting.");
+  // And the two sentences a tool call proved were commentary are in the reasoning
+  // channel, where they are useful WHILE the turn is still running.
+  assert.match(turn.reasoning, /Checking both hosts\./);
+  assert.match(turn.reasoning, /Not in the docker group; using sudo\./);
+  assert.doesNotMatch(turn.text, /docker group/);
+
+  // Commentary reaches a streaming caller as it happens, not at the end.
+  const said = events.findIndex((e) => e.type === "reasoning" && /docker group/.test(e.delta));
+  const answered = events.findIndex((e) => e.type === "text");
+  assert.ok(said >= 0 && said < answered, "commentary must be emitted before the answer");
+  // Exactly one text event: the answer cannot be streamed before it is known to be
+  // the answer, so it arrives whole.
+  assert.equal(events.filter((e) => e.type === "text").length, 1);
+});
+
+test("commentary: trace leaves a turn that never used a tool alone", async (t) => {
+  // Nothing followed the text, so nothing proved it was commentary. It IS the
+  // answer, and moving it would leave the caller with an empty message.
+  const agent = makeAgent({ server: { commentary: "trace" } });
+  t.after(() => agent.close());
+  const turn = await agent.prompt([{ type: "text", text: "hello" }]);
+  assert.equal(turn.text, "[fast] hello");
+});
+
 test("a command that cannot be spawned is 503, not a crash", async (t) => {
   const agent = makeAgent({ agent: { command: "definitely-not-a-real-binary-xyz" } });
   t.after(() => agent.close());
