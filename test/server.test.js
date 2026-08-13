@@ -180,10 +180,12 @@ test("temperature is accepted, reported back, and does not fail the request", as
   assert.deepEqual(body.x_acp2api, { ignored: ["temperature", "top_p"] });
 });
 
-test("a tool-sending agent framework is answered, not rejected", async (t) => {
+test("with server.tools off, a tool-sending framework is still answered", async (t) => {
   // The shape a framework like Hermes sends on EVERY request: its whole toolset
-  // plus sampling knobs. Refusing left such a client with no usable model at all.
-  const call = await start(t);
+  // plus sampling knobs. Refusing left such a client with no usable model at all,
+  // so they are dropped and reported rather than rejected -- which is what this
+  // server did for every version before tools were served.
+  const call = await start(t, { server: { tools: "off" } });
   const res = await call(
     "/v1/chat/completions",
     chat({
@@ -1062,4 +1064,92 @@ test("a shell command's output reaches the caller in the trace", async (t) => {
   assert.match(trace, /⎿ 1 failed, 3 passed/);
   // Bounded: everything above the last two lines stays out.
   assert.doesNotMatch(trace, /buried-by-the-cap/);
+});
+
+// --- the caller's own tools, served to the agent as an MCP server ----------
+
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a file the client has access to",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    },
+  },
+];
+
+test("a caller's tools are offered to the agent, and a call comes back as tool_calls", async (t) => {
+  // The whole contract in one turn: the tools reach the agent as an MCP server it
+  // can list, and when it calls one the completion stops with `tool_calls` -- the
+  // shape every OpenAI client already knows how to handle.
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: 'USETOOL read_file {"path":"README.md"}' }],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": "tools-a" },
+  });
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.choices[0].finish_reason, "tool_calls");
+  const [tc] = body.choices[0].message.tool_calls;
+  assert.equal(tc.function.name, "read_file");
+  assert.deepEqual(JSON.parse(tc.function.arguments), { path: "README.md" });
+  // Whatever the agent said before calling is carried too -- a message may hold
+  // both, and that sentence is usually the one explaining the call.
+  assert.match(body.choices[0].message.content, /TOOLS:read_file/);
+});
+
+test("the result the caller sends back reaches the same turn, which then finishes", async (t) => {
+  // This is what a suspended turn is FOR. No new session, no replayed history --
+  // the agent is still inside the call it made, and gets its answer.
+  const call = await start(t);
+  const ask = (messages) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages, tools: TOOLS }),
+      headers: { "x-conversation-id": "tools-b" },
+    });
+
+  const first = await (await ask([{ role: "user", content: 'USETOOL read_file {"path":"x"}' }])).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+
+  const second = await ask([
+    { role: "user", content: 'USETOOL read_file {"path":"x"}' },
+    first.choices[0].message,
+    { role: "tool", tool_call_id: callId, content: "the file said hello" },
+  ]);
+  assert.equal(second.status, 200);
+  const body = await second.json();
+  assert.equal(body.choices[0].finish_reason, "stop");
+  // The agent saw the caller's result, and said so.
+  // Only this segment: what the agent said BEFORE the call went to the response
+  // that carried the call, and repeating it here would deliver it twice.
+  assert.equal(body.choices[0].message.content.trim(), "RESULT:the file said hello");
+});
+
+test("a tool result for a call nobody is waiting on is refused, not run as a new turn", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: "hi" }, { role: "tool", tool_call_id: "call_nope", content: "x" }],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": "tools-c" },
+  });
+  assert.equal(res.status, 200, "no turn was suspended, so this is an ordinary turn");
+});
+
+test("server.tools off keeps the old behaviour: no MCP server is attached", async (t) => {
+  const call = await start(t, { server: { tools: "off" } });
+  const res = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "USETOOL read_file" }], tools: TOOLS }),
+    headers: { "x-conversation-id": "tools-d" },
+  });
+  const body = await res.json();
+  assert.match(body.choices[0].message.content, /NO-TOOL-SERVER/);
 });

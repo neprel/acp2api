@@ -44,18 +44,14 @@ export const IGNORED = new Set([
   "store",
   "parallel_tool_calls",
   "prediction",
-  // Tool DEFINITIONS. Refused until 1.2.0, on the reasoning that a caller waiting
-  // for `tool_calls` would get prose instead. That reasoning assumed the caller had
-  // no other way to get the work done. It does: an ACP agent has its own tools, and
-  // can be handed the caller's own tool servers through `mcpServers` -- so it acts
-  // rather than asks, and the work happens inside its loop instead of the caller's.
+  // `tools` is NOT here any more: since 1.8.0 the caller's tools are served to the
+  // agent as an MCP server and a call comes back as `finish_reason: "tool_calls"`.
+  // See src/mcp.js. It is still dropped when `server.tools: off`, and the drop is
+  // reported the same way as anything else on this list.
   //
-  // The deciding case: a client whose ONLY model is an ACP agent. Refusing here left
-  // it with no brain at all, which is a worse answer than a one-step loop. Tool
-  // definitions are therefore dropped, while tool calls and results already in the
-  // history are rendered faithfully -- see openai.js#toPromptBlocks.
-  "tools",
-  "tool_choice",
+  // The older forms stay ignored. `functions`/`function_call` were deprecated by
+  // OpenAI years ago and a caller still sending them is not one this bridge should
+  // grow a second code path for.
   "functions",
   "function_call",
 ]);

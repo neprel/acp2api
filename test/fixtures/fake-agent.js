@@ -409,6 +409,39 @@ const app = acp
       return { stopReason: "cancelled" };
     }
 
+    // Behaves like a real ACP agent that was handed an MCP server: connects to it,
+    // lists what it offers, calls one, and folds the result into its answer.
+    //
+    // Written over HTTP rather than stubbed, because the thing under test is the
+    // bridge's MCP endpoint -- a stub would prove only that the test agrees with
+    // itself. `USETOOL <name> <json>` picks the tool and its arguments.
+    if (text.includes("USETOOL")) {
+      const server = (state.mcp ?? []).find((s) => s.name === "acp2api-client-tools");
+      if (!server) {
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO-TOOL-SERVER" } });
+        return { stopReason: "end_turn" };
+      }
+      const rpc = async (method, params, id) => {
+        const res = await fetch(server.url, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        });
+        return res.status === 202 ? null : await res.json();
+      };
+      await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake" } }, 1);
+      const listed = await rpc("tools/list", {}, 2);
+      const [, name, args] = /USETOOL\s+(\S+)\s*(\{.*\})?/.exec(text) ?? [];
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `TOOLS:${listed.result.tools.map((t) => t.name).join(",")} ` },
+      });
+      const called = await rpc("tools/call", { name, arguments: args ? JSON.parse(args) : {} }, 3);
+      const got = called.result?.content?.[0]?.text ?? `ERROR:${called.error?.message}`;
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `RESULT:${got}` } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
     // Reports what session/new was given, so a test can prove MCP servers and
     // attachment blocks actually reached the agent instead of being dropped.
     if (text.includes("ECHOMCP")) {

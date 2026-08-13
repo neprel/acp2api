@@ -163,6 +163,60 @@ export function parseChatRequest(body) {
     maxTokens,
     stop,
     ignored,
+    // The caller's own tools, and the results it has sent back for calls this
+    // server handed it. Both are read from the same `messages` array the prompt
+    // comes from, because that is where OpenAI puts them.
+    tools: Array.isArray(body.tools) ? body.tools : [],
+    toolResults: toolResultsIn(body.messages),
+  };
+}
+
+/**
+ * The `role: "tool"` messages at the END of a history, as `{id, text}`.
+ *
+ * Only the trailing run: those are the answers to the calls this server is still
+ * holding open. A tool result from earlier in the conversation was answered long
+ * ago and belongs to the transcript, not to a call that is waiting.
+ */
+export function toolResultsIn(messages) {
+  const out = [];
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "tool") break;
+    out.unshift({ id: m.tool_call_id, text: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "") });
+  }
+  return out;
+}
+
+/**
+ * A completion whose turn stopped to ask the caller to run something.
+ *
+ * `content` carries whatever the agent said BEFORE it called -- a message may hold
+ * both, and dropping that text would lose the sentence that explains the call.
+ * `null` rather than `""` when it said nothing, which is what OpenAI sends.
+ */
+export function toolCallCompletion({ id, model, created, calls, text, reasoning }) {
+  return {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: text || null,
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
+          tool_calls: calls.map((c) => ({
+            id: c.id,
+            type: "function",
+            function: { name: c.name, arguments: c.arguments },
+          })),
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
   };
 }
 

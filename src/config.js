@@ -150,6 +150,30 @@ const DEFAULTS = {
   // safe: the caller can try the next model until one reports that it landed.
   // Empty disables the marker entirely.
   injectHeader: "x-acp2api-inject",
+  // What to do with the `tools` a caller declares in its request.
+  //
+  //   mcp  the default. They are offered to the agent as an MCP server, and a
+  //        call to one comes back to the caller as `finish_reason: "tool_calls"`.
+  //   off  they are dropped, and the agent answers in prose. What every version
+  //        before this one did.
+  //
+  // `session/prompt` has no `tools` field and never will -- an ACP agent runs its
+  // own tool loop, and the protocol's answer to "where do tools come from" is
+  // `mcpServers`, declared when the session opens. So the only way to serve a
+  // caller's tools is to BE a tool server, which is what src/mcp.js is.
+  //
+  // The turn does not end at the call. It sits inside the MCP request, holding it
+  // open, while the completion returns the call to the caller -- so when the
+  // result arrives in the next request, the agent picks up exactly where it was
+  // rather than re-planning from a summary. That is what an agent waiting on a
+  // tool is supposed to look like.
+  tools: "mcp",
+  // How long a tool call may sit unanswered before the agent is told it failed.
+  //
+  // The caller has gone, or decided not to run it. Something has to end, because
+  // on the other side of that call is an agent process holding a subscription
+  // open with nothing to do.
+  toolTimeoutMs: 300_000,
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
@@ -284,6 +308,12 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
     `server.commentary must be "answer" or "trace", got ${s.commentary}`,
   );
   req(["fork", "queue"].includes(s.busy), `server.busy must be "fork" or "queue", got ${s.busy}`);
+  req(["mcp", "off"].includes(s.tools), `server.tools must be "mcp" or "off", got ${s.tools}`);
+  s.toolTimeoutMs = asInt(s.toolTimeoutMs);
+  req(
+    Number.isInteger(s.toolTimeoutMs) && s.toolTimeoutMs > 0,
+    "server.toolTimeoutMs must be a positive integer",
+  );
   req(
     Number.isInteger(s.progressOutputLines) && s.progressOutputLines >= 0,
     "server.progressOutputLines must be a non-negative integer",

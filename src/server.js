@@ -16,6 +16,8 @@ import {
 } from "./openai.js";
 import { parseResponsesRequest, responseObject, ResponseStream } from "./responses.js";
 import { commonPrefix, conversationKey, fingerprint, newResponseId, SessionStore } from "./sessions.js";
+import { ToolBridge } from "./mcp.js";
+import { toolCallCompletion } from "./openai.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
@@ -63,6 +65,13 @@ export function createServer(config, { agents, log = () => {} } = {}) {
     maxContextFill: config.server.maxContextFill,
     log,
   });
+  // The caller's own tools, served to agents as an MCP server on this same port.
+  const tools = new ToolBridge({ timeoutMs: config.server.toolTimeoutMs, log });
+  // A conversation that goes takes its bench with it, or a call held open for a
+  // caller that will never come back outlives everything that could answer it.
+  sessions.onClose = (conv) => {
+    if (conv.bench) tools.close(conv.bench);
+  };
 
   const authorized = (req) => {
     if (!config.server.apiKey) return true;
@@ -91,8 +100,35 @@ export function createServer(config, { agents, log = () => {} } = {}) {
         });
       }
 
+      // The MCP endpoint the AGENT connects to, not a client-facing route. It is
+      // deliberately outside the api-key check above: the agent is a child of this
+      // process, reached over loopback, and it is not given the key. The token in
+      // the path is the credential, and it names one conversation's tools.
+      const mcp = /^\/mcp\/([A-Za-z0-9-]+)$/.exec(url.pathname);
+      if (mcp) {
+        if (req.method !== "POST") {
+          // No server-initiated stream lives here, and the spec says a server that
+          // does not offer one answers 405 rather than pretending.
+          res.writeHead(405, { allow: "POST" });
+          return res.end();
+        }
+        let message;
+        try {
+          message = JSON.parse(await readBody(req));
+        } catch {
+          return send(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+        }
+        const answer = await tools.handle(mcp[1], message);
+        // A notification takes no reply at all.
+        if (!answer) {
+          res.writeHead(202);
+          return res.end();
+        }
+        return send(res, 200, answer);
+      }
+
       if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
-        return await handleCompletion(req, res, registry, config, log, params, sessions);
+        return await handleCompletion(req, res, registry, config, log, params, sessions, tools, server);
       }
 
       if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
@@ -297,7 +333,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
 const timeoutError = (model, config) =>
   new AgentError(`${model}: no answer within ${config.server.requestTimeoutMs}ms`, 504, "timeout");
 
-async function handleCompletion(req, res, registry, config, log, params, sessions) {
+async function handleCompletion(req, res, registry, config, log, params, sessions, tools, httpServer) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
@@ -305,8 +341,24 @@ async function handleCompletion(req, res, registry, config, log, params, session
     throw e instanceof RequestError ? e : new RequestError(`invalid JSON body: ${e.message}`);
   }
 
-  const { model, stream, includeUsage, maxTokens, stop, ignored } = parseChatRequest(body);
-  params.report(model, ignored);
+  const {
+    model,
+    stream,
+    includeUsage,
+    maxTokens,
+    stop,
+    ignored,
+    tools: declared,
+    toolResults,
+  } = parseChatRequest(body);
+  // The caller declared tools and this server is willing to serve them. `off`
+  // keeps the old behaviour, where they are dropped and reported as ignored.
+  const serveTools = config.server.tools === "mcp" && declared.length > 0;
+  // Not reported as dropped when they are about to be served. `classify` cannot
+  // know: whether `tools` is honoured is a property of this server's config, not
+  // of the request.
+  const reported = serveTools ? ignored.filter((k) => k !== "tools" && k !== "tool_choice") : ignored;
+  params.report(model, reported);
   const limit = makeLimiter({ maxTokens, stop });
   const agent = registry.get(model);
   if (!agent) {
@@ -355,6 +407,17 @@ async function handleCompletion(req, res, registry, config, log, params, session
     ? null
     : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
       sessions.matchPrefix(model, systemId, prefix);
+
+  // A turn of this conversation is suspended inside a tool call, and this request
+  // is the rest of it rather than a new one. Everything below -- session matching,
+  // prompt building, `agent.turn` -- belongs to starting a turn, and none of it
+  // applies: the turn is already running and simply needs its answer.
+  if (match?.pending) {
+    return await resumeToolCall({
+      req, res, match, sessions, tools, config, log, model, meta, stream,
+      includeUsage, toolResults, timer,
+    });
+  }
 
   // "Join a turn already running, or do nothing." A caller that cannot know which
   // model a thread is on has to guess, and a guess that misses must be free --
@@ -446,6 +509,29 @@ async function handleCompletion(req, res, registry, config, log, params, session
       }
     }
 
+    // A session's MCP servers are fixed when it opens: `session/new` takes them,
+    // nothing adds one later, and `session/resume` compares the list it is given
+    // against the one the session was built with. So a conversation that has to
+    // serve the caller's tools and does not already have a bench needs a NEW
+    // session -- the history is replayed into it, which is what a cold start does
+    // anyway.
+    let bench = match?.bench ?? null;
+    if (serveTools && !bench) {
+      bench = tools.open(declared);
+      session = null;
+      if (convId) {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    } else if (bench) {
+      // Same conversation, possibly a different tool list. The agent listed them
+      // when it connected and is not told they changed, so this only takes effect
+      // for an agent that lists again -- which is why a caller is expected to send
+      // a stable set for the life of a conversation.
+      tools.setTools(bench, declared);
+    }
+    const benchServers = bench ? [benchServer(httpServer, bench)] : [];
+
     opened = !session;
     // Only the turns the session has not heard -- unless it is a fresh session,
     // which has heard nothing at all. The preamble goes with the session, so it is
@@ -456,14 +542,30 @@ async function handleCompletion(req, res, registry, config, log, params, session
 
     if (opened) {
       await sessions.prune(registry);
-      session = await agent.openSession();
-      convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null });
-      log("info", `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}`);
+      session = await agent.openSession({ mcpServers: benchServers });
+      convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null, bench });
+      log(
+        "info",
+        `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}` +
+          (bench ? ` with ${declared.length} caller tool(s)` : ""),
+      );
     } else {
       const how = keyed ? `keyed [${callerKey}]` : "by prefix";
       log("info", `${model}: continuing session ${how}, ${fresh.length} new of ${prefix.length} message(s)`);
     }
     sessions.setBusy(convId, true);
+
+    // With tools in play a turn has TWO ways to end, so it is run through a sink
+    // that can be handed to a later request. Without them, nothing here changes.
+    if (bench) {
+      return await runToolTurn({
+        res, agent, session, blocks, controller, limit, sessions, tools, convId,
+        bench, prefix, meta, stream, includeUsage, log, model, timer,
+        clientGone: () => clientGone,
+        timedOut: () => timedOut,
+        timeout,
+      });
+    }
 
     if (!stream) {
       const turn = await agent.turn(session, blocks, { signal: controller.signal, limit });
@@ -473,7 +575,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       // a router downstream would count as success.
       if (timedOut) throw timeout();
       remember(sessions, convId, prefix, turn.text);
-      return send(res, 200, completion({ ...meta, ...settleUsage(sessions, convId, turn), ignored }));
+      return send(res, 200, completion({ ...meta, ...settleUsage(sessions, convId, turn), ignored: reported }));
     }
 
     // Headers go out only once the turn is under way. Sending them earlier would
@@ -550,8 +652,188 @@ async function handleCompletion(req, res, registry, config, log, params, session
     throw e;
   } finally {
     clearTimeout(timer);
-    if (convId) sessions.setBusy(convId, false);
+    // A turn suspended inside a tool call is still running, and the conversation
+    // must stay busy for it: clearing the flag here would let the next request
+    // start a SECOND turn on a session whose first one is merely waiting.
+    if (convId && !sessions.isPending(convId)) sessions.setBusy(convId, false);
   }
+}
+
+/**
+ * The MCP server entry that points an agent back at this process.
+ *
+ * Loopback on purpose, and never the configured `server.host`: the agent is a
+ * child of this process and has no business reaching the bridge by whatever
+ * address the outside world uses. `0.0.0.0` in particular is not an address
+ * anything can connect TO.
+ */
+function benchServer(httpServer, token) {
+  const at = httpServer?.address?.();
+  const port = at?.port;
+  const host = !at || at.address === "0.0.0.0" || at.address === "::" ? "127.0.0.1" : at.address;
+  const authority = host.includes(":") ? `[${host}]` : host;
+  return { type: "http", name: "acp2api-client-tools", url: `http://${authority}:${port}/mcp/${token}`, headers: [] };
+}
+
+/**
+ * A turn's event stream, decoupled from whoever is listening to it.
+ *
+ * A turn that stops to ask the caller to run a tool OUTLIVES the request that
+ * started it: the completion returns `tool_calls`, and the turn is picked up by
+ * the next request carrying the results. In between, the agent may keep talking --
+ * and nobody is attached. Those events are buffered rather than dropped, then
+ * replayed to whoever attaches next, so no part of the turn is lost between two
+ * halves of the same conversation.
+ */
+function makeSink() {
+  let listener = null;
+  const waiting = [];
+  return {
+    emit(event) {
+      if (listener) listener(event);
+      else waiting.push(event);
+    },
+    attach(fn) {
+      listener = fn;
+      for (const event of waiting.splice(0)) fn(event);
+    },
+    detach() {
+      listener = null;
+    },
+  };
+}
+
+/**
+ * Waits for whichever comes first: the turn ending, or the agent asking the caller
+ * to run a tool.
+ *
+ * Both are ordinary outcomes of a turn that has tools available, and the caller
+ * has to be told which happened -- an answer, or a bill of work.
+ */
+async function untilTurnOrToolCall(pending, tools) {
+  let ended = null;
+  const finished = pending.turn.then(
+    (turn) => (ended = { turn }),
+    (error) => (ended = { error }),
+  );
+  const parked = tools.nextPark(pending.bench).then(() => ({ calls: tools.parked(pending.bench) }));
+  const outcome = await Promise.race([finished, parked]);
+  // A turn that has already ended wins over a call that parked in the same tick:
+  // a parked call belonging to a finished turn has nobody left to answer it.
+  return ended ?? outcome;
+}
+
+/**
+ * Runs a turn that has the caller's tools available to it, and answers whichever
+ * way it ends.
+ *
+ * The difference from an ordinary turn is that this one can stop halfway with a
+ * bill of work rather than an answer -- and when it does, it does NOT end. It sits
+ * inside the MCP call, and the conversation keeps it.
+ */
+async function runToolTurn(o) {
+  const sink = makeSink();
+  const seen = { text: "", reasoning: "" };
+  const turn = o.agent.turn(o.session, o.blocks, {
+    signal: o.controller.signal,
+    limit: o.limit,
+    onEvent: (event) => sink.emit(event),
+  });
+  // Nothing must be awaited between creating the promise and attaching a handler
+  // to it: an agent that fails instantly would otherwise reject unheard.
+  turn.catch(() => {});
+  const pending = { turn, sink, bench: o.bench, seen, prefix: o.prefix };
+  return await settleToolTurn({ ...o, pending });
+}
+
+/**
+ * Waits for a tool-enabled turn to reach its next boundary and answers the caller.
+ *
+ * Shared by the request that STARTS such a turn and by the one that resumes it,
+ * because from here on they are the same thing: a turn in flight, a sink to read
+ * it, and two ways it can end.
+ */
+async function settleToolTurn(o) {
+  const { pending, tools, sessions, convId, meta, res } = o;
+  const collect = (event) => {
+    if (event.type === "text") pending.seen.text += event.delta;
+    else if (event.type === "reasoning") pending.seen.reasoning += event.delta;
+  };
+  pending.sink.attach(collect);
+
+  const outcome = await untilTurnOrToolCall(pending, tools);
+
+  if (outcome.error) {
+    sessions.setPending(convId, null);
+    throw outcome.error;
+  }
+
+  if (outcome.calls?.length) {
+    // Handed over exactly once, so a second boundary in the same turn reports only
+    // what is new.
+    tools.reported(pending.bench, outcome.calls.map((c) => c.id));
+    // Nobody is listening until the next request arrives; the sink keeps whatever
+    // the agent says in the meantime.
+    pending.sink.detach();
+    sessions.setPending(convId, pending);
+    clearTimeout(o.timer);
+    o.log("info", `${o.model}: turn is waiting on ${outcome.calls.length} client tool call(s)`);
+    const body = toolCallCompletion({
+      ...meta,
+      calls: outcome.calls,
+      text: pending.seen.text,
+      reasoning: pending.seen.reasoning,
+    });
+    if (!o.stream) return send(res, 200, body);
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    write(res, chunk({ ...meta, delta: { role: "assistant", content: pending.seen.text, tool_calls: body.choices[0].message.tool_calls } }));
+    write(res, chunk({ ...meta, delta: {}, finishReason: "tool_calls" }));
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  }
+
+  // The turn is genuinely over. Everything it said across however many requests it
+  // took is in `seen` -- the answer belongs to whoever asked last.
+  sessions.setPending(convId, null);
+  const turn = { ...outcome.turn, text: pending.seen.text, reasoning: pending.seen.reasoning };
+  remember(sessions, convId, pending.prefix, turn.text);
+  clearTimeout(o.timer);
+  const settled = settleUsage(sessions, convId, turn);
+  if (!o.stream) return send(res, 200, completion({ ...meta, ...settled }));
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  write(res, chunk({ ...meta, delta: { role: "assistant", content: turn.text } }));
+  write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason) }));
+  if (o.includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
+  res.write("data: [DONE]\n\n");
+  return res.end();
+}
+
+/**
+ * Answers the tool calls a suspended turn is waiting on, and carries that same
+ * turn forward.
+ *
+ * No session is opened, no prompt is sent, no history is replayed: the agent is
+ * still inside the call it made, and all it needs is the result.
+ */
+async function resumeToolCall(o) {
+  const { match, tools, toolResults, sessions } = o;
+  const pending = match.pending;
+  const answered = toolResults.filter((r) => tools.resolve(pending.bench, r.id, r.text));
+  if (answered.length === 0) {
+    clearTimeout(o.timer);
+    // Nothing here matched a call this server is holding. Saying so is better than
+    // starting a second turn beside one that is still waiting -- which is what
+    // silence would have caused.
+    throw new RequestError(
+      `${o.model}: this conversation is waiting for the result of a tool call; none of the tool messages sent match it`,
+      409,
+      "tool_result_expected",
+    );
+  }
+  o.log("info", `${o.model}: answered ${answered.length} tool call(s); the turn continues`);
+  // A fresh segment: what the caller receives now is what the agent says from here.
+  pending.seen = { text: "", reasoning: "" };
+  return await settleToolTurn({ ...o, pending, convId: match.convId, bench: pending.bench });
 }
 
 /**

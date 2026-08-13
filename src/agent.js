@@ -340,16 +340,29 @@ export class Agent {
     }
   }
 
+  /**
+   * Every MCP server a session should be opened with: the agent's own, plus any
+   * the request brought.
+   *
+   * The extra one is how a caller's `tools` reach an agent at all -- there is no
+   * `tools` field on `session/prompt`, so they are served as a tool server. It is
+   * kept ON the session because `session/resume` fingerprints `mcpServers` and
+   * compares: resuming with a different list is refused, and rightly so.
+   */
+  #mcpFor(extra) {
+    return [...this.#spec.mcpServers, ...(extra ?? [])];
+  }
+
   /** `session/new` plus the agent's configured options. The cold path. */
-  async #newSession(ctx) {
+  async #newSession(ctx, extraMcp) {
     const builder = ctx.buildSession(this.#spec.cwd);
-    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+    for (const server of this.#mcpFor(extraMcp)) builder.withMcpServer(server);
     // `toRequest()` rather than `start()`: starting returns an `ActiveSession` that
     // registers its own update handler, and this class routes updates itself so a
     // resumed session can be read the same way a new one is. The builder is still
     // what shapes the request -- `mcpServers` has a fiddly array form.
     const res = await ctx.request(acp.methods.agent.session.new, builder.toRequest());
-    const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name };
+    const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name, mcp: extraMcp ?? [] };
     try {
       await this.#applyOptions(ctx, session, this.#spec);
     } catch (e) {
@@ -371,9 +384,14 @@ export class Agent {
    * already oriented. Every failure on that path falls back to a cold session:
    * starting cold is slower and more expensive, and it is never wrong.
    */
-  async openSession() {
+  async openSession({ mcpServers } = {}) {
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
+
+    // A warm base is shared by every conversation forked from it, so it cannot
+    // carry ONE caller's tool server. A request that brings tools opens cold --
+    // which is the same trade every other fork failure takes, and never wrong.
+    if (mcpServers?.length) return await this.#newSession(ctx, mcpServers);
 
     if (this.#spec.warmup && init.agentCapabilities?.sessionCapabilities?.fork) {
       try {
@@ -413,13 +431,17 @@ export class Agent {
    * a conversation whose session cannot be restored is a cold conversation, not a
    * failed request.
    */
-  async resumeSession(sessionId) {
+  async resumeSession(sessionId, { mcpServers: extra } = {}) {
     if (!sessionId) return null;
     const conn = await Promise.resolve().then(() => this.#connect());
     if (!conn.init.agentCapabilities?.sessionCapabilities?.resume) return null;
     const ctx = conn.connection.agent;
     const builder = ctx.buildSession(this.#spec.cwd);
-    for (const server of this.#spec.mcpServers) builder.withMcpServer(server);
+    for (const server of this.#mcpFor(extra)) builder.withMcpServer(server);
+    // Named apart from the parameter on purpose: this is the FULL list the builder
+    // produced, agent's own plus the caller's, and it is what the agent compares
+    // its fingerprint against. Reusing the name shadowed nothing and simply failed
+    // to parse -- reported, unhelpfully, twenty lines further down.
     const { cwd, mcpServers } = builder.toRequest();
     try {
       // The agent fingerprints cwd + mcpServers and compares them on resume, so
@@ -430,6 +452,7 @@ export class Agent {
         id: res?.sessionId ?? sessionId,
         options: res?.configOptions ?? [],
         agent: this.name,
+        mcp: extra ?? [],
       };
     } catch (e) {
       this.#log("info", `${this.name}: cannot resume ${sessionId} (${e?.message ?? e}); opening a new session`);
