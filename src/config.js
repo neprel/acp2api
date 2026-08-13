@@ -108,29 +108,33 @@ const DEFAULTS = {
   //
   //   fork   the default. It gets a session of its own, because two turns cannot
   //          interleave inside one agent.
-  //   queue  it is delivered INTO the running turn, and the agent picks it up at
-  //          its next step.
+  //   queue  it is steered INTO the running turn, and the agent takes it at its
+  //          next step.
   //
   // `queue` is what makes mid-turn steering possible at all. A coding-agent turn
   // runs for minutes behind a single completion, so "wait for the answer and send
   // the correction after" can mean waiting a quarter of an hour to redirect work
   // that went the wrong way in its first thirty seconds.
   //
-  // It rests on a capability the agent has to have: `session/prompt` on a session
-  // that is already prompting. `claude-agent-acp` advertises it as
-  // `agentCapabilities._meta.claudeCode.promptQueueing`, and MEASURED against it,
-  // the contract is:
+  // It rests on the `_session/steering` extension, which both shipped adapters
+  // implement and advertise as `_meta.steering.supported`; an agent without it
+  // falls back to `fork`. MEASURED end to end on 2026-08-13, mid-way through a
+  // 45-second command:
   //
-  //   - the running prompt returns EARLY, with `end_turn` and every usage counter
-  //     at zero -- a sentinel meaning "superseded", not an answer;
-  //   - the session carries on with both instructions in the same turn;
-  //   - the last outstanding prompt returns the real result and the real usage.
+  //   - the running prompt is NOT superseded and still reports the whole turn;
+  //   - the work already under way finishes;
+  //   - the steered instruction is carried out as well;
+  //   - both appear in the answer to the ORIGINAL request.
   //
-  // So the caller of the original request keeps its response: the bridge swallows
-  // that early return and goes on accumulating until the last prompt resolves. The
-  // request that DELIVERED the injection is answered immediately with an empty
+  // The request that delivered the injection is answered immediately with an empty
   // completion -- it was a notification, and the answer belongs to the turn it
   // joined. `fork` by default because this changes what a concurrent request means.
+  //
+  // What the agent does with the interrupted work is the MODEL's call, not the
+  // protocol's: steering redirects, it does not append. An instruction phrased as
+  // a replacement ("do exactly X") is a replacement, and the rest of the plan may
+  // well be abandoned. Say "as well as what you are doing" when that is what is
+  // meant.
   busy: "fork",
   // The header that marks a request as an INJECTION and nothing else: join a turn
   // already running, or do nothing at all.

@@ -6,6 +6,16 @@ import * as acp from "@agentclientprotocol/sdk";
 import { Progress } from "./progress.js";
 import { Terminals } from "./terminal.js";
 
+/**
+ * The extension method for putting a prompt into a turn that is already running.
+ *
+ * Not in `acp.methods` because it is not in ACP: the spec defines no mid-turn
+ * input at all. Both shipped adapters implement this one under the same name and
+ * advertise it the same way, which is the whole reason a single code path can
+ * serve both. See `Agent#inject`.
+ */
+const STEERING_METHOD = "_session/steering";
+
 /** Thrown for anything the HTTP layer should report with a specific status. */
 export class AgentError extends Error {
   constructor(message, status = 502, code = "agent_error") {
@@ -576,27 +586,18 @@ export class Agent {
       };
 
       this.#sinks.set(session.id, onUpdate);
-      // Opens the session to injection for as long as this turn runs. `inject`
-      // pushes here; nothing outside a turn may queue a prompt, because there
-      // would be no turn to fold the work into and nobody reading the updates.
-      session.queued = [];
-      let response = await ctx.request(acp.methods.agent.session.prompt, {
+      // Opens the session to injection for as long as this turn runs, and only
+      // that long. Nothing outside a turn may be steered in: there would be no
+      // turn to fold the work into and nobody reading the updates.
+      session.running = true;
+      // A steered prompt joins THIS request. The agent folds it into the turn
+      // already in flight, so this one response still reports the whole of it --
+      // measured 2026-08-13 with a 45 s command in progress: the original work
+      // finished, the injected command ran, and both appeared in this answer.
+      const response = await ctx.request(acp.methods.agent.session.prompt, {
         sessionId: session.id,
         prompt: blocks,
       });
-      // A queued prompt ENDS this one early -- `end_turn` with every usage counter
-      // at zero, which is a sentinel and not an answer. The work did not stop; it
-      // continues in the same session with both instructions, and the last prompt
-      // outstanding is the one that reports it. So this waits for that instead,
-      // while the sink above keeps accumulating throughout: to the caller of the
-      // original request, the injection is simply part of its own answer.
-      //
-      // Re-checked rather than snapshotted, because another injection can arrive
-      // while this is awaiting the previous one.
-      while (session.queued.length > 0) {
-        response = await session.queued.shift();
-      }
-      session.queued = null;
       if (asTrace) {
         // Whatever is still held when the turn ends had no tool call after it, so
         // it is the answer. Emitted in one delta because that is genuinely when it
@@ -624,11 +625,8 @@ export class Agent {
       // late chunk from this turn land in the next one's accumulator.
       this.#sinks.delete(session.id);
       // Shut the injection window even when the turn threw, so a later `inject`
-      // cannot queue a prompt into a session with nothing reading it. Anything
-      // still outstanding is settled here rather than left to reject unheard.
-      const orphans = session.queued ?? [];
-      session.queued = null;
-      for (const p of orphans) p.catch(() => {});
+      // cannot steer into a session with nothing reading it.
+      session.running = false;
       // The signal outlives the turn -- on a retained session it belongs to one
       // request while the session serves many, so a leaked listener would cancel
       // somebody else's turn.
@@ -643,57 +641,64 @@ export class Agent {
    * the turn this joins, and goes to whoever asked for that turn. What is returned
    * says only whether the agent took it.
    *
-   * Refused, rather than queued, when no turn is running -- `session.queued` is set
-   * for the life of a turn and null otherwise. A prompt sent outside one would run
-   * with no sink reading its updates: the work would happen, cost a real turn of a
-   * real subscription, and be seen by nobody.
+   * Refused, rather than queued, when no turn is running -- `session.running` is
+   * true for the life of a turn. A prompt sent outside one would run with no sink
+   * reading its updates: the work would happen, cost a real turn of a real
+   * subscription, and be seen by nobody.
+   *
+   * ONE mechanism, and it is not in ACP
+   * -----------------------------------
+   * ACP itself has nothing here: a turn is a request/response, and the spec says
+   * outright that it defines no way to send more input while one runs. `_session/
+   * steering` is the extension both adapters implement -- claude-agent-acp calls it
+   * "the agreed ACP steering wire protocol" in as many words -- advertised as
+   * `_meta.steering.supported` at the TOP level of the initialize result, NOT
+   * inside `agentCapabilities`. Grepping the wrong object is what once produced the
+   * conclusion that codex could not steer at all.
+   *
+   * An agent that does not advertise it is refused rather than tried. That is not
+   * caution for its own sake: codex was once sent a second `session/prompt` on the
+   * theory that it would supersede the first, and it DEADLOCKS -- the original
+   * request never resolves, the caller waits out its whole timeout (900 s where it
+   * happened) and the turn's work goes with it.
+   *
+   * `idleBehavior: "promptRequired"` is what stops a miss from costing a turn: with
+   * it, an agent that finds no live turn says so and does nothing. Without it the
+   * documented default is to START one, which is the opposite of what a caller
+   * joining a turn wants. Only claude honours it today; codex ignores the field and
+   * still answers `startedNewTurn`, which is why that outcome is reported loudly
+   * rather than quietly counted as success.
    *
    * @param {object} session an open session, mid-turn
    * @param {Array} blocks ACP content blocks
-   * @returns {Promise<boolean>} whether it was queued
+   * @returns {Promise<boolean>} whether it joined the running turn
    */
   async inject(session, blocks) {
-    if (!session?.queued) return false;
+    if (!session?.running) return false;
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
-    const ctx = connection.agent;
+    if (!init?._meta?.steering?.supported) return false;
 
-    // TWO agents, two mechanisms, both vendor extensions -- there is nothing about
-    // this in ACP itself. Neither is guessed: each is advertised in `initialize`,
-    // and an agent that advertises neither is refused rather than tried.
+    const res = await connection.agent.request(STEERING_METHOD, {
+      sessionId: session.id,
+      prompt: blocks,
+      _meta: { steering: { idleBehavior: "promptRequired" } },
+    });
+
+    // `injected` is the one that means what this method promises. The others are
+    // named rather than lumped together, because they are different facts:
     //
-    // Refusing matters. `codex-acp` was once sent a second `session/prompt`
-    // because it does not advertise Claude's flag, and that does not supersede
-    // anything there -- it DEADLOCKS. The first request never resolves, the caller
-    // waits out its whole timeout (900 s on the deployment where it happened) and
-    // the turn's work goes with it.
-
-    // codex: a method of its own, `_meta.steering.supported` at the TOP level of
-    // the initialize result -- not inside `agentCapabilities`, which is why
-    // grepping for Claude's flag found nothing and produced the wrong conclusion
-    // that codex could not steer at all.
-    //
-    // The contract is the simpler of the two, measured 2026-08-13: it returns
-    // `{outcome: "injected"}` IMMEDIATELY and leaves the running prompt alone, so
-    // that prompt still reports the whole turn. Nothing to drain.
-    if (init?._meta?.steering?.supported) {
-      const res = await ctx.request("_session/steering", { sessionId: session.id, prompt: blocks });
-      return res?.outcome !== "rejected";
+    //   startedNewTurn  the turn ended underneath us and a WHOLE NEW ONE is now
+    //                   running, unasked and unread. Worth a warning every time.
+    //   promptRequired  nothing happened and the text is still the caller's to
+    //                   send -- the outcome `idleBehavior` exists to produce.
+    //   failed          codex could neither inject nor start anything.
+    const outcome = res?.outcome;
+    if (outcome === "injected") return true;
+    if (outcome === "startedNewTurn") {
+      this.#log("warn", `${this.name}: steering found no live turn and started a new one (${session.id})`);
+      return false;
     }
-
-    // claude: a second `session/prompt`, gated on `promptQueueing`. Here the
-    // running prompt IS superseded -- it returns early with zero usage and the
-    // last outstanding prompt reports everything -- which is what `turn()` drains.
-    if (init?.agentCapabilities?._meta?.claudeCode?.promptQueueing) {
-      const p = ctx.request(acp.methods.agent.session.prompt, {
-        sessionId: session.id,
-        prompt: blocks,
-      });
-      // `turn()` awaits this and reports its result; the catch here only stops an
-      // unhandled rejection in the window before it gets there.
-      p.catch(() => {});
-      session.queued.push(p);
-      return true;
-    }
+    this.#log("info", `${this.name}: steering declined (${outcome ?? "no outcome"})`);
     return false;
   }
 

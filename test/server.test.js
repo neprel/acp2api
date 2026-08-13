@@ -280,38 +280,50 @@ test("an injection that finds no running turn is refused, never run", async (t) 
   assert.equal((await res.json()).error.code, "no_running_turn");
 });
 
-test("an agent with its own steering method gets that, not a second prompt", async (t) => {
-  // codex advertises `_meta.steering.supported` at the top level of initialize and
-  // takes `_session/steering`; sending it a second `session/prompt` instead
-  // deadlocks it. Two vendor extensions, neither in ACP, both read from the
-  // handshake rather than guessed.
+test("a steering outcome that is not `injected` reaches the caller as a refusal", async (t) => {
+  // `startedNewTurn` is the dangerous one: the turn ended underneath the steer and
+  // the agent began a WHOLE NEW one, unasked, streaming to nobody. Counting that as
+  // success would tell an injecting caller it had joined a turn it had in fact
+  // created -- so it is reported as "did not join", and logged.
   const call = await start(t, {
     server: { busy: "queue" },
-    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], env: { STEERING: "1" } }],
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        env: { STEER_OUTCOME: "startedNewTurn" },
+      },
+    ],
   });
-  const ask = (content, headers) =>
+  const ask = (content) =>
     call("/v1/chat/completions", {
       ...chat({ model: "fake", messages: [{ role: "user", content }] }),
-      headers: { "x-conversation-id": "thread-a", ...(headers ?? {}) },
+      headers: { "x-conversation-id": "thread-a", "x-acp2api-inject": "1" },
     });
 
-  const running = ask("SLOWTURN please");
+  const running = call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "SLOWTURN please" }] }),
+    headers: { "x-conversation-id": "thread-a" },
+  });
   await new Promise((r) => setTimeout(r, 120));
-  assert.equal((await ask("ALSO-THIS", { "x-acp2api-inject": "1" })).status, 200);
+  assert.equal((await ask("ALSO-THIS")).status, 409);
 
   const answer = (await (await running).json()).choices[0].message.content;
   assert.match(answer, /SLOWTURN please/);
-  assert.match(answer, /ALSO-THIS/);
+  assert.ok(!answer.includes("ALSO-THIS"));
 });
 
-test("an agent that never claimed it can queue prompts is never given a second one", async (t) => {
-  // Measured the hard way: `codex-acp` does not know the word `promptQueueing`,
-  // and a second prompt into a session already prompting DEADLOCKS it -- the first
+test("an agent that never claimed it can steer is never sent a steering request", async (t) => {
+  // ACP defines no mid-turn input at all, so this rests entirely on an extension
+  // the agent has to advertise. Guessing was measured the hard way: a second
+  // `session/prompt` into a session already prompting DEADLOCKS codex -- the first
   // request never resolves and the caller waits out its entire timeout, losing the
   // turn's work. The capability was in the handshake the whole time.
   const call = await start(t, {
     server: { busy: "queue" },
-    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], env: { NOQUEUE: "1" } }],
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], env: { NOSTEER: "1" } }],
   });
   const ask = (content) =>
     call("/v1/chat/completions", {

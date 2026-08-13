@@ -95,30 +95,31 @@ const app = acp
     agentCapabilities: {
       loadSession: false,
       sessionCapabilities: { close: {}, resume: {}, fork: {} },
-      // Advertised the way `claude-agent-acp` advertises it. `NOQUEUE=1` drops it,
-      // so a test can prove the bridge refuses to inject into an agent that never
-      // said it could take a second prompt -- which is what `codex-acp` is, and
-      // what deadlocked a live turn for its whole 900-second timeout.
-      ...(process.env.NOQUEUE || process.env.STEERING ? {} : { _meta: { claudeCode: { promptQueueing: true } } }),
     },
-    // codex-acp advertises its own mechanism HERE, at the top level, not inside
-    // agentCapabilities -- which is why looking for Claude's flag concluded it
-    // could not steer at all. `STEERING=1` makes the fixture that agent.
-    ...(process.env.STEERING ? { _meta: { steering: { supported: true } } } : {}),
+    // Both shipped adapters advertise steering HERE, at the top level, and not
+    // inside `agentCapabilities` -- looking in the wrong object is what once
+    // produced the conclusion that codex could not steer at all. `NOSTEER=1` drops
+    // it, so a test can prove the bridge refuses to inject into an agent that never
+    // claimed the capability rather than trying something that might deadlock.
+    ...(process.env.NOSTEER ? {} : { _meta: { steering: { supported: true } } }),
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
-  // codex's contract, measured: it answers immediately and leaves the running
-  // prompt alone, so that prompt still reports the whole turn. Nothing to drain.
+  // The measured contract of both adapters: answer immediately and leave the
+  // running prompt alone, so that prompt still reports the whole turn.
+  //
   // The SDK refuses an unknown method without a params parser, so this passes one
-  // through: the shape is codex's own (`{sessionId, prompt}`) and the fixture has
-  // no schema to validate it against.
+  // through: the shape is the adapters' own (`{sessionId, prompt, _meta}`) and the
+  // fixture has no schema to validate it against.
   .onRequest("_session/steering", (p) => p, ({ params }) => {
     const state = sessions.get(params.sessionId);
     if (!state) throw new Error(`no such session ${params.sessionId}`);
+    // `STEER_OUTCOME` lets a test drive the outcomes that are NOT success --
+    // `startedNewTurn` (a whole turn began unasked) and `promptRequired` (nothing
+    // happened) both have to reach the caller as "did not join".
+    const outcome = process.env.STEER_OUTCOME || "injected";
+    if (outcome !== "injected") return { outcome };
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
     state.heard = [...(state.heard ?? []), text];
-    // NOT superseded, and that is the whole difference from Claude's queueing: the
-    // running prompt carries on and is still the one that reports the turn.
     return { outcome: "injected" };
   })
   .onRequest(acp.methods.agent.session.new, ({ params }) => {

@@ -123,25 +123,45 @@ stop sequence in the reply.
 
 # rule A prompt can be delivered INTO a turn already running {#inject}
 
-`inject` sends `session/prompt` on a session that is already prompting. What comes
-back is not an answer — it is whether the agent took it.
+`inject` steers a prompt into a session that is already prompting. What comes back
+is not an answer — it is whether the agent took it.
 
-**Two agents, two mechanisms, neither of them ACP.** Both are vendor extensions
-declared in `initialize`, and both are read from the handshake rather than guessed:
+**ACP itself has nothing here.** The spec is explicit that a turn is a
+request/response and that it defines no mechanism for sending more input while one
+runs. So this rests entirely on an extension — and there is exactly **one**,
+implemented by both shipped adapters under the same name:
 
-| agent | advertises | how | effect on the running prompt |
-| --- | --- | --- | --- |
-| `claude-agent-acp` | `agentCapabilities._meta.claudeCode.promptQueueing` | a second `session/prompt` | **superseded** — returns early with zero usage; the last prompt reports everything |
-| `codex-acp` | `_meta.steering.supported` (TOP level, not in `agentCapabilities`) | `_session/steering`, params `{sessionId, prompt}` | **untouched** — returns `{outcome:"injected"}` at once, the running prompt still reports the turn |
+| | |
+| --- | --- |
+| method | `_session/steering`, params `{sessionId, prompt, _meta}` |
+| advertised as | `_meta.steering.supported` — **top level of the initialize result**, NOT inside `agentCapabilities` |
+| implemented by | `claude-agent-acp` ≥ 0.66.0, `codex-acp` ≥ 1.1.14 |
+| outcomes | `injected` · `startedNewTurn` · `promptRequired` (claude, opt-in) · `failed` (codex) |
 
-The placement matters more than it should: looking for Claude's flag inside
-`agentCapabilities` found nothing on codex and produced the confident, wrong
-conclusion that codex could not be steered at all. It advertises the same feature
-one level up, under a different name, with a better contract.
+`claude-agent-acp` calls it "the agreed ACP steering wire protocol" in its own
+source. Treat it as the de-facto standard, not as one vendor's quirk.
 
-**An agent that advertises neither is refused, and that is not caution.** codex was
-once sent a second `session/prompt` for exactly that reason, and it does not
-supersede there — it **deadlocks**. The first request never resolves, the caller
+**Where it is advertised has cost real time twice.** Grepping `agentCapabilities`
+for Claude's older `promptQueueing` flag found nothing on codex and produced the
+confident, wrong conclusion that codex could not steer at all. Then, once codex was
+supported through steering, claude was left on the old second-prompt path for no
+reason — both had spoken the same protocol the whole time, and the bridge carried
+two code paths, two capability probes and a queue-draining loop to serve one
+feature. **Look at `init._meta.steering`, and nowhere else.**
+
+`_meta: {steering: {idleBehavior: "promptRequired"}}` goes with every steer and is
+what stops a miss from costing a turn: with it, an agent that finds no live turn
+says `promptRequired` and does nothing. Without it the documented default is to
+**start a new turn**, which is the opposite of joining one. Only claude honours the
+field today; codex ignores it and can still answer `startedNewTurn`.
+
+**Only `injected` is success.** `startedNewTurn` means a whole turn is now running
+unasked and unread — logged as a warning. `promptRequired` and `failed` mean
+nothing happened. All three return false, and the caller sees 409.
+
+**An agent that does not advertise it is refused, and that is not caution.** codex
+was once sent a second `session/prompt` on the theory that it would supersede the
+first. It does not — it **deadlocks**. The first request never resolves, the caller
 waits out its entire timeout (900 s on the deployment where it happened), and the
 turn's work goes with it. Refusing costs nothing: the message still reaches the
 agent the ordinary way, on its next turn.
@@ -151,25 +171,26 @@ The SDK carries a custom method without complaint on the CLIENT side —
 recognise. On the agent side it refuses without an explicit params parser, which
 is what the fixture has to pass.
 
-The contract, measured against `claude-agent-acp` on 2026-08-12 rather than assumed:
+**The measured contract** (2026-08-13, end to end against codex, steered 12 s into a
+turn whose first command was a 45-second sleep):
 
-- the agent advertises it as `agentCapabilities._meta.claudeCode.promptQueueing`;
-- the RUNNING prompt returns early with `end_turn` and every usage counter at zero.
-  **That is a sentinel, not an answer** — treated as a result it truncates the turn
-  and reports zero cost for work that really happened;
-- the session carries on with both instructions in the same turn;
-- the LAST outstanding prompt returns the real result and the real cumulative usage.
+- the running prompt is **not** superseded and still reports the whole turn;
+- the work already under way finishes;
+- the steered instruction is carried out as well;
+- both appear in the answer to the **original** request.
 
-`turn()` therefore does not finish when its own request resolves: it drains
-`session.queued` and reports what the last one said, while the sink keeps
-accumulating throughout. To the caller of the original request the injection is
-simply part of its own answer — which is the point, because that caller is the one
-waiting, and a second HTTP response would arrive where nobody is listening.
+So `turn()` awaits its own request and nothing else. There is no queue to drain.
 
-`session.queued` is the window: an array for the life of a turn, null otherwise.
-Outside a turn `inject` REFUSES rather than queueing, because a prompt with no sink
-reading it would still run, still spend a turn of a real subscription, and be seen
-by nobody.
+What the agent does with the interrupted plan is the **model's** decision, not the
+protocol's: steering redirects, it does not append. Claude delivers it with
+`priority: "now"`, which pre-empts the current generation. An instruction phrased as
+a replacement ("do exactly X") is taken as one, and the rest of the plan may be
+abandoned — observed live, and mistaken at the time for a protocol failure. Say "as
+well as what you are already doing" when that is what is meant.
+
+`session.running` is the window: true for the life of a turn. Outside one `inject`
+REFUSES, because a prompt with no sink reading it would still run, still spend a
+turn of a real subscription, and be seen by nobody.
 
 A miss must be free. `server.injectHeader` marks a request as an injection and
 nothing else: it joins a running turn or answers **409**, and never falls through to
@@ -251,8 +272,8 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 # test agent
 
 - a prompt is never queued into a session with no turn running
-- an agent that never claimed it can queue prompts is never given a second one
-- an agent with its own steering method gets that, not a second prompt
+- an agent that never claimed it can steer is never sent a steering request
+- a steering outcome that is not `injected` reaches the caller as a refusal
 
 - by default the agent's running commentary is part of the answer
 - `commentary: trace` moves what was said between tool calls into the reasoning
