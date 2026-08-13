@@ -271,6 +271,33 @@ spending a subscription.
 Its prompt text selects the failure to exercise (`QUOTA`, `BOOM`, `HANG`, `REFUSE`).
 Add behaviour there rather than reaching for a mocking library.
 
+# bad Never publish a version in order to test it {#verify_before_publish}
+
+A published version is a release, not a step in a debugging loop. On 2026-08-12
+this package went 1.6.0 → 1.6.1 → 1.6.2 within an hour on a live fleet, and the
+last two existed only because the previous one was wrong.
+
+The defect that forced 1.6.2 was findable before any of them: `inject` was built
+and shipped against `claude-agent-acp`, which advertises `promptQueueing`, and then
+run against `codex-acp`, which does not know the word — where a second prompt into
+a busy session deadlocks it and costs the caller its entire request timeout. The
+raw-ACP probe that eventually found it already existed and had been used against
+one adapter only.
+
+**Verify with a packed build, against every adapter the change touches.**
+`npm pack` produces the same artifact the registry would serve, and it installs
+into a container exactly like a published one:
+
+```
+npm pack                                   # -> acp2api-x.y.z.tgz
+docker cp acp2api-x.y.z.tgz <container>:/tmp/
+docker exec <container> npm install -g --include=optional /tmp/acp2api-x.y.z.tgz
+```
+
+The test suite is necessary and not sufficient here: the fixture agent behaves the
+way the adapters were *observed* to behave, so a capability no adapter was probed
+for is a capability the suite cannot know about. Publish once, when it is right.
+
 # done Acceptance
 
 Verified 2026-08-09 on the Mac, against the real logged-in Claude subscription:
