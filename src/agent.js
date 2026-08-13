@@ -655,30 +655,46 @@ export class Agent {
   async inject(session, blocks) {
     if (!session?.queued) return false;
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
-    // ONLY an agent that says it can take a second prompt. This is not caution --
-    // it was learned by breaking a live turn.
-    //
-    // The behaviour was measured against `claude-agent-acp`, which advertises
-    // `promptQueueing`, and then used against `codex-acp`, which does not know the
-    // word: sending a second prompt into a session already prompting does not
-    // supersede anything there, it DEADLOCKS. The first request never resolves,
-    // the caller waits out its whole timeout -- 900 s on the deployment where this
-    // happened -- and the turn's work is lost with it.
-    //
-    // The capability was in the initialize handshake the entire time. Refusing
-    // here costs nothing: the caller learns the answer immediately and the message
-    // still reaches the agent the ordinary way, on its next turn.
-    if (!init?.agentCapabilities?._meta?.claudeCode?.promptQueueing) return false;
     const ctx = connection.agent;
-    const p = ctx.request(acp.methods.agent.session.prompt, {
-      sessionId: session.id,
-      prompt: blocks,
-    });
-    // `turn()` awaits this and reports its result; the catch here only stops an
-    // unhandled rejection in the window before it gets there.
-    p.catch(() => {});
-    session.queued.push(p);
-    return true;
+
+    // TWO agents, two mechanisms, both vendor extensions -- there is nothing about
+    // this in ACP itself. Neither is guessed: each is advertised in `initialize`,
+    // and an agent that advertises neither is refused rather than tried.
+    //
+    // Refusing matters. `codex-acp` was once sent a second `session/prompt`
+    // because it does not advertise Claude's flag, and that does not supersede
+    // anything there -- it DEADLOCKS. The first request never resolves, the caller
+    // waits out its whole timeout (900 s on the deployment where it happened) and
+    // the turn's work goes with it.
+
+    // codex: a method of its own, `_meta.steering.supported` at the TOP level of
+    // the initialize result -- not inside `agentCapabilities`, which is why
+    // grepping for Claude's flag found nothing and produced the wrong conclusion
+    // that codex could not steer at all.
+    //
+    // The contract is the simpler of the two, measured 2026-08-13: it returns
+    // `{outcome: "injected"}` IMMEDIATELY and leaves the running prompt alone, so
+    // that prompt still reports the whole turn. Nothing to drain.
+    if (init?._meta?.steering?.supported) {
+      const res = await ctx.request("_session/steering", { sessionId: session.id, prompt: blocks });
+      return res?.outcome !== "rejected";
+    }
+
+    // claude: a second `session/prompt`, gated on `promptQueueing`. Here the
+    // running prompt IS superseded -- it returns early with zero usage and the
+    // last outstanding prompt reports everything -- which is what `turn()` drains.
+    if (init?.agentCapabilities?._meta?.claudeCode?.promptQueueing) {
+      const p = ctx.request(acp.methods.agent.session.prompt, {
+        sessionId: session.id,
+        prompt: blocks,
+      });
+      // `turn()` awaits this and reports its result; the catch here only stops an
+      // unhandled rejection in the window before it gets there.
+      p.catch(() => {});
+      session.queued.push(p);
+      return true;
+    }
+    return false;
   }
 
   /**

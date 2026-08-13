@@ -280,6 +280,30 @@ test("an injection that finds no running turn is refused, never run", async (t) 
   assert.equal((await res.json()).error.code, "no_running_turn");
 });
 
+test("an agent with its own steering method gets that, not a second prompt", async (t) => {
+  // codex advertises `_meta.steering.supported` at the top level of initialize and
+  // takes `_session/steering`; sending it a second `session/prompt` instead
+  // deadlocks it. Two vendor extensions, neither in ACP, both read from the
+  // handshake rather than guessed.
+  const call = await start(t, {
+    server: { busy: "queue" },
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], env: { STEERING: "1" } }],
+  });
+  const ask = (content, headers) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": "thread-a", ...(headers ?? {}) },
+    });
+
+  const running = ask("SLOWTURN please");
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal((await ask("ALSO-THIS", { "x-acp2api-inject": "1" })).status, 200);
+
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.match(answer, /SLOWTURN please/);
+  assert.match(answer, /ALSO-THIS/);
+});
+
 test("an agent that never claimed it can queue prompts is never given a second one", async (t) => {
   // Measured the hard way: `codex-acp` does not know the word `promptQueueing`,
   // and a second prompt into a session already prompting DEADLOCKS it -- the first

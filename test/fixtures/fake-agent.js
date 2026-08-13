@@ -99,10 +99,28 @@ const app = acp
       // so a test can prove the bridge refuses to inject into an agent that never
       // said it could take a second prompt -- which is what `codex-acp` is, and
       // what deadlocked a live turn for its whole 900-second timeout.
-      ...(process.env.NOQUEUE ? {} : { _meta: { claudeCode: { promptQueueing: true } } }),
+      ...(process.env.NOQUEUE || process.env.STEERING ? {} : { _meta: { claudeCode: { promptQueueing: true } } }),
     },
+    // codex-acp advertises its own mechanism HERE, at the top level, not inside
+    // agentCapabilities -- which is why looking for Claude's flag concluded it
+    // could not steer at all. `STEERING=1` makes the fixture that agent.
+    ...(process.env.STEERING ? { _meta: { steering: { supported: true } } } : {}),
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
+  // codex's contract, measured: it answers immediately and leaves the running
+  // prompt alone, so that prompt still reports the whole turn. Nothing to drain.
+  // The SDK refuses an unknown method without a params parser, so this passes one
+  // through: the shape is codex's own (`{sessionId, prompt}`) and the fixture has
+  // no schema to validate it against.
+  .onRequest("_session/steering", (p) => p, ({ params }) => {
+    const state = sessions.get(params.sessionId);
+    if (!state) throw new Error(`no such session ${params.sessionId}`);
+    const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
+    state.heard = [...(state.heard ?? []), text];
+    // NOT superseded, and that is the whole difference from Claude's queueing: the
+    // running prompt carries on and is still the one that reports the turn.
+    return { outcome: "injected" };
+  })
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
     // Monotonic, NOT derived from the live count: ids must never be reused after a
     // session closes, or a test asserting "this is a different session" passes by

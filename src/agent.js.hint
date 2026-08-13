@@ -126,15 +126,30 @@ stop sequence in the reply.
 `inject` sends `session/prompt` on a session that is already prompting. What comes
 back is not an answer — it is whether the agent took it.
 
-**Only for an agent that ADVERTISES it.** `claude-agent-acp` does;
-`codex-acp` does not know the word, and sending a second prompt into a session
-already prompting does not supersede anything there — it **deadlocks**. The first
-request never resolves, the caller waits out its entire timeout (900 s on the
-deployment where this happened), and the turn's work is lost with it. Measured the
-hard way, on a live turn, after the feature had been built and shipped against one
-adapter's behaviour with the capability sitting unread in the handshake all along.
-`inject` refuses when it is absent, and refusing costs nothing: the message still
-reaches the agent the ordinary way, on its next turn.
+**Two agents, two mechanisms, neither of them ACP.** Both are vendor extensions
+declared in `initialize`, and both are read from the handshake rather than guessed:
+
+| agent | advertises | how | effect on the running prompt |
+| --- | --- | --- | --- |
+| `claude-agent-acp` | `agentCapabilities._meta.claudeCode.promptQueueing` | a second `session/prompt` | **superseded** — returns early with zero usage; the last prompt reports everything |
+| `codex-acp` | `_meta.steering.supported` (TOP level, not in `agentCapabilities`) | `_session/steering`, params `{sessionId, prompt}` | **untouched** — returns `{outcome:"injected"}` at once, the running prompt still reports the turn |
+
+The placement matters more than it should: looking for Claude's flag inside
+`agentCapabilities` found nothing on codex and produced the confident, wrong
+conclusion that codex could not be steered at all. It advertises the same feature
+one level up, under a different name, with a better contract.
+
+**An agent that advertises neither is refused, and that is not caution.** codex was
+once sent a second `session/prompt` for exactly that reason, and it does not
+supersede there — it **deadlocks**. The first request never resolves, the caller
+waits out its entire timeout (900 s on the deployment where it happened), and the
+turn's work goes with it. Refusing costs nothing: the message still reaches the
+agent the ordinary way, on its next turn.
+
+The SDK carries a custom method without complaint on the CLIENT side —
+`request()` looks the spec up with `spec?.mapResponse` and sends what it does not
+recognise. On the agent side it refuses without an explicit params parser, which
+is what the fixture has to pass.
 
 The contract, measured against `claude-agent-acp` on 2026-08-12 rather than assumed:
 
@@ -237,6 +252,7 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 
 - a prompt is never queued into a session with no turn running
 - an agent that never claimed it can queue prompts is never given a second one
+- an agent with its own steering method gets that, not a second prompt
 
 - by default the agent's running commentary is part of the answer
 - `commentary: trace` moves what was said between tool calls into the reasoning
