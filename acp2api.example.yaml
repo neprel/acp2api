@@ -90,8 +90,9 @@ server:
   #   ignore accept and drop silently
   #   error  reject with 400
   # `warn` is the default because every client library sends temperature unasked.
-  # Parameters that would change what the ANSWER MEANS (tools, response_format,
-  # n > 1) are refused regardless of this setting -- see src/params.js.
+  # Parameters that would change what the ANSWER MEANS (response_format, n > 1)
+  # are refused regardless of this setting -- see src/params.js. `tools` is not
+  # among them any more: it is served, see `tools:` below.
   unsupportedParams: warn
 
   # Retained ACP sessions. Each is a live child process holding a login, so both
@@ -160,6 +161,29 @@ server:
   # case for a caller that has to guess which model a thread is on, so it has to be
   # free. Set "" to disable the marker.
   injectHeader: x-acp2api-inject
+
+  # What to do with the `tools` a caller declares in its request.
+  #
+  #   mcp  the default. They are offered to the agent as an MCP server on this
+  #        same port, and a call to one comes back to the caller as
+  #        `finish_reason: "tool_calls"` -- the shape every OpenAI client knows.
+  #   off  they are dropped and reported as ignored. What every version before
+  #        1.8.0 did.
+  #
+  # `session/prompt` has no `tools` field and will not get one: an ACP agent runs
+  # its own tool loop, and the protocol's answer to "where do tools come from" is
+  # `mcpServers`. So the only way to serve a caller's tools is to be a tool server.
+  #
+  # The turn does NOT end at the call. It waits inside it while the completion
+  # returns, so the result the caller sends back reaches the same turn and the
+  # agent carries on from where it was. That needs a NAMED conversation
+  # (`conversationHeader`), since the turn outlives the request that started it.
+  tools: mcp
+
+  # How long a tool call may sit unanswered before the agent is told it failed.
+  # The caller has gone, or decided not to run it -- and on the other side of that
+  # call is an agent process holding a subscription open with nothing to do.
+  toolTimeoutMs: 300000
 
 agents:
   # `name` is the OpenAI model id clients ask for.

@@ -50,7 +50,8 @@ sensibly anyway. All of it was built against a fleet running in production.
 | [**Watching the work**](#watching-a-turn-happen) | Tool calls, diffs and plans on the reasoning channel, so a long turn stops looking like a hang. |
 | [**Running the commands yourself**](#running-the-agents-commands-yourself) | Take execution out of the agent and into your process, with your bounds. |
 | [**Failover that works**](#status-codes-and-why-they-matter) | An exhausted subscription answers 429, so a router can move to the next model instead of counting a broken agent as an outage. |
-| [**Tools from MCP**](#tools-come-from-mcp-not-from-tools) | An ACP agent runs its own tool loop; tools are declared per agent and it acts rather than asks. |
+| [**Your tools, in the agent's hands**](#your-tools-in-the-agents-hands) | Send OpenAI `tools` and get `tool_calls` back — served to the agent as an MCP server, with the turn held open until your result arrives. |
+| [**The agent's own tools**](#the-agents-own-tools-come-from-mcp) | Declared per agent, used without asking: it acts rather than asks. |
 | [**Model and effort from config**](#what-openai-parameters-do) | `session/set_config_option` reaches the selectors the CLI exposes, by meaning rather than by vendor id. |
 
 Each has its own section below, with the request that exercises it.
@@ -113,10 +114,52 @@ agents:
 | `mcpServers` | tools for this agent — see below |
 | `env`, `cwd`, `args` | per-agent spawn overrides |
 
-### Tools come from MCP, not from `tools`
+### Your tools, in the agent's hands
 
-An ACP agent runs its **own** tool loop, so there is no per-request `tools` array to
-honour. Tools are a property of the agent, declared when its session opens:
+Send `tools` the way you always would, and they reach the agent:
+
+```jsonc
+POST /v1/chat/completions
+x-conversation-id: thread-9ab1        // required: the turn outlives this request
+
+{ "model": "claude-opus",
+  "messages": [{"role": "user", "content": "What are the 2026 company holidays?"}],
+  "tools": [{"type": "function", "function": {"name": "company_holiday", "parameters": {…}}}] }
+```
+
+You get back exactly what OpenAI would give you:
+
+```jsonc
+{"choices": [{"finish_reason": "tool_calls",
+  "message": {"role": "assistant", "content": null,
+    "tool_calls": [{"id": "call_83766e91", "type": "function",
+      "function": {"name": "company_holiday", "arguments": "{\"year\":\"2026\"}"}}]}}]}
+```
+
+Run it, send the result back as a `tool` message in the same conversation, and the
+turn finishes.
+
+**`session/prompt` has no `tools` field**, and will not get one — an ACP agent runs
+its own loop, and the protocol's answer to "where do tools come from" is
+`mcpServers`. So acp2api *becomes* a tool server: a small MCP server on its own
+port whose tool list is whatever your request declared.
+
+What that buys you is the part worth knowing: **the turn does not end at the
+call.** It sits inside the MCP request while your completion returns, so when the
+result arrives the agent picks up exactly where it was — mid-plan, with everything
+it had read still in hand — instead of re-planning from a summary. A parked call
+has a deadline (`toolTimeoutMs`); a caller that never answers cannot leave an agent
+waiting on a paid subscription forever.
+
+Verified against a real Claude Code end to end: the agent listed the tool, called
+it, and finished the turn quoting a value that existed nowhere but the result sent
+back to it. Set `server.tools: off` to drop them instead, which is what every
+version before 1.8.0 did.
+
+### The agent's own tools come from MCP
+
+Tools that belong to the *agent* rather than to the caller are declared when its
+session opens, and it uses them without asking anyone:
 
 ```yaml
 agents:

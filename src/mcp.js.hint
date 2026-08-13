@@ -1,0 +1,103 @@
+<file_context path="src/mcp.js">
+
+# application_context The caller's own tools, served to the agent as an MCP server
+
+`session/prompt` carries `{sessionId, prompt, _meta}` — verified against the SDK's
+generated types, including the v2 draft. There is no `tools` field and there is not
+going to be one: an ACP agent runs its **own** tool loop, and the protocol's answer
+to "where do tools come from" is `mcpServers`, declared when the session opens.
+
+So a caller's OpenAI `tools` cannot be served by passing anything down. They can
+only be served by **becoming a tool server**, which is what this file is: a small
+MCP server, in-process, on the bridge's own HTTP port, whose tool list is whatever
+the current request declared. The agent connects to it like any other MCP server
+and never learns the tools belong to whoever is on the other end of the completion.
+
+# architectural_decision A tool call is PARKED, not answered {#park}
+
+An MCP tool call has to be answered, and only the caller can answer it — over HTTP,
+in a later request, in OpenAI's shape. So the JSON-RPC response is held open, the
+completion returns `finish_reason: "tool_calls"`, and the next request carrying
+`role: "tool"` results resolves it.
+
+**The ACP turn never ends.** It sits inside a tool call, which is a perfectly
+ordinary thing for a turn to be doing, and when the result arrives the agent picks
+up exactly where it was — mid-plan, with everything it had read still in hand —
+rather than re-planning from a summary. That is the whole reason for the
+complexity; the alternative (end the turn, feed the result as a new prompt) is
+simpler and throws away the state the caller paid for.
+
+What it costs, and what pays for it:
+
+- the turn's event sink must outlive the request that started it, buffering
+  whatever the agent says while nobody is attached (`makeSink` in server.js);
+- the conversation stays **busy** while suspended, so a second turn cannot start on
+  a session whose first one is merely waiting. `matchKey` hands a suspended turn
+  back regardless of `server.busy`, because the next request is not a second turn —
+  it is the rest of this one;
+- a parked call has a deadline. A caller that never comes back would otherwise
+  leave an agent process waiting forever on a subscription that is still being
+  paid for.
+
+# invariant The MCP route sits ABOVE the api-key gate {#no_key}
+
+The agent is a child of this process, reached over loopback, and is **never given
+the server's api key**. The token in the path is the credential, and it names one
+conversation's tools.
+
+Put the route under the key check and every agent connection is answered 401. It
+fails **silently**: the caller's tools simply never appear, the agent reports "no
+such tool is available", and nothing in the log says why. That happened, cost two
+live turns of a real subscription to find, and was visible the whole time in a
+one-line probe that was run and misread. A test now pins the order.
+
+`log()` on every MCP request exists for the same reason: whether the agent ARRIVES
+is the first question worth asking when tools do not show up, and reasoning about
+someone else's MCP client is not an answer.
+
+# system_invariant Transport: stateless streamable HTTP {#transport}
+
+The session is named by the token in the URL, so no `Mcp-Session-Id` is issued and
+none is expected. Requests are answered as plain JSON. There is no server-initiated
+stream, so `GET` is refused with 405 — which the spec allows in as many words for a
+server that does not offer one. A notification (no `id`) is answered 202 with no
+body.
+
+`initialize` echoes back the client's `protocolVersion` when it sent one. A
+stricter answer buys nothing: the surface here is `tools/list` and `tools/call`,
+which have not changed across the versions in the wild.
+
+# verification_and_unit_test_criteria
+
+Both shipped adapters were verified live, end to end, on 2026-08-13 — not with a
+stub, because a stub proves only that the test agrees with itself:
+
+| | claude-agent-acp 0.66.0 | codex-acp 1.1.14 |
+| --- | --- | --- |
+| tool appears as | `mcp__acp2api-client-tools__company_holiday` | `mcp.acp2api-client-tools.company_holiday` |
+| handshake | initialize → notifications/initialized → tools/list → tools/call | same |
+| completion | `finish_reason: "tool_calls"` | same |
+| after the result | the same turn finished from it | the same turn finished from it |
+
+The probe tool returned a value that exists nowhere else (`MERIDIAN-77`), so the
+answer could not have come from anywhere but the caller's result.
+
+- a caller's tools are offered to the agent, and a call comes back as tool_calls
+- the result the caller sends back reaches the same turn, which then finishes
+- a tool result for a call nobody is waiting on is refused, not run as a new turn
+- server.tools off keeps the old behaviour: no MCP server is attached
+- the MCP endpoint is reachable without the api key, because the agent has none
+
+The fixture acts as a real MCP client over HTTP for these — `USETOOL` in
+test/fixtures/fake-agent.js.
+
+# scope_boundary What this is not
+
+Not a general MCP server: it serves exactly the tools of one conversation's current
+request, and `tools/list` is the only discovery it offers. No resources, no
+prompts, no sampling, no server-initiated notifications — including
+`tools/list_changed`, which is why a caller is expected to send a stable tool set
+for the life of a conversation. An agent that has already listed is not told the
+list changed.
+
+</file_context>
