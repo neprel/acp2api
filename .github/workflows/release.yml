@@ -1,0 +1,78 @@
+# Publish to npm and cut a GitHub release, from a tag.
+#
+# The tag is the trigger and the version is `package.json` -- the job refuses to
+# run if they disagree, because the alternative is a v1.7.1 release carrying 1.7.0
+# and a registry that can never be corrected: npm versions are immutable.
+#
+# Nothing is published that has not passed the suite on this exact commit. That is
+# not ceremony either: this package spawns coding agents that hold live logins, and
+# a broken publish is not a rollback, it is a deprecate-and-bump.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # For re-running a release whose publish step failed after the tag was pushed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v1.7.1"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Cutting the GitHub release.
+      contents: write
+      # Signs the npm provenance attestation, which is what lets anyone verify
+      # that this tarball was built from this commit by this workflow.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: The tag and package.json must agree
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="v$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag $tag does not match package.json $version" >&2
+            exit 1
+          fi
+          echo "releasing $version"
+
+      - run: npm test
+
+      # `--provenance` needs id-token: write above. It publishes a signed
+      # statement of where the tarball came from, which npm shows on the package
+      # page. Free, and the whole point of building in the open.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Notes are generated from the commits since the previous tag. The commit
+      # messages in this repository are written to be read, so this is a better
+      # changelog than a hand-maintained file that goes stale.
+      - name: Cut the GitHub release, with the published tarball attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # The same bytes that went to the registry, so the release page is a
+          # usable mirror for anyone who does not want to install from npm.
+          tarball=$(npm pack --silent)
+          gh release create "$tag" --title "$tag" --generate-notes --verify-tag "$tarball"

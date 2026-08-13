@@ -1,5 +1,10 @@
 # acp2api
 
+[![ci](https://github.com/neprel/acp2api/actions/workflows/ci.yml/badge.svg)](https://github.com/neprel/acp2api/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/acp2api)](https://www.npmjs.com/package/acp2api)
+[![node](https://img.shields.io/node/v/acp2api)](https://www.npmjs.com/package/acp2api)
+[![license](https://img.shields.io/npm/l/acp2api)](LICENSE)
+
 **An OpenAI-compatible HTTP server in front of [ACP](https://agentclientprotocol.com) agents.**
 
 Plenty of tools speak the OpenAI API and would very much like to drive a coding
@@ -26,6 +31,29 @@ interface.
    OpenWebUI, a router,       OpenAI  ⇄  ACP            codex-acp
    your own script)                                     opencode acp, cline --acp, …
 ```
+
+## What it gives you
+
+A coding agent is not a chat model, and the gap between the two is where every
+feature below comes from. A turn runs for minutes, not seconds. It holds state you
+paid for — files it read, a plan it built. It narrates itself. It runs commands. An
+OpenAI client knows none of that, and everything here exists to make one behave
+sensibly anyway. All of it was built against a fleet running in production.
+
+| | what it solves |
+| --- | --- |
+| [**Conversations, not cold starts**](#continuity-a-stateless-caller-becomes-a-conversation) | The OpenAI API asks clients to be stateless. Replaying a transcript into a coding agent every message throws away everything it had learned. |
+| [**Naming a conversation**](#naming-a-conversation-when-inferring-it-cannot-work) | A gateway that keeps the transcript on its side has no growing prefix to match. One header fixes it. |
+| [**Steering a running turn**](#saying-something-while-the-turn-is-still-running) | Correcting work that went wrong in its first thirty seconds, without waiting out the other nineteen minutes. |
+| [**Parking, not forgetting**](#going-quiet-does-not-lose-the-work) | A thread nobody has touched for an hour gives back its process and keeps its memory. |
+| [**Warm starts**](#starting-warm-instead-of-cold) | Every new conversation begins already oriented, for one warm-up instead of one per thread. |
+| [**Watching the work**](#watching-a-turn-happen) | Tool calls, diffs and plans on the reasoning channel, so a long turn stops looking like a hang. |
+| [**Running the commands yourself**](#running-the-agents-commands-yourself) | Take execution out of the agent and into your process, with your bounds. |
+| [**Failover that works**](#status-codes-and-why-they-matter) | An exhausted subscription answers 429, so a router can move to the next model instead of counting a broken agent as an outage. |
+| [**Tools from MCP**](#tools-come-from-mcp-not-from-tools) | An ACP agent runs its own tool loop; tools are declared per agent and it acts rather than asks. |
+| [**Model and effort from config**](#what-openai-parameters-do) | `session/set_config_option` reaches the selectors the CLI exposes, by meaning rather than by vendor id. |
+
+Each has its own section below, with the request that exercises it.
 
 ## Why go through ACP at all
 
@@ -427,7 +455,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 103 tests, offline
+make test      # 174 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack

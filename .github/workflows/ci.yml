@@ -1,0 +1,68 @@
+# Every push and every pull request runs the suite.
+#
+# The tests spawn a real ACP agent over stdio (test/fixtures/fake-agent.js) and
+# drive the HTTP server end to end, so this is not a lint pass -- it is the same
+# thing that has caught every regression in this repository so far, including a
+# missing clearTimeout that held the event loop for the whole request timeout and
+# only showed up as "the test file stopped exiting".
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `engines` says >=22. Both are tested because the suite uses the node
+        # test runner and web streams, and those are exactly the areas where a
+        # major bump has bitten before.
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      # `npm ci` and not `npm install`: the lockfile is the point of a CI run.
+      - run: npm ci
+      - run: npm test
+
+  # What `npm publish` would actually upload. A `files` list that has drifted --
+  # a new src/*.js that nobody added, an example config left behind -- produces a
+  # package that works from a checkout and fails from the registry, and that is
+  # only visible by looking at the tarball.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Pack, then check the tarball actually carries the server
+        run: |
+          npm pack --dry-run --json > pack.json
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const [{ files }] = JSON.parse(readFileSync("pack.json", "utf8"));
+            const shipped = new Set(files.map((f) => f.path));
+            const required = ["bin/acp2api.js", "src/server.js", "src/agent.js", "src/config.js"];
+            const missing = required.filter((f) => !shipped.has(f));
+            if (missing.length) throw new Error(`the package would ship without: ${missing.join(", ")}`);
+            console.log(`tarball carries ${shipped.size} files`);
+          '
