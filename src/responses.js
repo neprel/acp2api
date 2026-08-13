@@ -15,7 +15,11 @@ import { RequestError, toPromptBlocks } from "./openai.js";
 const NATIVE = new Set(["model", "input", "instructions", "previous_response_id", "store", "stream", "reasoning", "max_output_tokens"]);
 
 const REFUSED = {
-  tools: "the agent runs its own tool loop and cannot return tool calls; give it tools with `mcpServers` in the agent config instead",
+  // Chat completions serve a caller's tools (see src/mcp.js); this endpoint does
+  // not yet, and says so rather than dropping them. The work is the output shape:
+  // Responses reports a call as a `function_call` output item with its own id and
+  // lifecycle events, which is a different translation from `tool_calls`.
+  tools: "not on /v1/responses yet -- use /v1/chat/completions, which serves a caller's tools, or give the agent its own with `mcpServers` in the agent config",
   tool_choice: "see `tools`",
   text: "structured output is not implemented yet; it can only be emulated by prompting and validating",
   include: "there is nothing extra to include -- output items are always complete",

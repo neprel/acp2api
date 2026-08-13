@@ -195,7 +195,7 @@ export function toolResultsIn(messages) {
  * both, and dropping that text would lose the sentence that explains the call.
  * `null` rather than `""` when it said nothing, which is what OpenAI sends.
  */
-export function toolCallCompletion({ id, model, created, calls, text, reasoning }) {
+export function toolCallCompletion({ id, model, created, calls, text, reasoning, ignored }) {
   return {
     id,
     object: "chat.completion",
@@ -217,6 +217,7 @@ export function toolCallCompletion({ id, model, created, calls, text, reasoning 
         finish_reason: "tool_calls",
       },
     ],
+    ...(ignored?.length ? { x_acp2api: { ignored } } : {}),
   };
 }
 

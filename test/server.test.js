@@ -1151,3 +1151,22 @@ test("the MCP endpoint answers the agent, which carries nothing but its token", 
   const body = await res.json();
   assert.equal(body.error.message, "unknown tool session");
 });
+
+test("tool_choice is reported as ignored even while the tools themselves are served", async (t) => {
+  // Serving the tools and honouring `tool_choice` are different promises. The
+  // agent decides what to call and when; there is no way to tell it "you must call
+  // this one" through a tool server. Dropping the parameter quietly, next to tools
+  // that DO work, is how a caller comes to believe `required` was honoured.
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: "hi" }],
+      tools: TOOLS,
+      tool_choice: "required",
+    }),
+    headers: { "x-conversation-id": "tools-e" },
+  });
+  const body = await res.json();
+  assert.deepEqual(body.x_acp2api.ignored, ["tool_choice"]);
+});

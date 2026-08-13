@@ -339,10 +339,15 @@ async function handleCompletion(req, res, registry, config, log, params, session
   // The caller declared tools and this server is willing to serve them. `off`
   // keeps the old behaviour, where they are dropped and reported as ignored.
   const serveTools = config.server.tools === "mcp" && declared.length > 0;
-  // Not reported as dropped when they are about to be served. `classify` cannot
-  // know: whether `tools` is honoured is a property of this server's config, not
-  // of the request.
-  const reported = serveTools ? ignored.filter((k) => k !== "tools" && k !== "tool_choice") : ignored;
+  // `tools` is not reported as dropped when it is about to be served -- `classify`
+  // cannot know that, since whether they are honoured is a property of this
+  // server's config rather than of the request.
+  //
+  // `tool_choice` STAYS reported, and that is deliberate. It is not honoured: the
+  // agent decides what to call and when, and there is no way to tell it "you must
+  // call this one" through a tool server. Quietly dropping it while serving the
+  // tools beside it would tell a caller that asked for `required` that it got it.
+  const reported = serveTools ? ignored.filter((k) => k !== "tools") : ignored;
   params.report(model, reported);
   const limit = makeLimiter({ maxTokens, stop });
   const agent = registry.get(model);
@@ -400,7 +405,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
   if (match?.pending) {
     return await resumeToolCall({
       req, res, match, sessions, tools, config, log, model, meta, stream,
-      includeUsage, toolResults, timer,
+      includeUsage, toolResults, timer, ignored: reported,
     });
   }
 
@@ -545,7 +550,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
     if (bench) {
       return await runToolTurn({
         res, agent, session, blocks, controller, limit, sessions, tools, convId,
-        bench, prefix, meta, stream, includeUsage, log, model, timer,
+        bench, prefix, meta, stream, includeUsage, log, model, timer, ignored: reported,
         clientGone: () => clientGone,
         timedOut: () => timedOut,
         timeout,
@@ -768,6 +773,10 @@ async function settleToolTurn(o) {
       calls: outcome.calls,
       text: pending.seen.text,
       reasoning: pending.seen.reasoning,
+      // Reported here too. A turn that stops to ask for a tool is still a turn
+      // that was handed `temperature` and dropped it, and the caller has the same
+      // right to know as it would on any other answer.
+      ignored: o.ignored,
     });
     if (!o.stream) return send(res, 200, body);
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -784,7 +793,7 @@ async function settleToolTurn(o) {
   remember(sessions, convId, pending.prefix, turn.text);
   clearTimeout(o.timer);
   const settled = settleUsage(sessions, convId, turn);
-  if (!o.stream) return send(res, 200, completion({ ...meta, ...settled }));
+  if (!o.stream) return send(res, 200, completion({ ...meta, ...settled, ignored: o.ignored }));
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   write(res, chunk({ ...meta, delta: { role: "assistant", content: turn.text } }));
   write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason) }));
