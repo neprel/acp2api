@@ -55,4 +55,6 @@ separate them. At startup, log every model id with the agent, model and reasonin
 behind it: that mapping is the one thing an operator needs when a caller reports the
 wrong answers from the right name.
 
-An empty `apiKey` is warned about explicitly at startup.
+A non-loopback `host` is announced at startup. Not a refusal — where to listen is
+the operator's call — but there is no authentication here and the process spawns an
+agent that executes commands, so it is worth reading once.

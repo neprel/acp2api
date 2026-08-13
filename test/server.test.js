@@ -10,10 +10,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "fake-agent.js");
 
 /** Starts the server on an ephemeral port and returns a fetch bound to it. */
-async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {}) {
+async function start(t, { agents, specs, server: serverOpts } = {}) {
   const config = normalizeConfig(
     {
-      server: { host: "127.0.0.1", port: 10021, apiKey, cwd: here, ...serverOpts },
+      server: { host: "127.0.0.1", port: 10021, cwd: here, ...serverOpts },
       agents: specs ?? [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
     },
     { baseDir: here, env: {} },
@@ -45,7 +45,6 @@ async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {})
       ...init,
       headers: {
         "content-type": "application/json",
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
         ...(init.headers ?? {}),
       },
     });
@@ -86,8 +85,8 @@ async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {})
 const chat = (body) => ({ method: "POST", body: JSON.stringify(body) });
 
 test("/health needs no key and lists the configured models", async (t) => {
-  const call = await start(t, { apiKey: "secret" });
-  const res = await call("/health", { headers: { authorization: "" } });
+  const call = await start(t);
+  const res = await call("/health");
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { status: "ok", agents: ["fake"] });
 });
@@ -97,22 +96,6 @@ test("/v1/models lists agents as OpenAI models", async (t) => {
   const body = await (await call("/v1/models")).json();
   assert.equal(body.object, "list");
   assert.deepEqual(body.data, [{ id: "fake", object: "model", created: 0, owned_by: "general" }]);
-});
-
-test("the api key is enforced on everything but /health", async (t) => {
-  const call = await start(t, { apiKey: "secret" });
-  assert.equal((await call("/v1/models", { headers: { authorization: "Bearer wrong" } })).status, 401);
-  assert.equal((await call("/v1/models", { headers: { authorization: "" } })).status, 401);
-  // Length differences must not short-circuit into a different code path.
-  assert.equal((await call("/v1/models", { headers: { authorization: "Bearer s" } })).status, 401);
-  assert.equal((await call("/v1/models")).status, 200);
-  // Anthropic-style clients send x-api-key instead of a bearer token.
-  assert.equal((await call("/v1/models", { headers: { authorization: "", "x-api-key": "secret" } })).status, 200);
-});
-
-test("an empty apiKey disables authentication entirely", async (t) => {
-  const call = await start(t);
-  assert.equal((await call("/v1/models", { headers: { authorization: "" } })).status, 200);
 });
 
 test("a non-streaming completion returns content, reasoning and usage", async (t) => {
@@ -1154,18 +1137,17 @@ test("server.tools off keeps the old behaviour: no MCP server is attached", asyn
   assert.match(body.choices[0].message.content, /NO-TOOL-SERVER/);
 });
 
-test("the MCP endpoint is reachable without the api key, because the agent has none", async (t) => {
-  // The agent is a child of this process and is never given the server's key; the
-  // token in the path is its credential. Putting this route behind the key gate --
-  // which is where it first landed -- makes every agent's connection a silent 401
-  // and the caller's tools simply never appear, with nothing in the log to say so.
-  const call = await start(t, { apiKey: "secret" });
+test("the MCP endpoint answers the agent, which carries nothing but its token", async (t) => {
+  // The token in the path is the only thing that addresses a conversation's tools.
+  // This route once sat behind an api-key gate the agent was never given, which
+  // made every connection a silent 401: the tools simply never appeared, with
+  // nothing in the log to say why. The key is gone; the route is still checked.
+  const call = await start(t);
   const res = await call("/mcp/no-such-token", {
     method: "POST",
-    headers: { authorization: "" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
   });
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.equal(body.error.message, "unknown tool session", "reached the bridge, not the api-key gate");
+  assert.equal(body.error.message, "unknown tool session");
 });

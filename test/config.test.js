@@ -98,10 +98,10 @@ test("limitPatterns compile to case-insensitive regexes and can be replaced", ()
 test("loadConfig reads YAML and reports the file in errors", () => {
   const dir = mkdtempSync(join(tmpdir(), "acp2api-"));
   const file = join(dir, "c.yaml");
-  writeFileSync(file, "server:\n  port: 1234\n  apiKey: ${K}\nagents:\n  - name: a\n    type: claude\n    model: opus\n");
+  writeFileSync(file, "server:\n  port: 1234\n  host: ${K}\nagents:\n  - name: a\n    type: claude\n    model: opus\n");
   const c = loadConfig(file, { env: { K: "secret" } });
   assert.equal(c.server.port, 1234);
-  assert.equal(c.server.apiKey, "secret");
+  assert.equal(c.server.host, "secret");
   assert.equal(c.agents[0].model, "opus");
   assert.equal(c.server.cwd, dir);
 

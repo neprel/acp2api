@@ -6,13 +6,15 @@
 # be written here.
 
 server:
+  # There is NO authentication here, by design: acp2api is a local bridge and
+  # authorization belongs to whatever router sits in front of it -- which is where
+  # it is already done, and where it can be done properly.
+  #
+  # Loopback by default for that reason. Binding somewhere the network can reach
+  # is yours to decide and is announced at startup, but remember what is behind
+  # this port: an agent that runs commands and writes files.
   host: 127.0.0.1
   port: 10021
-
-  # What CLIENTS of this server send as `Authorization: Bearer ...`.
-  # NOT an Anthropic or OpenAI key -- none is ever used. Each agent spends the
-  # subscription its own CLI is logged into. Leave empty to disable auth.
-  apiKey: ${ACP2API_API_KEY:-}
 
   # Workspace handed to every ACP session, and the boundary for fs/read_text_file
   # and fs/write_text_file. Relative paths resolve against this file.

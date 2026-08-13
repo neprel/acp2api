@@ -1,5 +1,4 @@
 import { createServer as createHttpServer } from "node:http";
-import { timingSafeEqual } from "node:crypto";
 import { Agent, AgentError } from "./agent.js";
 import { ParamReporter } from "./params.js";
 import {
@@ -20,14 +19,6 @@ import { ToolBridge } from "./mcp.js";
 import { toolCallCompletion } from "./openai.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-
-/** Constant-time compare that does not leak length through an early return. */
-function secretEquals(a, b) {
-  const x = Buffer.from(a ?? "", "utf8");
-  const y = Buffer.from(b ?? "", "utf8");
-  if (x.length !== y.length) return false;
-  return timingSafeEqual(x, y);
-}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -73,23 +64,13 @@ export function createServer(config, { agents, log = () => {} } = {}) {
     if (conv.bench) tools.close(conv.bench);
   };
 
-  const authorized = (req) => {
-    if (!config.server.apiKey) return true;
-    const header = req.headers.authorization ?? "";
-    const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-    // x-api-key too: Anthropic-style clients send that instead, and both are
-    // pointing at the same server here.
-    return secretEquals(bearer, config.server.apiKey) || secretEquals(req.headers["x-api-key"], config.server.apiKey);
-  };
-
   const server = createHttpServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     try {
       if (url.pathname === "/health") return send(res, 200, { status: "ok", agents: [...registry.keys()] });
-      // The MCP endpoint the AGENT connects to, not a client-facing route. It is
-      // deliberately outside the api-key check above: the agent is a child of this
-      // process, reached over loopback, and it is not given the key. The token in
-      // the path is the credential, and it names one conversation's tools.
+      // The MCP endpoint the AGENT connects to, not a client-facing route. The
+      // token in the path names one conversation's tools and is the only thing
+      // that addresses it.
       const mcp = /^\/mcp\/([A-Za-z0-9-]+)$/.exec(url.pathname);
       if (mcp) {
         if (req.method !== "POST") {
@@ -117,7 +98,6 @@ export function createServer(config, { agents, log = () => {} } = {}) {
         return send(res, 200, answer);
       }
 
-      if (!authorized(req)) return send(res, 401, errorBody("invalid api key", "invalid_api_key", "authentication_error"));
 
       if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
         return send(res, 200, {

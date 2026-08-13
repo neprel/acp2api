@@ -59,9 +59,12 @@ export const DEFAULT_LIMIT_PATTERNS = [
 ];
 
 const DEFAULTS = {
+  // Loopback by default, and deliberately so: this bridge has no authentication
+  // of its own and spawns agents that run commands and write files. Binding it
+  // somewhere the network can reach is the operator's call to make -- and is
+  // announced at startup, because it is worth seeing once.
   host: "127.0.0.1",
   port: 10021,
-  apiKey: "",
   cwd: ".",
   requestTimeoutMs: 600_000,
   permission: "allow",
@@ -293,7 +296,6 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
 
   req(Number.isInteger(s.port) && s.port > 0 && s.port < 65536, `server.port must be a port number, got ${s.port}`);
   req(typeof s.host === "string" && s.host.length > 0, "server.host must be a non-empty string");
-  req(typeof s.apiKey === "string", "server.apiKey must be a string");
   req(["allow", "deny"].includes(s.permission), `server.permission must be "allow" or "deny", got ${s.permission}`);
   req(
     ["ignore", "warn", "error"].includes(s.unsupportedParams),

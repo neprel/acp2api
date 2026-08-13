@@ -49,8 +49,12 @@ if (opts.check) {
   process.exit(0);
 }
 
-if (!config.server.apiKey) {
-  log("warn", "server.apiKey is empty -- every request is accepted without authentication");
+// Said once, at startup, and not as a refusal: where to listen is the operator's
+// decision. But there is no api key here -- authentication belongs to the router in
+// front -- and this process spawns an agent that executes commands, so a non-
+// loopback bind is worth reading once rather than discovering later.
+if (!/^(127\.\d+\.\d+\.\d+|localhost|::1)$/i.test(config.server.host)) {
+  log("warn", `listening on ${config.server.host} -- there is no authentication here; put a router or proxy in front`);
 }
 
 // The workspace is a bind-mounted volume that does not exist on a fresh host. An

@@ -55,7 +55,7 @@ message and anything else as a stack trace.
 
 `${VAR}` and `${VAR:-fallback}` expand recursively over the whole document first, so
 validation sees final values. An unset variable with no fallback is **fatal** — the
-alternative is a server that starts with an empty `apiKey` and an open port.
+alternative is a server that silently starts with a half-expanded config.
 
 Because expansion always produces strings, `port` and `requestTimeoutMs` are coerced
 from numeric strings before their integer checks, and `fs` from `"false"`/`"0"`.

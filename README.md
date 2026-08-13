@@ -5,25 +5,10 @@
 [![node](https://img.shields.io/node/v/acp2api)](https://www.npmjs.com/package/acp2api)
 [![license](https://img.shields.io/npm/l/acp2api)](LICENSE)
 
-**An OpenAI-compatible HTTP server in front of [ACP](https://agentclientprotocol.com) agents.**
+**Use Claude Code, Codex or any [ACP](https://agentclientprotocol.com) agent from
+anything that speaks the OpenAI API.**
 
-Plenty of tools speak the OpenAI API and would very much like to drive a coding
-agent like Claude Code or Codex — but do not speak
-[ACP](https://agentclientprotocol.com) yet. Hermes is a good example: it can already
-run *as* an ACP server for editors, while a generalized ACP *client* is still an
-open request ([#5257](https://github.com/NousResearch/hermes-agent/issues/5257),
-[#36057](https://github.com/NousResearch/hermes-agent/issues/36057)).
-
-`acp2api` closes that gap from the other side. It speaks ACP to the agents and the
-OpenAI API to everyone else, so anything that can already POST to
-`/v1/chat/completions` gets ACP agents today:
-
-```
-POST /v1/chat/completions   {"model": "claude-opus", "messages": [...]}
-```
-
-Every agent you configure becomes an OpenAI **model id**. That is the whole
-interface.
+Each agent you configure becomes a **model id**. That is the whole interface.
 
 ```
    OpenAI client                acp2api                  ACP agent
@@ -31,6 +16,43 @@ interface.
    OpenWebUI, a router,       OpenAI  ⇄  ACP            codex-acp
    your own script)                                     opencode acp, cline --acp, …
 ```
+
+It spawns the CLI you are already logged into and spends **that subscription** —
+no API key is read, replayed or forwarded.
+
+## Sixty seconds
+
+```sh
+npm install -g acp2api
+```
+
+```yaml
+# acp2api.yaml
+server:
+  cwd: ./work                # the agents' workspace, and their fs boundary
+agents:
+  - name: claude-opus        # <- the model id clients ask for
+    type: claude
+    model: opus
+  - name: codex
+    type: codex
+```
+
+```sh
+acp2api --config acp2api.yaml
+```
+
+```sh
+curl localhost:10021/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"claude-opus","messages":[{"role":"user","content":"what is in this repo?"}]}'
+```
+
+That is a working install. Everything below is what you get for free once it runs,
+and what to turn on when you want more.
+
+There is **no authentication** here: acp2api listens on loopback and authorization
+belongs to whatever router sits in front. Binding it elsewhere is a `host:` away
+and yours to decide.
 
 ## What it gives you
 
@@ -56,54 +78,26 @@ sensibly anyway. All of it was built against a fleet running in production.
 
 Each has its own section below, with the request that exercises it.
 
-## Why go through ACP at all
+## Why through ACP, and not the vendor's API
 
-The CLI is **spawned** and uses the subscription it is already logged into
-(`~/.claude`, `~/.codex`). No OAuth token is read, replayed, or forwarded — which
-is the point. The other way to build this is to borrow the vendor's token and call
-the vendor's private HTTP API; that yields nicer error handling and is not yours to
-do.
+Because the subscription is the point. The other way to build this is to borrow a
+vendor's OAuth token and call its private HTTP API; that is nicer to code against
+and is not yours to do. Here the CLI is spawned and uses the login it already has
+(`~/.claude`, `~/.codex`) — nothing is read, replayed or forwarded.
 
-The cost of the honest branch is that everything must fit through ACP's stdio
-JSON-RPC. That turns out to be enough: `session/set_config_option` exposes both the
-model selector and the reasoning level, so an agent is fully specified from config.
-
-## Install
-
-```sh
-npm install -g acp2api
-```
+The cost is that everything must fit through ACP's stdio JSON-RPC, which turns out
+to be enough: `session/set_config_option` reaches the model selector and the
+reasoning level, so an agent is fully specified from config.
 
 The [Claude](https://github.com/agentclientprotocol/claude-agent-acp) and
-[Codex](https://github.com/agentclientprotocol/codex-acp) adapters come bundled as
-optional dependencies. Skip them with `--omit=optional` if you only need `general`
-agents. Log the CLIs in as usual (`claude`, `codex login`) — acp2api never handles
-credentials.
+[Codex](https://github.com/agentclientprotocol/codex-acp) adapters ship with the
+package; `--omit=optional` skips them if you only run `general` agents.
 
 ## Configure
 
-One YAML file. `${VAR}` and `${VAR:-default}` expand from the environment. Start
-from [`acp2api.example.yaml`](acp2api.example.yaml).
-
-```yaml
-server:
-  host: 127.0.0.1
-  port: 10021
-  apiKey: ${ACP2API_API_KEY}   # what CLIENTS send; not a vendor key
-  cwd: ./work                  # session workspace and fs sandbox
-  permission: allow            # how to answer session/request_permission
-  requestTimeoutMs: 900000
-
-agents:
-  - name: claude-opus          # <- the OpenAI model id
-    type: claude               # claude | codex | general
-    model: opus[1m]
-    reasoning: high
-  - name: opencode
-    type: general              # anything else that speaks ACP
-    command: opencode
-    args: [acp]
-```
+One YAML file, `${VAR}` and `${VAR:-default}` expanded from the environment. Every
+option is documented in [`acp2api.example.yaml`](acp2api.example.yaml) — start from
+that. The quickstart above is a valid config; the rest is opt-in.
 
 | key | meaning |
 | --- | --- |
@@ -442,11 +436,11 @@ than approximate:
 | `store: false` | close the session with the turn |
 
 ```sh
-curl localhost:10021/v1/responses -H "authorization: Bearer $KEY" \
+curl localhost:10021/v1/responses \
   -d '{"model":"claude-opus","input":"My favourite number is 41. Reply: noted"}'
 # {"id":"resp_...","output_text":"noted", ...}
 
-curl localhost:10021/v1/responses -H "authorization: Bearer $KEY" \
+curl localhost:10021/v1/responses \
   -d '{"model":"claude-opus","input":"What was my number?","previous_response_id":"resp_..."}'
 # "41"
 ```
@@ -462,8 +456,9 @@ Retained sessions are live child processes holding logins, so they are bounded b
 outlives a newer idle one) and `server.sessionTtlMs`. Both close the ACP session, as
 do delete, shutdown, and a first turn that fails before answering.
 
-Auth is `Authorization: Bearer <apiKey>` or `x-api-key`. An empty `apiKey` disables
-it, and the server says so on startup.
+There is no authentication: acp2api is a local bridge, and authorization is the
+job of the router in front of it. It binds loopback by default and says so at
+startup if you point `host:` somewhere else.
 
 Agent *thinking* is streamed and returned as `reasoning_content` alongside
 `content` — the non-standard-but-universal field vLLM, DeepSeek and OpenRouter all

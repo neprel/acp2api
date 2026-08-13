@@ -30,12 +30,16 @@ nothing else.
 
 # invariant Auth compares in constant time, on both header spellings {#auth}
 
-`Authorization: Bearer` and `x-api-key` are both accepted — Anthropic-style clients
-send the latter at the same server. Comparison is `timingSafeEqual` with a length
-pre-check that returns the same way for every mismatch.
+**There is no authentication.** It was removed deliberately: this bridge is
+reached through a router — litellm, a proxy — and that is where authorization can
+be done properly and is already done. A second, weaker copy of it here bought
+nothing and cost a config key, two headers, a constant-time compare and a class of
+silent 401s. The one that mattered: the MCP route sat under the key check the agent
+was never given, so every agent connection was refused without a word.
 
-An empty configured `apiKey` disables authentication entirely, and the CLI warns
-about it at startup. That is a deployment choice, not an accident to guess at.
+What remains is placement. `host` binds loopback by default and the CLI says so at
+startup when it does not — where to listen is the operator's decision, but what is
+behind the port is an agent that runs commands.
 
 # func handleCompletion {#handle}
 
@@ -119,9 +123,7 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 
 # test server
 
-- `/health` needs no key and lists the models; every other route enforces it
-- both header spellings authenticate; a wrong or short key is 401
-- an empty `apiKey` accepts everything
+- `/health` lists the configured models
 - a non-streaming turn returns content, `reasoning_content` and usage
 - a streaming turn emits role, deltas and a terminal `finish_reason`, then `[DONE]`
 - `stream_options.include_usage` adds a usage-only chunk before `[DONE]`
