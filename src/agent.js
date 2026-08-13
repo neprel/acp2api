@@ -478,6 +478,18 @@ export class Agent {
    * cannot express at all.
    */
   async turn(session, blocks, { signal, onEvent = () => {}, limit = null, overrides = null } = {}) {
+    // Already gone before the turn began -- the caller hung up while the session
+    // was being opened, which on a cold agent is seconds.
+    //
+    // This has to be checked rather than left to the listener below, because
+    // `abort` has ALREADY been dispatched: `addEventListener` after the fact never
+    // fires, so the cancel notification would never be sent. The turn would then
+    // run to the end with nobody waiting for it, and an agent whose turn only ends
+    // when it is told would never end at all. Measured as a CI job sitting for
+    // five minutes against a log that simply stopped.
+    if (signal?.aborted) {
+      throw new AgentError(`${this.name}: cancelled before the turn started`, 499, "cancelled");
+    }
     const { connection } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
 

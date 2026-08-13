@@ -140,9 +140,19 @@ test("aborting the request cancels the turn in the agent", async (t) => {
   const agent = makeAgent();
   t.after(() => agent.close());
   const controller = new AbortController();
-  const pending = agent.prompt([{ type: "text", text: "HANG" }], { signal: controller.signal });
-  // Wait until the agent is demonstrably mid-turn before cancelling.
-  await new Promise((r) => setTimeout(r, 200));
+  // Cancelled on the agent's FIRST sign of life, not after a fixed wait. Two
+  // hundred milliseconds is not enough to spawn a process on a two-core runner,
+  // so the abort landed before the turn existed -- and a signal that is already
+  // aborted notifies nobody who listens afterwards, so the turn ran on with
+  // nobody waiting and the test file never exited. Five minutes of CI, and a log
+  // that just stopped.
+  let began;
+  const started = new Promise((r) => (began = r));
+  const pending = agent.prompt([{ type: "text", text: "HANG" }], {
+    signal: controller.signal,
+    onEvent: () => began(),
+  });
+  await started;
   controller.abort();
   assert.equal((await pending).stopReason, "cancelled");
 });
