@@ -21,7 +21,13 @@ async function start(t, { server: serverOpts } = {}) {
   );
   const s = createServer(config, { agents: new Map(config.agents.map((a) => [a.name, new Agent(a, config.server)])) });
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  t.after(() => new Promise((r) => s.close(r)));
+  t.after(() => {
+    // Destroyed rather than drained -- see the note in server.test.js. A request
+    // still in flight when a test fails makes `close()` wait for it forever, and
+    // the file never exits.
+    s.closeAllConnections();
+    return new Promise((r) => s.close(r));
+  });
   const base = `http://127.0.0.1:${s.address().port}`;
   return (path, init = {}) => fetch(base + path, { headers: { "content-type": "application/json" }, ...init });
 }

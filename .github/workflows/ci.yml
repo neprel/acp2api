@@ -24,6 +24,12 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The suite takes about fifteen seconds. This bound is not for slowness, it is
+    # for the failure mode that produced it: a test that fails mid-request leaves
+    # that request in flight, `server.close()` waits for it, the file never exits,
+    # and the job sits silent until somebody notices. That cost twelve minutes and
+    # produced a log that simply stopped, with no error anywhere in it.
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +53,7 @@ jobs:
   # only visible by looking at the tarball.
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -18,13 +18,29 @@ async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {})
     },
     { baseDir: here, env: {} },
   );
-  const registry = agents ?? new Map(config.agents.map((s) => [s.name, new Agent(s, config.server)]));
-  const server = createServer(config, { agents: registry });
+  // The server's own log, kept so a test can wait for something to HAPPEN instead
+  // of waiting for a duration. See `call.until`.
+  const lines = [];
+  const listeners = new Set();
+  const log = (_level, line) => {
+    lines.push(line);
+    for (const l of [...listeners]) l(line);
+  };
+  const registry = agents ?? new Map(config.agents.map((s) => [s.name, new Agent(s, config.server, log)]));
+  const server = createServer(config, { agents: registry, log });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  t.after(() => new Promise((r) => server.close(r)));
+  t.after(() => {
+    // Connections are DESTROYED, not waited for. A test that fails mid-request
+    // leaves that request in flight, and `server.close()` waits for it: the file
+    // then never exits, and neither does the job running it. Measured on CI --
+    // one failed assertion, twelve minutes of a runner doing nothing, and a log
+    // that simply stopped after the previous test file with no error anywhere.
+    server.closeAllConnections();
+    return new Promise((r) => server.close(r));
+  });
 
   const base = `http://127.0.0.1:${server.address().port}`;
-  return (path, init = {}) =>
+  const call = (path, init = {}) =>
     fetch(base + path, {
       ...init,
       headers: {
@@ -33,6 +49,38 @@ async function start(t, { apiKey = "", agents, specs, server: serverOpts } = {})
         ...(init.headers ?? {}),
       },
     });
+
+  /**
+   * Resolves once the server has logged something matching `re`.
+   *
+   * This exists because "sleep and hope the turn started by now" is not a test, it
+   * is a coin toss weighted by whatever machine it runs on. It passed on a laptop
+   * with ten cores and failed on a two-core CI runner, where spawning the agent
+   * takes longer than the wait -- so the second request found no turn to join,
+   * started its own, and asserted against an answer that was never supposed to
+   * exist.
+   *
+   * `new session for …` is logged immediately before `setBusy(convId, true)`, with
+   * no await between them, so a request sent after this line is guaranteed to find
+   * the conversation busy.
+   */
+  call.until = (re) =>
+    new Promise((resolve, reject) => {
+      if (lines.some((l) => re.test(l))) return resolve();
+      const timer = setTimeout(() => {
+        listeners.delete(listener);
+        reject(new Error(`nothing matched ${re} in the server log:\n  ${lines.join("\n  ")}`));
+      }, 10_000);
+      const listener = (line) => {
+        if (!re.test(line)) return;
+        clearTimeout(timer);
+        listeners.delete(listener);
+        resolve();
+      };
+      listeners.add(listener);
+    });
+
+  return call;
 }
 
 const chat = (body) => ({ method: "POST", body: JSON.stringify(body) });
@@ -251,9 +299,11 @@ test("busy: queue delivers a second message INTO the running turn", async (t) =>
 
   // Deliberately NOT awaited: the point is that the second request arrives while
   // the first turn is still running, which is the only moment an injection means
-  // anything.
+  // anything. Waiting for the LOG rather than for a duration -- the agent takes
+  // however long it takes to spawn, and on a two-core runner that is longer than
+  // any sleep worth writing.
   const running = ask("SLOWTURN please");
-  await new Promise((r) => setTimeout(r, 120));
+  await call.until(/new session for/);
   const injected = await (await ask("ALSO-THIS")).json();
 
   // The injection is answered immediately and empty. The answer is not its own:
@@ -307,7 +357,7 @@ test("a steering outcome that is not `injected` reaches the caller as a refusal"
     ...chat({ model: "fake", messages: [{ role: "user", content: "SLOWTURN please" }] }),
     headers: { "x-conversation-id": "thread-a" },
   });
-  await new Promise((r) => setTimeout(r, 120));
+  await call.until(/new session for/);
   assert.equal((await ask("ALSO-THIS")).status, 409);
 
   const answer = (await (await running).json()).choices[0].message.content;
@@ -335,7 +385,7 @@ test("an agent that never claimed it can steer is never sent a steering request"
     ...chat({ model: "fake", messages: [{ role: "user", content: "SLOWTURN please" }] }),
     headers: { "x-conversation-id": "thread-a" },
   });
-  await new Promise((r) => setTimeout(r, 120));
+  await call.until(/new session for/);
   assert.equal((await ask("ALSO-THIS")).status, 409);
 
   // And the turn it refused to join finishes normally, on its own.
@@ -353,7 +403,7 @@ test("busy: fork keeps two concurrent turns apart, which is still the default", 
     });
 
   const running = ask("SLOWTURN please");
-  await new Promise((r) => setTimeout(r, 120));
+  await call.until(/new session for/);
   const second = await (await ask("SEPARATE")).json();
 
   // A session of its own, so it answers for itself rather than joining anything.
@@ -633,7 +683,15 @@ test("the request timeout is a 504, not a truncated 200", async (t) => {
   const agent = new Agent(config.agents[0], config.server);
   const server = createServer(config, { agents: new Map([["fake", agent]]) });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  t.after(() => new Promise((r) => server.close(r)));
+  t.after(() => {
+    // Connections are DESTROYED, not waited for. A test that fails mid-request
+    // leaves that request in flight, and `server.close()` waits for it: the file
+    // then never exits, and neither does the job running it. Measured on CI --
+    // one failed assertion, twelve minutes of a runner doing nothing, and a log
+    // that simply stopped after the previous test file with no error anywhere.
+    server.closeAllConnections();
+    return new Promise((r) => server.close(r));
+  });
 
   const res = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
     method: "POST",

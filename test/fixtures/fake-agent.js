@@ -120,6 +120,10 @@ const app = acp
     if (outcome !== "injected") return { outcome };
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
     state.heard = [...(state.heard ?? []), text];
+    // Releases the running SLOWTURN, which has been waiting for exactly this. The
+    // turn then answers with everything it heard, injection included -- which is
+    // the whole behaviour under test.
+    state.steered?.();
     return { outcome: "injected" };
   })
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
@@ -201,38 +205,29 @@ const app = acp
     if (text.includes("QUOTA")) throw new Error("Claude usage limit reached. Your limit will reset at 3pm.");
     if (text.includes("BOOM")) throw new Error("connection reset by peer");
 
-    // Prompt queueing, exactly as `claude-agent-acp` was measured to do it: a
-    // prompt arriving while one is in flight SUPERSEDES it. The running one
-    // returns immediately with `end_turn` and every usage counter at zero -- a
-    // sentinel, not an answer -- and the work carries on under the new one, which
-    // reports the real result for both. See agent.js.hint#inject.
-    if (state.inflight) {
-      state.inflight.supersede();
-      state.inflight = null;
-    }
-    let superseded = false;
-    const holder = {};
-    holder.promise = new Promise((resolve) => {
-      holder.supersede = () => { superseded = true; resolve(); };
-    });
-    state.inflight = holder;
-
     const say = (update) => client.notify(acp.methods.client.session.update, { sessionId: params.sessionId, update });
     state.abort = new AbortController();
 
-    // A turn slow enough to be injected into, which answers with EVERYTHING this
-    // session has been told. Sticky, so the injected prompt takes the same path and
-    // is the one that reports both. `superseded` is the whole point: it is what a
-    // caller must not mistake for an answer.
-    if (text.includes("SLOWTURN") || state.slow) {
-      state.slow = true;
-      await Promise.race([holder.promise, new Promise((r) => setTimeout(r, 400))]);
-      if (superseded) {
-        return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
-      }
+    // A turn slow enough to be steered into, which answers with EVERYTHING this
+    // session has been told -- so a test can see whether the injected text was
+    // folded into this turn's own answer.
+    //
+    // It waits for the STEER, not for a duration. A fixed 400 ms was a bet that
+    // the injecting request would arrive inside it, and that bet is lost on a
+    // machine slow enough: the turn ends first, the injection finds nothing to
+    // join, and the test fails claiming the bridge did not deliver.
+    //
+    // The cap is only for the tests where nothing is ever injected -- an agent
+    // that refuses to steer, a request that forks instead. It is generous against
+    // the ~50 ms an injection needs once the turn is known to be running, and
+    // small enough that four such tests do not dominate the suite.
+    if (text.includes("SLOWTURN")) {
+      await Promise.race([
+        new Promise((resolve) => { state.steered = resolve; }),
+        new Promise((r) => setTimeout(r, 1_500)),
+      ]);
+      state.steered = null;
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `HEARD:${state.heard.join("|")}` } });
-      state.inflight = null;
-      state.slow = false;
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
