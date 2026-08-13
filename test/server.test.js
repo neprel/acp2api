@@ -1222,3 +1222,31 @@ test("a streaming turn resumed from a tool result finishes as a normal stream", 
   assert.match(chunks.map((c) => c.choices[0].delta.content ?? "").join(""), /RESULT:the file said hello/);
   assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
 });
+
+test("a tool-enabled turn streams its trace as it happens, not in one piece at the end", async (t) => {
+  // The regression this pins: with tools present every turn took the tool path,
+  // which collected the reasoning channel and delivered it with the answer. The
+  // caller's progress bubble vanished from every conversation and nothing failed
+  // to say so -- the answer arrived exactly as before.
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: "COUNT" }],
+      tools: TOOLS,
+      stream: true,
+    }),
+    headers: { "x-conversation-id": "tools-live" },
+  });
+
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+  // More than one frame carries content: the answer was streamed, not posted whole.
+  const withContent = chunks.filter((c) => (c.choices[0].delta.content ?? "") !== "");
+  assert.ok(withContent.length > 1, `expected the text to arrive in deltas, got ${withContent.length} frame(s)`);
+  assert.ok(
+    chunks.some((c) => (c.choices[0].delta.reasoning_content ?? "") !== ""),
+    "the reasoning channel must reach the caller while the turn runs",
+  );
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+});

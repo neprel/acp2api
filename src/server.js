@@ -787,9 +787,25 @@ async function untilTurnOrToolCall(pending, tools) {
  */
 async function settleResponseTurn(o) {
   const { pending, tools, sessions, convId, shape, res } = o;
+
+  // Written through, for the same reason as on chat completions: a turn that can
+  // stop for a tool is still a turn someone is watching, and collecting its trace
+  // to deliver at the end removes the live view from every caller that sends tools.
+  let stream = null;
+  const open = (body) => {
+    if (stream) return stream;
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    stream = new ResponseStream((event) => write(res, event), { id: o.id, response: body });
+    stream.created();
+    return stream;
+  };
   pending.sink.attach((event) => {
     if (event.type === "text") pending.seen.text += event.delta;
     else if (event.type === "reasoning") pending.seen.reasoning += event.delta;
+    else return;
+    if (!o.stream) return;
+    open(shape({ text: "", reasoning: "", stopReason: "end_turn", usage: null }))
+      .delta(event.type === "reasoning" ? "reasoning" : "message", event.delta);
   });
 
   const outcome = await untilTurnOrToolCall(pending, tools);
@@ -801,16 +817,12 @@ async function settleResponseTurn(o) {
   const streamed = (body) => {
     clearTimeout(o.timer);
     if (!o.stream) return send(res, 200, body);
-    // The terminal event carries the whole object, function calls included. What a
-    // streaming client does NOT get is an incremental `output_item.added` for the
-    // call itself -- the turn produces it in one piece, and inventing a delta
-    // sequence for something that was never streamed would be theatre.
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    const stream = new ResponseStream((event) => write(res, event), { id: o.id, response: body });
-    stream.created();
-    if (pending.seen.reasoning) stream.delta("reasoning", pending.seen.reasoning);
-    if (pending.seen.text) stream.delta("message", pending.seen.text);
-    stream.completed(body);
+    // Text and reasoning have already gone out as deltas. The terminal event
+    // carries the whole object, function calls included -- what a streaming client
+    // does NOT get is an incremental `output_item.added` for the call itself,
+    // because the turn produced it in one piece and inventing a delta sequence for
+    // it would be theatre.
+    open(body).completed(body);
     res.write("data: [DONE]\n\n");
     return res.end();
   };
@@ -874,11 +886,33 @@ async function runToolTurn(o) {
  */
 async function settleToolTurn(o) {
   const { pending, tools, sessions, convId, meta, res } = o;
-  const collect = (event) => {
+
+  // WRITTEN THROUGH, not accumulated. A turn that can stop for a tool is still a
+  // turn someone is watching: the reasoning channel carries the agent's running
+  // trace, and a caller renders it live. Collecting it and delivering it in one
+  // piece at the end silently removed the progress bubble from every conversation
+  // that sends tools -- which, for a gateway, is all of them. The answer arrived
+  // as before and nothing failed, so nothing said so.
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    write(res, chunk({ ...meta, delta: { role: "assistant", content: "" } }));
+  };
+  pending.sink.attach((event) => {
     if (event.type === "text") pending.seen.text += event.delta;
     else if (event.type === "reasoning") pending.seen.reasoning += event.delta;
-  };
-  pending.sink.attach(collect);
+    // The agent's own tool calls are progress, not content -- see the note in the
+    // ordinary streaming path.
+    else return;
+    if (!o.stream) return;
+    start();
+    write(res, chunk({
+      ...meta,
+      delta: event.type === "reasoning" ? { reasoning_content: event.delta } : { content: event.delta },
+    }));
+  });
 
   const outcome = await untilTurnOrToolCall(pending, tools);
 
@@ -908,8 +942,10 @@ async function settleToolTurn(o) {
       ignored: o.ignored,
     });
     if (!o.stream) return send(res, 200, body);
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    write(res, chunk({ ...meta, delta: { role: "assistant", content: pending.seen.text, tool_calls: body.choices[0].message.tool_calls } }));
+    // Whatever it said before asking has already gone out as deltas; only the call
+    // itself and the terminal frame are left.
+    start();
+    write(res, chunk({ ...meta, delta: { tool_calls: body.choices[0].message.tool_calls } }));
     write(res, chunk({ ...meta, delta: {}, finishReason: "tool_calls" }));
     res.write("data: [DONE]\n\n");
     return res.end();
@@ -923,8 +959,9 @@ async function settleToolTurn(o) {
   clearTimeout(o.timer);
   const settled = settleUsage(sessions, convId, turn);
   if (!o.stream) return send(res, 200, completion({ ...meta, ...settled, ignored: o.ignored }));
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-  write(res, chunk({ ...meta, delta: { role: "assistant", content: turn.text } }));
+  // The text left with the deltas as it was produced; an empty turn still owes the
+  // client a well-formed stream, which is what `start()` guarantees here.
+  start();
   write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason) }));
   if (o.includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
   res.write("data: [DONE]\n\n");
