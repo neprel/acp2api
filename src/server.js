@@ -117,7 +117,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
       }
 
       if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
-        return await handleResponse(req, res, registry, config, log, params, sessions);
+        return await handleResponse(req, res, registry, config, log, params, sessions, tools, server);
       }
 
       const stored = /^\/(?:v1\/)?responses\/([^/]+)$/.exec(url.pathname);
@@ -161,7 +161,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
  * continues an existing one and sends only the new input, because the agent already
  * holds the history.
  */
-async function handleResponse(req, res, registry, config, log, params, sessions) {
+async function handleResponse(req, res, registry, config, log, params, sessions, tools, httpServer) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
@@ -233,6 +233,31 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
       ...turn,
     });
 
+  const serveTools = config.server.tools === "mcp" && request.tools.length > 0;
+
+  // A turn of this conversation is suspended inside a tool call, and this request
+  // carries its answer. Same shape as on chat completions -- the agent is still
+  // inside the call it made, so nothing below (session, prompt, history) applies.
+  if (conversation?.pending) {
+    const pending = conversation.pending;
+    const answered = request.toolResults.filter((r) => tools.resolve(pending.bench, r.id, r.text));
+    if (answered.length === 0) {
+      clearTimeout(timer);
+      throw new RequestError(
+        `${request.model}: this conversation is waiting for the result of a tool call; ` +
+          `none of the function_call_output items sent match it`,
+        409,
+        "tool_result_expected",
+      );
+    }
+    log("info", `${request.model}: answered ${answered.length} tool call(s); the turn continues`);
+    pending.seen = { text: "", reasoning: "" };
+    return await settleResponseTurn({
+      res, tools, sessions, convId, pending, shape, id, stream: request.stream,
+      timer, log, model: request.model, sessionsRecord: request.store,
+    });
+  }
+
   let session = conversation?.session ?? null;
   let opened = false;
   try {
@@ -247,10 +272,25 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
         convId = null;
       }
     }
+    // A bench must exist before the session opens: `session/new` is the only
+    // place an MCP server can be declared, and `session/resume` compares the list
+    // it is given against the one the session was built with.
+    let bench = conversation ? sessions.bench(convId) : null;
+    if (serveTools && !bench) {
+      bench = tools.open(request.tools);
+      session = null;
+      if (convId) {
+        await sessions.discard(convId, registry);
+        convId = null;
+      }
+    } else if (bench) {
+      tools.setTools(bench, request.tools);
+    }
+
     if (!session) {
-      session = await agent.openSession();
+      session = await agent.openSession({ mcpServers: bench ? [benchServer(httpServer, bench)] : [] });
       opened = true;
-      convId = sessions.open(request.model, session);
+      convId = sessions.open(request.model, session, { bench });
     }
 
     // `reasoning.effort` is re-applied per turn: on a continued conversation the
@@ -272,6 +312,22 @@ async function handleResponse(req, res, registry, config, log, params, sessions)
       stream.created();
       return stream;
     };
+
+    if (bench) {
+      const sink = makeSink();
+      const running = agent.turn(session, request.blocks, {
+        signal: controller.signal,
+        limit,
+        overrides,
+        onEvent: (e) => sink.emit(e),
+      });
+      running.catch(() => {});
+      return await settleResponseTurn({
+        res, tools, sessions, convId, shape, id, stream: request.stream, timer, log,
+        model: request.model, sessionsRecord: request.store,
+        pending: { turn: running, sink, bench, seen: { text: "", reasoning: "" } },
+      });
+    }
 
     const turn = await agent.turn(session, request.blocks, {
       signal: controller.signal,
@@ -711,6 +767,73 @@ async function untilTurnOrToolCall(pending, tools) {
   // A turn that has already ended wins over a call that parked in the same tick:
   // a parked call belonging to a finished turn has nobody left to answer it.
   return ended ?? outcome;
+}
+
+/**
+ * The Responses half of `settleToolTurn`: same suspended turn, same two ways out,
+ * a different object to say it with.
+ *
+ * Kept apart rather than merged. The two APIs disagree about what a tool call IS
+ * -- `tool_calls` on a message here, a `function_call` output item with its own id
+ * there -- and about what a response is shaped like. Folding both into one
+ * function would mean a parameter that switches between them at every step, which
+ * reads worse than saying it twice.
+ */
+async function settleResponseTurn(o) {
+  const { pending, tools, sessions, convId, shape, res } = o;
+  pending.sink.attach((event) => {
+    if (event.type === "text") pending.seen.text += event.delta;
+    else if (event.type === "reasoning") pending.seen.reasoning += event.delta;
+  });
+
+  const outcome = await untilTurnOrToolCall(pending, tools);
+  if (outcome.error) {
+    sessions.setPending(convId, null);
+    throw outcome.error;
+  }
+
+  const streamed = (body) => {
+    clearTimeout(o.timer);
+    if (!o.stream) return send(res, 200, body);
+    // The terminal event carries the whole object, function calls included. What a
+    // streaming client does NOT get is an incremental `output_item.added` for the
+    // call itself -- the turn produces it in one piece, and inventing a delta
+    // sequence for something that was never streamed would be theatre.
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    const stream = new ResponseStream((event) => write(res, event), { id: o.id, response: body });
+    stream.created();
+    if (pending.seen.reasoning) stream.delta("reasoning", pending.seen.reasoning);
+    if (pending.seen.text) stream.delta("message", pending.seen.text);
+    stream.completed(body);
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  };
+
+  if (outcome.calls?.length) {
+    tools.reported(pending.bench, outcome.calls.map((c) => c.id));
+    pending.sink.detach();
+    sessions.setPending(convId, pending);
+    o.log("info", `${o.model}: turn is waiting on ${outcome.calls.length} client tool call(s)`);
+    const asking = shape({
+      text: pending.seen.text,
+      reasoning: pending.seen.reasoning,
+      stopReason: "end_turn",
+      usage: null,
+      calls: outcome.calls,
+    });
+    // RECORDED, even though the turn is not finished. This id is what the caller
+    // puts in `previous_response_id` to send the result back, and without it there
+    // is no way to reach the turn that is waiting for it -- a 404 instead of a
+    // continuation.
+    if (o.sessionsRecord) sessions.record(convId, o.id, asking);
+    return streamed(asking);
+  }
+
+  sessions.setPending(convId, null);
+  const turn = { ...outcome.turn, text: pending.seen.text, reasoning: pending.seen.reasoning };
+  const body = shape(settleUsage(sessions, convId, turn));
+  if (o.sessionsRecord) sessions.record(convId, o.id, body);
+  return streamed(body);
 }
 
 /**

@@ -146,6 +146,12 @@ it had read still in hand — instead of re-planning from a summary. A parked ca
 has a deadline (`toolTimeoutMs`); a caller that never answers cannot leave an agent
 waiting on a paid subscription forever.
 
+`/v1/responses` does the same thing in its own spelling: the call arrives as a
+`function_call` output item with a `call_id`, and you answer it with a
+`function_call_output` item on the next request. Streaming works on both, with one
+honest limit — the call is delivered whole in the terminal event rather than as a
+delta sequence, because the turn produced it whole.
+
 Verified against a real Claude Code end to end: the agent listed the tool, called
 it, and finished the turn quoting a value that existed nowhere but the result sent
 back to it. Set `server.tools: off` to drop them instead, which is what every
@@ -494,7 +500,7 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 177 tests, offline
+make test      # 183 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack

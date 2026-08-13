@@ -43,7 +43,13 @@ test("input accepts a bare string, messages, and typed input_text parts", () => 
   // instructions are the system preamble, prepended and unlabelled
   assert.deepEqual(toInputBlocks("hi", "be terse"), [{ type: "text", text: "be terse\n\nhi" }]);
   assert.throws(() => toInputBlocks(42), /`input` must be a string or an array/);
-  assert.throws(() => toInputBlocks([{ type: "function_call" }]), /are not supported/);
+  // A call this server made and its answer are part of the record, not something
+  // to say to the agent again -- it is still sitting inside that call.
+  assert.deepEqual(
+    toInputBlocks([{ role: "user", content: "hi" }, { type: "function_call" }, { type: "function_call_output" }]),
+    [{ type: "text", text: "hi" }],
+  );
+  assert.throws(() => toInputBlocks([{ type: "computer_call" }]), /are not supported/);
 });
 
 test("parseResponsesRequest maps the fields ACP can carry", () => {
@@ -68,8 +74,11 @@ test("parseResponsesRequest maps the fields ACP can carry", () => {
   assert.equal(parseResponsesRequest({ model: "m", input: "hi", store: false }).store, false);
 });
 
-test("tools and text.format are refused; style parameters are ignored", () => {
-  assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", tools: [] }), /`tools` is not supported/);
+test("text.format is refused; style parameters are ignored; tools are read", () => {
+  // `tools` used to be refused here on the grounds that an ACP agent cannot return
+  // a tool call. It can now -- served as an MCP server, reported as a
+  // `function_call` output item -- so the parameter is read rather than rejected.
+  assert.deepEqual(parseResponsesRequest({ model: "m", input: "hi", tools: [{ type: "function" }] }).tools.length, 1);
   assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", text: {} }), /structured output/);
   assert.deepEqual(parseResponsesRequest({ model: "m", input: "hi", temperature: 0 }).ignored, ["temperature"]);
   assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", max_output_tokens: 0 }), /positive integer/);
@@ -289,4 +298,70 @@ test("forgetting one response of a chain keeps the conversation alive", async ()
   // ...and the last one takes the session with it.
   await store.forget("resp_2", agents);
   assert.deepEqual(closed, ["s1"]);
+});
+
+const TOOLS = [
+  { type: "function", name: "read_file", parameters: { type: "object", properties: {} } },
+];
+
+test("/v1/responses serves a caller's tools and reports a call as a function_call item", async (t) => {
+  // Same feature as on chat completions, spelled the way this API spells it: a
+  // `function_call` output item with a `call_id`, which is what comes back.
+  const call = await start(t);
+  const body = await (
+    await call("/v1/responses", post({ model: "fake", input: 'USETOOL read_file {"path":"x"}', tools: TOOLS }))
+  ).json();
+
+  const fc = body.output.find((o) => o.type === "function_call");
+  assert.ok(fc, `expected a function_call item, got ${JSON.stringify(body.output.map((o) => o.type))}`);
+  assert.equal(fc.name, "read_file");
+  assert.deepEqual(JSON.parse(fc.arguments), { path: "x" });
+  assert.match(fc.call_id, /^call_/);
+});
+
+test("a function_call_output continues the same suspended turn", async (t) => {
+  const call = await start(t);
+  const first = await (
+    await call("/v1/responses", post({ model: "fake", input: 'USETOOL read_file {"path":"x"}', tools: TOOLS }))
+  ).json();
+  const fc = first.output.find((o) => o.type === "function_call");
+
+  const second = await (
+    await call(
+      "/v1/responses",
+      post({
+        model: "fake",
+        previous_response_id: first.id,
+        input: [{ type: "function_call_output", call_id: fc.call_id, output: "the file said hello" }],
+        tools: TOOLS,
+      }),
+    )
+  ).json();
+
+  assert.equal(second.status, "completed");
+  assert.match(second.output_text, /RESULT:the file said hello/);
+});
+
+test("a streaming turn that stops for a tool ends with the call in the terminal event", async (t) => {
+  // The call is not invented as a delta sequence -- it arrives whole -- but the
+  // stream must still be well formed and must not end pretending the turn is over
+  // with nothing in it.
+  const call = await start(t);
+  const res = await call(
+    "/v1/responses",
+    post({ model: "fake", input: 'USETOOL read_file {"path":"x"}', tools: TOOLS, stream: true }),
+  );
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /text\/event-stream/);
+
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  assert.equal(frames.at(-1), "[DONE]");
+  const events = frames.slice(0, -1).map((f) => JSON.parse(f));
+  assert.equal(events[0].type, "response.created");
+  const done = events.at(-1);
+  assert.equal(done.type, "response.completed");
+  const fc = done.response.output.find((o) => o.type === "function_call");
+  assert.equal(fc.name, "read_file");
+  // Sequence numbers are the contract for a consumer that tracks them.
+  assert.deepEqual(events.map((e) => e.sequence_number), events.map((_, i) => i));
 });

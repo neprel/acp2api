@@ -15,12 +15,6 @@ import { RequestError, toPromptBlocks } from "./openai.js";
 const NATIVE = new Set(["model", "input", "instructions", "previous_response_id", "store", "stream", "reasoning", "max_output_tokens"]);
 
 const REFUSED = {
-  // Chat completions serve a caller's tools (see src/mcp.js); this endpoint does
-  // not yet, and says so rather than dropping them. The work is the output shape:
-  // Responses reports a call as a `function_call` output item with its own id and
-  // lifecycle events, which is a different translation from `tool_calls`.
-  tools: "not on /v1/responses yet -- use /v1/chat/completions, which serves a caller's tools, or give the agent its own with `mcpServers` in the agent config",
-  tool_choice: "see `tools`",
   text: "structured output is not implemented yet; it can only be emulated by prompting and validating",
   include: "there is nothing extra to include -- output items are always complete",
   truncation: "the agent manages its own context window",
@@ -48,15 +42,25 @@ export function toInputBlocks(input, instructions) {
     typeof input === "string"
       ? [{ role: "user", content: input }]
       : Array.isArray(input)
-        ? input.map((item) => normalizeItem(item))
+        ? input.map((item) => normalizeItem(item)).filter(Boolean)
         : null;
   if (!messages) throw new RequestError("`input` must be a string or an array of items");
+  // Every item was a tool answer: there is nothing to prompt with, and the caller
+  // is resuming a turn rather than starting one. The handler checks for that first
+  // and never gets here, so this is the guard for the case where it is wrong.
+  if (messages.length === 0) return [];
   return toPromptBlocks(instructions ? [{ role: "system", content: instructions }, ...messages] : messages);
 }
 
 /** Accepts both `{role, content}` messages and typed input items. */
 function normalizeItem(item) {
   if (!item || typeof item !== "object") throw new RequestError("each input item must be an object");
+  // A call this server made, echoed back by the caller. It is part of the record
+  // rather than something to say again -- the agent is still inside that call.
+  if (item.type === "function_call") return null;
+  // The ANSWER to one. Read separately by `toolOutputsIn`; rendering it as a
+  // message would tell the agent a person had pasted the result.
+  if (item.type === "function_call_output") return null;
   if (item.type && item.type !== "message") {
     throw new RequestError(`input items of type "${item.type}" are not supported; send messages`);
   }
@@ -104,11 +108,27 @@ export function parseResponsesRequest(body) {
     maxTokens,
     stop: [],
     ignored: ignored.sort(),
+    // The caller's own tools, and the answers it has sent back for calls this
+    // server handed it. Same feature as on chat completions, different spelling:
+    // Responses names a call `function_call` and its answer `function_call_output`.
+    tools: Array.isArray(body.tools) ? body.tools : [],
+    toolResults: toolOutputsIn(body.input),
   };
 }
 
+/** `function_call_output` items in an input array, as `{id, text}`. */
+export function toolOutputsIn(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((item) => item?.type === "function_call_output")
+    .map((item) => ({
+      id: item.call_id,
+      text: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+    }));
+}
+
 /** Builds the response object. `status` is derived from the ACP stop reason. */
-export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored }) {
+export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored, calls }) {
   const [status, incomplete] = STATUS[stopReason] ?? ["completed", null];
   return {
     id,
@@ -120,13 +140,29 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
       ...(reasoning
         ? [{ id: `${id}-rs`, type: "reasoning", summary: [{ type: "summary_text", text: reasoning }] }]
         : []),
-      {
-        id: `${id}-msg`,
-        type: "message",
+      // A turn that stopped to ask for a tool still says whatever it said before
+      // asking, so the message item is emitted only when there is one.
+      ...(text || !calls?.length
+        ? [
+            {
+              id: `${id}-msg`,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text, annotations: [] }],
+            },
+          ]
+        : []),
+      // `function_call`, not `tool_calls`: the same event, spelled the way this API
+      // spells it. `call_id` is what the caller sends back on the next request.
+      ...(calls ?? []).map((c) => ({
+        id: `${id}-fc-${c.id}`,
+        type: "function_call",
         status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text, annotations: [] }],
-      },
+        call_id: c.id,
+        name: c.name,
+        arguments: c.arguments,
+      })),
     ],
     output_text: text,
     instructions: instructions ?? null,

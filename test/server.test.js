@@ -1170,3 +1170,55 @@ test("tool_choice is reported as ignored even while the tools themselves are ser
   const body = await res.json();
   assert.deepEqual(body.x_acp2api.ignored, ["tool_choice"]);
 });
+
+test("a streaming completion that stops for a tool emits the call and finishes cleanly", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: 'USETOOL read_file {"path":"x"}' }],
+      tools: TOOLS,
+      stream: true,
+    }),
+    headers: { "x-conversation-id": "tools-stream" },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /text\/event-stream/);
+
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  assert.equal(frames.at(-1), "[DONE]", "a stream that stops for a tool still terminates properly");
+  const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+  const calls = chunks.flatMap((c) => c.choices[0].delta.tool_calls ?? []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].function.name, "read_file");
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
+});
+
+test("a streaming turn resumed from a tool result finishes as a normal stream", async (t) => {
+  const call = await start(t);
+  const ask = (messages) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages, tools: TOOLS, stream: true }),
+      headers: { "x-conversation-id": "tools-stream-2" },
+    });
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"}' };
+
+  const opening = (await (await ask([user])).text())
+    .split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""))
+    .slice(0, -1).map((f) => JSON.parse(f));
+  const id = opening.flatMap((c) => c.choices[0].delta.tool_calls ?? [])[0].id;
+
+  const rest = (await (
+    await ask([
+      user,
+      { role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: id, content: "the file said hello" },
+    ])
+  ).text())
+    .split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+
+  assert.equal(rest.at(-1), "[DONE]");
+  const chunks = rest.slice(0, -1).map((f) => JSON.parse(f));
+  assert.match(chunks.map((c) => c.choices[0].delta.content ?? "").join(""), /RESULT:the file said hello/);
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+});
