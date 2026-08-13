@@ -4,6 +4,7 @@
 [![npm](https://img.shields.io/npm/v/acp2api)](https://www.npmjs.com/package/acp2api)
 [![node](https://img.shields.io/node/v/acp2api)](https://www.npmjs.com/package/acp2api)
 [![license](https://img.shields.io/npm/l/acp2api)](LICENSE)
+[![built with HINT](https://img.shields.io/badge/built_with-HINT-5b4ee6)](https://openhint.dev/)
 
 **Use Claude Code, Codex or any [ACP](https://agentclientprotocol.com) agent from
 anything that speaks the OpenAI API.**
@@ -493,17 +494,33 @@ Two related traps this handles rather than inherits:
 ## Develop
 
 ```sh
-make test      # 174 tests, offline
+make test      # 177 tests, offline
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack
 ```
 
-Every source file has a companion `.hint` next to it stating what that file owns,
-its function contracts, its invariants, and the test scenarios it must cover — with
-the cross-cutting decisions in the folder-level [`_.hint`](_.hint). They are the
-contract, not documentation: `make spec` fails when the code drifts from them.
-Change a spec deliberately, then re-run `hint lock` to record the new snapshot.
+This repository is built with **[HINT](https://openhint.dev/)**, and most of it was
+written by coding agents — the ones it exists to serve.
+
+Every source file has a companion `.hint` beside it stating what that file owns:
+its function contracts, its invariants, the test scenarios it must cover, and the
+decisions that must not be relitigated — with the cross-cutting ones in the
+folder-level [`_.hint`](_.hint). `hint <path>` returns the knowledge that applies
+to a path, inheritance resolved, which is how an agent picks up the reasoning
+behind code it is about to change instead of rediscovering it.
+
+They are a contract, not documentation: `make spec` fails when the code drifts from
+what its spec declares. Change a spec deliberately, then `hint lock` to record the
+new snapshot.
+
+It is also where the expensive lessons live. Every hard-won fact in this project —
+that ACP defines no mid-turn input and `_session/steering` is the extension both
+adapters implement, that an already-aborted `AbortSignal` never notifies a listener
+added afterwards, that the MCP route must sit above any auth gate because the agent
+carries no key — is written down next to the code it constrains, with what it cost
+to learn. That is the whole point: the next agent to touch this reads it first, and
+does not pay twice.
 
 | file | |
 | --- | --- |
@@ -513,7 +530,8 @@ Change a spec deliberately, then re-run `hint lock` to record the new snapshot.
 | `src/openai.js` | chat-completions ⇄ ACP translation, no I/O |
 | `src/responses.js` | Responses API ⇄ ACP translation, and the typed event stream |
 | `src/sessions.js` | retained conversations: lookup, TTL, LRU eviction, closing |
-| `src/server.js` | HTTP routing, auth, SSE, status mapping |
+| `src/server.js` | HTTP routing, SSE, status mapping, the turn that outlives its request |
+| `src/mcp.js` | the caller's tools, served to the agent as an MCP server |
 | `test/fixtures/fake-agent.js` | a **real** ACP agent over real stdio |
 
 The tests drive that fixture through an actual JSON-RPC handshake instead of mocking
