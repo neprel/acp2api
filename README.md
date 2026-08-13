@@ -218,6 +218,53 @@ forking on each such change would mean never continuing anything.
 The header name is `server.conversationHeader`; set it to `""` to ignore it.
 Requests without it fall back to prefix matching.
 
+### Saying something while the turn is still running
+
+A coding-agent turn runs for minutes behind a single completion. Without a way in,
+correcting work that went wrong in its first thirty seconds means waiting for the
+whole thing to finish.
+
+Turn it on with `server.busy: queue`, then send the correction to the **same**
+conversation, marked as an injection:
+
+```
+POST /v1/chat/completions
+x-conversation-id: mattermost:thread:9ab1…
+x-acp2api-inject: 1
+
+{"model":"claude-opus","messages":[{"role":"user","content":"also run the linter"}]}
+```
+
+It answers **200 with an empty message**, immediately. That is the honest shape of
+"delivered, nothing to say": the answer belongs to the turn you joined and reaches
+whoever is waiting on *that* request. Measured against codex, injected twelve
+seconds into a turn whose first command was a 45-second sleep — the original work
+finished, the injected command ran too, and both came back in the original
+request's answer.
+
+A miss costs nothing, which is what makes this usable from a caller that has to
+guess which model a thread is on:
+
+| | |
+| --- | --- |
+| **409** `no_running_turn` | no turn to join, or the agent cannot be steered. Try the next model. |
+| **200**, empty content | it landed |
+
+Without `x-acp2api-inject` a miss would fall through to the ordinary path and start
+a whole turn of a real subscription, streaming to a caller that is not listening.
+
+**Requirements and limits.** The agent must advertise `_meta.steering.supported` —
+`claude-agent-acp` ≥ 0.66.0 and `codex-acp` ≥ 1.1.14 both do. ACP itself defines no
+mid-turn input; `_session/steering` is the extension both implement, and an agent
+without it is refused rather than sent something that might wedge it. Only a
+**named** conversation can be joined: prefix matching cannot identify a
+conversation whose transcript is still being written.
+
+**Steering redirects; it does not append.** The message pre-empts the current
+generation, and what happens to the unfinished plan is the model's decision. "Do
+exactly X" is read as a replacement, and the rest may be abandoned. Say "as well as
+what you are already doing" when that is what you mean.
+
 ### Going quiet does not lose the work
 
 A conversation nobody has continued past `sessionTtlMs` is **parked**, not ended:

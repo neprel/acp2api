@@ -133,6 +133,34 @@ server:
   # the header. Prefix matching stays the fallback either way.
   conversationHeader: x-conversation-id
 
+  # What a request for a NAMED conversation whose turn is still running should do.
+  #
+  #   fork   the default. It gets a session of its own -- two turns cannot
+  #          interleave inside one agent.
+  #   queue  it is steered INTO the running turn, and the agent takes it at its
+  #          next step.
+  #
+  # `queue` is what makes it possible to correct a turn while it runs, instead of
+  # waiting out the minutes a coding-agent turn takes and sending the correction
+  # afterwards. It needs an agent that advertises `_meta.steering.supported`
+  # (claude-agent-acp >= 0.66.0, codex-acp >= 1.1.14); anything else falls back to
+  # `fork`, because ACP itself has no mid-turn input and guessing at one can wedge
+  # the agent.
+  #
+  # Steering REDIRECTS rather than appends: it pre-empts the current generation,
+  # and what becomes of the unfinished plan is the model's decision.
+  busy: fork
+
+  # Marks a request as an injection and nothing else: join a turn already running,
+  # or answer 409 and do nothing.
+  #
+  # Without it, an injection that misses -- wrong model, turn already over, no such
+  # conversation -- falls through and starts a whole turn of a real subscription,
+  # doing work nobody asked for and streaming it to nobody. Missing is the NORMAL
+  # case for a caller that has to guess which model a thread is on, so it has to be
+  # free. Set "" to disable the marker.
+  injectHeader: x-acp2api-inject
+
 agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus
