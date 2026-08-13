@@ -109,3 +109,4 @@ test("loadConfig reads YAML and reports the file in errors", () => {
   assert.throws(() => loadConfig(file, { env: {} }), new RegExp(file));
   assert.throws(() => loadConfig(join(dir, "gone.yaml")), /cannot read config/);
 });
+
