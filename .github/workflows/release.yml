@@ -44,6 +44,13 @@ jobs:
 
       - run: npm ci
 
+      # Trusted publishing needs npm >= 11.5.1, and setup-node ships whatever npm
+      # came with the Node line -- 10.x on Node 22. Without this the OIDC exchange
+      # is simply not implemented and the publish falls back to asking for a token
+      # that may not exist.
+      - name: npm new enough to publish without a token
+        run: npm install -g npm@^11.5.1
+
       - name: The tag and package.json must agree
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -56,9 +63,21 @@ jobs:
 
       - run: npm test
 
-      # `--provenance` needs id-token: write above. It publishes a signed
-      # statement of where the tarball came from, which npm shows on the package
-      # page. Free, and the whole point of building in the open.
+      # Two ways to be allowed to publish, and the job takes whichever is set up.
+      #
+      # TRUSTED PUBLISHING (preferred, nothing to store): npm exchanges the
+      # workflow's OIDC token for a short-lived credential. It requires
+      # `id-token: write` above, npm >= 11.5.1, and a trusted publisher configured
+      # on the package's npmjs.com settings naming this repository AND this file
+      # by name -- `release.yml`. Rename this file and publishing stops working
+      # until the setting is updated, which is the point of it.
+      #
+      # NPM_TOKEN (fallback): a repository secret. Works everywhere, but it is a
+      # long-lived credential sitting in a settings page.
+      #
+      # `--provenance` is independent of both: a signed statement of which commit
+      # and which workflow produced this tarball, shown on the npm page. Free on a
+      # public repository, and the reason to build in the open at all.
       - name: Publish to npm
         run: npm publish --provenance --access public
         env:
