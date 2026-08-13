@@ -88,7 +88,13 @@ export function createServer(config, { agents, log = () => {} } = {}) {
         // Logged, because whether the agent ever ARRIVES here is the first question
         // asked when a caller's tools do not show up, and answering it by reasoning
         // about someone else's MCP client is guesswork.
-        log("info", `mcp: ${message?.method ?? "?"} [${mcp[1].slice(0, 8)}]`);
+        // The tool's NAME on a call, not just the method. Whether an agent reaches
+        // for a caller's tool when it already has a native one of its own is a
+        // question about cost -- a call through here ends the completion and comes
+        // back as another request, where its own costs nothing -- and it is not a
+        // question anyone should answer by guessing.
+        const named = message?.method === "tools/call" ? ` ${message?.params?.name}` : "";
+        log("info", `mcp: ${message?.method ?? "?"}${named} [${mcp[1].slice(0, 8)}]`);
         const answer = await tools.handle(mcp[1], message);
         // A notification takes no reply at all.
         if (!answer) {
