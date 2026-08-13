@@ -280,6 +280,34 @@ test("an injection that finds no running turn is refused, never run", async (t) 
   assert.equal((await res.json()).error.code, "no_running_turn");
 });
 
+test("an agent that never claimed it can queue prompts is never given a second one", async (t) => {
+  // Measured the hard way: `codex-acp` does not know the word `promptQueueing`,
+  // and a second prompt into a session already prompting DEADLOCKS it -- the first
+  // request never resolves and the caller waits out its entire timeout, losing the
+  // turn's work. The capability was in the handshake the whole time.
+  const call = await start(t, {
+    server: { busy: "queue" },
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE], env: { NOQUEUE: "1" } }],
+  });
+  const ask = (content) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": "thread-a", "x-acp2api-inject": "1" },
+    });
+
+  const running = call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "SLOWTURN please" }] }),
+    headers: { "x-conversation-id": "thread-a" },
+  });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal((await ask("ALSO-THIS")).status, 409);
+
+  // And the turn it refused to join finishes normally, on its own.
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.match(answer, /SLOWTURN please/);
+  assert.ok(!answer.includes("ALSO-THIS"));
+});
+
 test("busy: fork keeps two concurrent turns apart, which is still the default", async (t) => {
   const call = await start(t);
   const ask = (content) =>

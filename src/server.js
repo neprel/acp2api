@@ -380,6 +380,17 @@ async function handleCompletion(req, res, registry, config, log, params, session
     // resending the transcript would ask the agent to answer it twice.
     const queued = await agent.inject(match.session, toPromptBlocks(turns.slice(-1)));
     log("info", `${model}: ${queued ? "injected into" : "could not join"} the running turn [${callerKey}]`);
+    // A turn was running, and the agent still would not take it -- it never claimed
+    // it could queue prompts. Same answer as finding no turn at all, because it is
+    // the same fact for the caller: not this one, try the next.
+    if (!queued && injectOnly) {
+      clearTimeout(timer);
+      return send(
+        res,
+        409,
+        errorBody(`${model}: this agent cannot take a prompt mid-turn`, "no_running_turn"),
+      );
+    }
     // This request is answered NOW, so its deadline is over. Every other exit from
     // this function clears the timer in a `finally`; leaving here without doing so
     // held the timer -- and with it the whole event loop -- for the full request

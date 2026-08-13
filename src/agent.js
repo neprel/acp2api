@@ -654,7 +654,21 @@ export class Agent {
    */
   async inject(session, blocks) {
     if (!session?.queued) return false;
-    const { connection } = await Promise.resolve().then(() => this.#connect());
+    const { connection, init } = await Promise.resolve().then(() => this.#connect());
+    // ONLY an agent that says it can take a second prompt. This is not caution --
+    // it was learned by breaking a live turn.
+    //
+    // The behaviour was measured against `claude-agent-acp`, which advertises
+    // `promptQueueing`, and then used against `codex-acp`, which does not know the
+    // word: sending a second prompt into a session already prompting does not
+    // supersede anything there, it DEADLOCKS. The first request never resolves,
+    // the caller waits out its whole timeout -- 900 s on the deployment where this
+    // happened -- and the turn's work is lost with it.
+    //
+    // The capability was in the initialize handshake the entire time. Refusing
+    // here costs nothing: the caller learns the answer immediately and the message
+    // still reaches the agent the ordinary way, on its next turn.
+    if (!init?.agentCapabilities?._meta?.claudeCode?.promptQueueing) return false;
     const ctx = connection.agent;
     const p = ctx.request(acp.methods.agent.session.prompt, {
       sessionId: session.id,

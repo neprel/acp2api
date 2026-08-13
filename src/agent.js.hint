@@ -126,6 +126,16 @@ stop sequence in the reply.
 `inject` sends `session/prompt` on a session that is already prompting. What comes
 back is not an answer — it is whether the agent took it.
 
+**Only for an agent that ADVERTISES it.** `claude-agent-acp` does;
+`codex-acp` does not know the word, and sending a second prompt into a session
+already prompting does not supersede anything there — it **deadlocks**. The first
+request never resolves, the caller waits out its entire timeout (900 s on the
+deployment where this happened), and the turn's work is lost with it. Measured the
+hard way, on a live turn, after the feature had been built and shipped against one
+adapter's behaviour with the capability sitting unread in the handshake all along.
+`inject` refuses when it is absent, and refusing costs nothing: the message still
+reaches the agent the ordinary way, on its next turn.
+
 The contract, measured against `claude-agent-acp` on 2026-08-12 rather than assumed:
 
 - the agent advertises it as `agentCapabilities._meta.claudeCode.promptQueueing`;
@@ -226,6 +236,7 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 # test agent
 
 - a prompt is never queued into a session with no turn running
+- an agent that never claimed it can queue prompts is never given a second one
 
 - by default the agent's running commentary is part of the answer
 - `commentary: trace` moves what was said between tool calls into the reasoning

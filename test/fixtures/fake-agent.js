@@ -92,7 +92,15 @@ const app = acp
   .agent({ name: "fake-agent" })
   .onRequest(acp.methods.agent.initialize, () => ({
     protocolVersion: acp.PROTOCOL_VERSION,
-    agentCapabilities: { loadSession: false, sessionCapabilities: { close: {}, resume: {}, fork: {} } },
+    agentCapabilities: {
+      loadSession: false,
+      sessionCapabilities: { close: {}, resume: {}, fork: {} },
+      // Advertised the way `claude-agent-acp` advertises it. `NOQUEUE=1` drops it,
+      // so a test can prove the bridge refuses to inject into an agent that never
+      // said it could take a second prompt -- which is what `codex-acp` is, and
+      // what deadlocked a live turn for its whole 900-second timeout.
+      ...(process.env.NOQUEUE ? {} : { _meta: { claudeCode: { promptQueueing: true } } }),
+    },
     agentInfo: { name: "fake-agent", version: "1.0.0" },
   }))
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
