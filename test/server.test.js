@@ -1153,3 +1153,19 @@ test("server.tools off keeps the old behaviour: no MCP server is attached", asyn
   const body = await res.json();
   assert.match(body.choices[0].message.content, /NO-TOOL-SERVER/);
 });
+
+test("the MCP endpoint is reachable without the api key, because the agent has none", async (t) => {
+  // The agent is a child of this process and is never given the server's key; the
+  // token in the path is its credential. Putting this route behind the key gate --
+  // which is where it first landed -- makes every agent's connection a silent 401
+  // and the caller's tools simply never appear, with nothing in the log to say so.
+  const call = await start(t, { apiKey: "secret" });
+  const res = await call("/mcp/no-such-token", {
+    method: "POST",
+    headers: { authorization: "" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.error.message, "unknown tool session", "reached the bridge, not the api-key gate");
+});

@@ -86,20 +86,6 @@ export function createServer(config, { agents, log = () => {} } = {}) {
     const url = new URL(req.url, "http://localhost");
     try {
       if (url.pathname === "/health") return send(res, 200, { status: "ok", agents: [...registry.keys()] });
-      if (!authorized(req)) return send(res, 401, errorBody("invalid api key", "invalid_api_key", "authentication_error"));
-
-      if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-        return send(res, 200, {
-          object: "list",
-          data: [...registry.values()].map((a) => ({
-            id: a.name,
-            object: "model",
-            created: 0,
-            owned_by: a.spec.type,
-          })),
-        });
-      }
-
       // The MCP endpoint the AGENT connects to, not a client-facing route. It is
       // deliberately outside the api-key check above: the agent is a child of this
       // process, reached over loopback, and it is not given the key. The token in
@@ -118,6 +104,10 @@ export function createServer(config, { agents, log = () => {} } = {}) {
         } catch {
           return send(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
         }
+        // Logged, because whether the agent ever ARRIVES here is the first question
+        // asked when a caller's tools do not show up, and answering it by reasoning
+        // about someone else's MCP client is guesswork.
+        log("info", `mcp: ${message?.method ?? "?"} [${mcp[1].slice(0, 8)}]`);
         const answer = await tools.handle(mcp[1], message);
         // A notification takes no reply at all.
         if (!answer) {
@@ -126,6 +116,21 @@ export function createServer(config, { agents, log = () => {} } = {}) {
         }
         return send(res, 200, answer);
       }
+
+      if (!authorized(req)) return send(res, 401, errorBody("invalid api key", "invalid_api_key", "authentication_error"));
+
+      if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
+        return send(res, 200, {
+          object: "list",
+          data: [...registry.values()].map((a) => ({
+            id: a.name,
+            object: "model",
+            created: 0,
+            owned_by: a.spec.type,
+          })),
+        });
+      }
+
 
       if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
         return await handleCompletion(req, res, registry, config, log, params, sessions, tools, server);
