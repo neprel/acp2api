@@ -130,6 +130,45 @@ Verified on 2026-08-09 against `claude-agent-acp` 0.66.0 and `codex-acp` 1.1.14 
 running `initialize` + `session/new` and printing the response. Do that again rather
 than trusting this table: the model lists move every few weeks.
 
+The wider survey in [#agent_survey](#agent_survey) shows how far this table travels:
+the category names are consistent across vendors, but WHICH categories an agent
+publishes is not, and one of them appears only after a model has been chosen.
+
+# rule What the registry's 38 agents actually do {#agent_survey}
+
+Run on 2026-08-14 against the
+[ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json),
+which carries the exact package or signed archive and the exact argv per agent — so
+"does it work with this bridge" is answered by a loop rather than by 38 guesses.
+Each was installed and asked `initialize` + `session/new`; the ones that would take
+a model without an account were then driven through a real turn. The results are in
+the README. What belongs here is what they imply for this code.
+
+**`_meta.steering.supported` is advertised by three of thirty-eight** — Claude
+Agent, Codex and JetBrains Junie. `Agent#inject` already returns false without it,
+which is right, but it means `server.busy: queue` is a two-vendor feature and should
+be described as one rather than as a general capability.
+
+**`mcpCapabilities` is advertised and this bridge ignores it.** Agents publish
+`{http, sse}` at `initialize`; several publish neither, and Cline publishes no
+`mcpCapabilities` object at all. `#mcpFor` hands every configured server to
+`session/new` regardless of transport. Nothing has broken because of it yet, but an
+http server given to a stdio-only agent is a failure that could be caught at config
+time and is currently discovered at session time.
+
+**Authentication failures reach the caller as 500, and they are not server faults.**
+An agent that refuses `session/new` until its account is signed in is in a permanent
+state, not a transient one: a router reading 500 keeps that model in its failover
+chain and keeps paying the timeout. [#limit_detection](#limit_detection) already
+argues that status codes are the contract; this is the same argument for `-32000`
+auth errors, which want 401 or 403.
+
+**Two shapes of "not configured" look alike and are not.** `Failed to resolve
+provider: GOOSE_PROVIDER` is one config file away from working; `Authentication
+required: call authenticate` is an account nobody in this repository can create.
+Both arrive as `session/new` errors. Anything that classifies agents automatically
+has to separate them, and the only signal available is the message text.
+
 # bad Two failure modes that look like success {#silent_success}
 
 Both were found by running the thing, not by reading the code, and both would make a
