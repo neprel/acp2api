@@ -1127,6 +1127,75 @@ test("a tool result for a call nobody is waiting on is refused, not run as a new
   assert.equal(res.status, 200, "no turn was suspended, so this is an ordinary turn");
 });
 
+test("a finished tool turn releases the conversation, so the next message is not swallowed", async (t) => {
+  // The bug this pins: `busy` is set when a turn starts and cleared in that
+  // request's `finally`, but a tool turn ENDS in a different request -- the one
+  // carrying the last result -- and that path had no `finally` of its own. The
+  // conversation was left `busy: true, pending: null` with no live turn behind it.
+  //
+  // Nothing errored. Every later message took the busy/queue branch, `inject`
+  // refused because there was no running turn to join, and the bridge answered
+  // HTTP 200 with EMPTY TEXT -- which a client reads as the model saying nothing.
+  // Hermes retried three times and reported "the model returned no content",
+  // sending everyone to look at the model. Seen on a production agent 2026-08-15.
+  const call = await start(t, { server: { busy: "queue" } });
+  const ask = (messages) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages, tools: TOOLS }),
+      headers: { "x-conversation-id": "tools-busy" },
+    });
+
+  const first = await (await ask([{ role: "user", content: 'USETOOL read_file {"path":"x"}' }])).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+  const done = await (await ask([
+    { role: "user", content: 'USETOOL read_file {"path":"x"}' },
+    { role: "assistant", content: null, tool_calls: first.choices[0].message.tool_calls },
+    { role: "tool", tool_call_id: callId, content: "hello" },
+  ])).json();
+  assert.match(done.choices[0].message.content, /hello/, "the tool turn finished normally");
+
+  // THE ASSERTION. Same conversation key, ordinary next message. Before the fix
+  // this came back 200 with content "" -- a success carrying nothing.
+  const next = await (await ask([{ role: "user", content: "and now say plain" }])).json();
+  assert.notEqual(
+    next.choices[0].message.content.trim(),
+    "",
+    "an empty 200 here means the conversation was left busy with no turn behind it",
+  );
+});
+
+test("a turn suspended in a tool call is abandoned when the caller sends a new message instead", async (t) => {
+  // The other way a thread wedges, and this one is permanent by construction.
+  //
+  // A suspended turn waits for a tool result and has no other exit. When the
+  // caller stops sending results -- a client that gave up, an iteration budget
+  // that ran out INSIDE a tool call -- `pending` is never cleared, and every later
+  // message answers 409 "waiting for the result of a tool call" for the life of
+  // the process. `sessionTtlMs` does not help: a pending conversation is
+  // deliberately neither parked nor evicted. Seen on a production agent 2026-08-15,
+  // where one thread answered 409 for three hours while every other thread on the
+  // same agent worked normally.
+  //
+  // A request carrying NO tool messages is not a confused continuation, it is a
+  // new message; the suspended turn is abandoned and a fresh one starts. A request
+  // that does carry tool messages and matches none still gets the 409 -- that
+  // caller believes it is answering something, and saying so is the useful reply.
+  const call = await start(t);
+  const ask = (messages) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages, tools: TOOLS }),
+      headers: { "x-conversation-id": "tools-abandoned" },
+    });
+
+  const first = await (await ask([{ role: "user", content: 'USETOOL read_file {"path":"x"}' }])).json();
+  assert.equal(first.choices[0].finish_reason, "tool_calls", "a turn is now suspended");
+
+  const res = await ask([{ role: "user", content: "never mind, just say plain" }]);
+  assert.equal(res.status, 200, "a new message must not be answered with 409 forever");
+  const body = await res.json();
+  assert.notEqual(body.choices[0].message.content.trim(), "");
+});
+
 test("server.tools off keeps the old behaviour: no MCP server is attached", async (t) => {
   const call = await start(t, { server: { tools: "off" } });
   const res = await call("/v1/chat/completions", {

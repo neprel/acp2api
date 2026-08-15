@@ -86,6 +86,48 @@ They need opposite answers: a timeout owes the caller 504, a vanished client owe
 nothing. One flag for both produces a 504 written to a closed socket, or a silent
 200 for a request that timed out.
 
+## bad A conversation must always have a way OUT of a suspended turn {#suspended_turn_exits}
+Two wedges, both found in production on 2026-08-15 in acp2api 1.10.2, both fixed in
+1.10.3, and both worth stating together because they are the same omission: a tool
+turn ends in a DIFFERENT request from the one that started it, and the state that
+request set was left behind.
+
+**`busy` was never cleared by the request that finished the turn.** `setBusy(true)`
+happens where a turn starts and is cleared in that request's `finally`. The last
+tool-result request goes through `resumeToolCall`, which returned before ever
+reaching that `finally`. The conversation was left `busy: true, pending: null` with
+no live turn behind it.
+
+Nothing errored, which is what made it expensive. Every later message took the
+`match?.busy` branch, `agent.inject` refused because there was no running turn to
+join, and this server answered **HTTP 200 with empty text** — an honest-looking
+success. The caller (Hermes) retried three times and reported "the model returned
+no content", sending everyone to look at the model.
+
+**`pending` had no exit but a matching tool result.** If the caller stops sending
+results — a client that gave up, an iteration budget that ran out INSIDE a tool
+call — `resumeToolCall` answers every later message with
+
+```
+409 this conversation is waiting for the result of a tool call;
+    none of the tool messages sent match it
+```
+
+for the life of the process. `sessionTtlMs` does not help: a pending conversation
+is deliberately neither parked nor evicted. One Mattermost thread answered 409 for
+three hours while every other thread on the same agent worked normally.
+
+The rule now: **a request carrying NO tool messages is a new message, not a
+confused continuation.** It abandons the suspended turn — `discard`, because the
+ACP session on the other side is still inside its own tool call and handing it a
+fresh prompt asks it to do two things at once — and starts fresh. A request that
+DOES carry tool messages and matches none still gets the 409; that caller believes
+it is answering something, and saying so is the useful reply.
+
+Both are pinned by regression tests that were each shown to fail with only their
+own fix reverted. Do not take a passing suite as evidence here — the bug's whole
+signature is a 200.
+
 # rule Streaming headers are withheld until the agent produces something {#defer_headers}
 
 `start()` runs on the first streamed event, not before the turn. Committing to

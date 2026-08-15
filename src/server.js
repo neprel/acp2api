@@ -455,7 +455,9 @@ async function handleCompletion(req, res, registry, config, log, params, session
   const callerKey = config.server.conversationHeader
     ? String(req.headers[config.server.conversationHeader] ?? "").trim().slice(0, 512)
     : "";
-  const match = !config.server.continuity
+  // `let`, not `const`: the suspended-turn branch below abandons a wedged
+  // conversation and continues as if nothing had matched.
+  let match = !config.server.continuity
     ? null
     : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
       sessions.matchPrefix(model, systemId, prefix);
@@ -465,10 +467,40 @@ async function handleCompletion(req, res, registry, config, log, params, session
   // prompt building, `agent.turn` -- belongs to starting a turn, and none of it
   // applies: the turn is already running and simply needs its answer.
   if (match?.pending) {
-    return await resumeToolCall({
-      req, res, match, sessions, tools, config, log, model, meta, stream,
-      includeUsage, toolResults, timer, ignored: reported,
-    });
+    // ... unless the caller is plainly not answering it.
+    //
+    // A suspended turn waits for a tool result and has no other way out. If the
+    // caller stops sending results -- a client that gave up mid-turn, an
+    // iteration budget that ran out inside a tool call -- the conversation keeps
+    // `pending` forever, and `resumeToolCall` answers every later message with
+    //
+    //   409 this conversation is waiting for the result of a tool call;
+    //       none of the tool messages sent match it
+    //
+    // for the life of the process. `sessionTtlMs` does not help: a pending
+    // conversation is deliberately neither parked nor evicted. Seen on
+    // a production agent 2026-08-15, where one Mattermost thread answered 409 for
+    // three hours while every other thread on the same agent worked.
+    //
+    // A request carrying NO tool messages at all is not a confused continuation,
+    // it is a new message. Abandon the suspended turn and start a fresh one. A
+    // request that does carry tool messages and simply matches none still gets
+    // the 409 -- that caller believes it is answering something, and telling it
+    // otherwise is the useful reply.
+    if (toolResults.length === 0) {
+      log("warn", `${model}: abandoning a turn suspended in a tool call -- the caller sent a new message instead of results${callerKey ? ` [${callerKey}]` : ""}`);
+      // `discard`, not just clearing the two flags: the ACP session on the other
+      // side is still suspended inside its own tool call, and handing it a fresh
+      // prompt asks it to do two things at once. Closing it costs the thread's
+      // context, which the abandoned turn had already lost.
+      await sessions.discard(match.convId, registry);
+      match = null;
+    } else {
+      return await resumeToolCall({
+        req, res, match, sessions, tools, config, log, model, meta, stream,
+        includeUsage, toolResults, timer, ignored: reported,
+      });
+    }
   }
 
   // "Join a turn already running, or do nothing." A caller that cannot know which
@@ -976,6 +1008,29 @@ async function settleToolTurn(o) {
  * still inside the call it made, and all it needs is the result.
  */
 async function resumeToolCall(o) {
+  const { match, tools, toolResults, sessions } = o;
+  // The turn that ends HERE was started by a different request, and that request's
+  // `finally` -- the one that clears `busy` -- ran long ago, while the turn was
+  // still suspended and correctly still busy. This path is the only place that can
+  // clear it, and until 1.10.3 it did not: a conversation whose tool turn had
+  // finished was left `busy: true, pending: null` with no live turn behind it.
+  //
+  // What that looked like was not an error. Every later message took the
+  // `match?.busy` branch, `agent.inject` refused because there was no running turn
+  // to join, and the bridge answered HTTP 200 with empty text -- an honest-looking
+  // success. Hermes retried it three times and reported "the model returned no
+  // content", which reads like a model fault. Seen on a production agent 2026-08-15.
+  //
+  // The condition matches the other `finally` exactly: still pending means the turn
+  // asked for more tools and is genuinely still running.
+  try {
+    return await resumeToolCallInner(o);
+  } finally {
+    if (match.convId && !sessions.isPending(match.convId)) sessions.setBusy(match.convId, false);
+  }
+}
+
+async function resumeToolCallInner(o) {
   const { match, tools, toolResults, sessions } = o;
   const pending = match.pending;
   const answered = toolResults.filter((r) => tools.resolve(pending.bench, r.id, r.text));
