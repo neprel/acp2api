@@ -16,6 +16,7 @@ import {
 import { parseResponsesRequest, responseObject, ResponseStream } from "./responses.js";
 import { commonPrefix, conversationKey, fingerprint, newResponseId, SessionStore } from "./sessions.js";
 import { ToolBridge } from "./mcp.js";
+import { Metrics } from "./metrics.js";
 import { toolCallCompletion } from "./openai.js";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -45,15 +46,22 @@ function readBody(req) {
  * anything; in production it is built from the config.
  */
 export function createServer(config, { agents, log = () => {} } = {}) {
+  // Built whether or not anything scrapes it: recording is cheap, and an operator
+  // who turns `metricsAddr` on wants the counters to have been running, not to
+  // start from zero at the moment they looked.
+  const metrics = new Metrics({
+    agentLabels: Object.fromEntries(config.agents.map((a) => [a.name, a.labels ?? {}])),
+  });
   const registry =
     agents ??
-    new Map(config.agents.map((spec) => [spec.name, new Agent(spec, config.server, log)]));
+    new Map(config.agents.map((spec) => [spec.name, new Agent(spec, config.server, log, metrics)]));
   const params = new ParamReporter(config.server.unsupportedParams, log);
   const sessions = new SessionStore({
     max: config.server.maxSessions,
     ttlMs: config.server.sessionTtlMs,
     forgetTtlMs: config.server.forgetTtlMs,
     maxContextFill: config.server.maxContextFill,
+    metrics,
     log,
   });
   // The caller's own tools, served to agents as an MCP server on this same port.
@@ -149,6 +157,10 @@ export function createServer(config, { agents, log = () => {} } = {}) {
       else res.end();
     }
   });
+
+  // Handed to the caller so the process can start the metrics listener and so a
+  // test can read the registry without a socket.
+  server.metrics = metrics;
 
   server.on("close", async () => {
     // Retained sessions first: each is a live login, and closing the agent out from
@@ -1080,10 +1092,33 @@ function settleUsage(sessions, convId, turn) {
   // How full the window is describes the SESSION, so it is recorded even when the
   // turn reported no token counts at all.
   if (turn.context) sessions.rememberContext(convId, turn.context);
-  if (!turn.usage) return turn;
-  const usage = deltaUsage(turn.usage, sessions.usageBaseline(convId));
-  sessions.rememberUsage(convId, turn.usage);
-  return { ...turn, usage };
+  // Cost is cumulative for the SESSION exactly like the token counters, so it is
+  // settled the same way and in the same place. A figure that moved backwards is
+  // read as the agent re-basing its own accounting, not as a refund.
+  let cost = turn.cost;
+  if (Number.isFinite(cost?.amount)) {
+    const before = sessions.costBaseline(convId)?.amount ?? 0;
+    sessions.rememberCost(convId, cost);
+    cost = { ...cost, amount: cost.amount >= before ? cost.amount - before : cost.amount };
+  }
+  let usage;
+  if (turn.usage) {
+    usage = deltaUsage(turn.usage, sessions.usageBaseline(convId));
+    sessions.rememberUsage(convId, turn.usage);
+  }
+  // Metrics are recorded HERE, and only here, for the same reason the settling is:
+  // this function runs exactly once per turn and holds the only per-turn figures
+  // that exist. Recording at the five call sites instead would be five chances to
+  // forget one, and recording before the settling would export the whole
+  // conversation's spend on every turn.
+  sessions.metrics?.recordUsage({
+    agent: sessions.agentOf(convId),
+    usage,
+    cost,
+    context: turn.context,
+  });
+  if (!usage) return { ...turn, cost };
+  return { ...turn, usage, cost };
 }
 
 const finishOf = (stopReason) =>

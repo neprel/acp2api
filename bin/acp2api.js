@@ -2,7 +2,9 @@
 import { mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { ConfigError, loadConfig } from "../src/config.js";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "../src/server.js";
+import { metricsServer } from "../src/metrics.js";
 
 const USAGE = `acp2api -- OpenAI-compatible HTTP server over ACP coding agents
 
@@ -72,11 +74,26 @@ server.listen(config.server.port, config.server.host, () => {
   }
 });
 
+// Metrics get their own listener, because the two ports answer different questions
+// for different audiences: the API is unauthenticated and belongs on loopback, and
+// a scraper has to reach the other one from somewhere else. Off unless asked for.
+let metrics = null;
+if (config.server.metricsAddr !== "off") {
+  const cut = config.server.metricsAddr.lastIndexOf(":");
+  const mHost = config.server.metricsAddr.slice(0, cut);
+  const mPort = Number(config.server.metricsAddr.slice(cut + 1));
+  metrics = metricsServer(server.metrics, { createServer: createHttpServer });
+  metrics.listen(mPort, mHost, () => {
+    log("info", `metrics on http://${config.server.metricsAddr}/metrics`);
+  });
+}
+
 // Agents are child processes: leaving them behind on shutdown leaks a CLI holding
 // an authenticated session, so close the server (which closes them) and only then exit.
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
     log("info", `${signal} -- shutting down`);
+    metrics?.close();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 10_000).unref();
   });

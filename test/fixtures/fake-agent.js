@@ -84,7 +84,11 @@ function chargeTurn(state) {
   u.thoughtTokens += 3;
   if (state.turns === 1) u.cachedWriteTokens += 11;
   else u.cachedReadTokens += 10;
-  u.totalTokens = u.inputTokens + u.outputTokens;
+  // `inputTokens` is the FRESH input -- both real adapters exclude cache reads from
+  // it -- so the session total has to add them back or it under-counts every turn
+  // that hit the cache. Checked against a real codex turn: its own accounting
+  // reported total = (input including cached) + output.
+  u.totalTokens = u.inputTokens + u.cachedReadTokens + u.outputTokens;
   return { ...u };
 }
 

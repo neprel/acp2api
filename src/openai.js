@@ -292,21 +292,39 @@ export function deltaUsage(usage, before) {
 
 /**
  * One turn's counters in OpenAI's shape. `null` when the agent omits usage -- it is
- * an unstable part of the spec and most agents do.
+ * an unstable part of the spec and not every agent sends it.
  *
  * `cached_tokens` is the only evidence a caller ever gets that continuing a session
- * saved anything, so it is reported whenever the agent supplies it. It is a SUBSET
- * of `prompt_tokens` in OpenAI's model, not an addition to it.
+ * saved anything, so it is reported whenever the agent supplies it.
+ *
+ * THE TWO MODELS DISAGREE ABOUT WHAT "INPUT" MEANS, and getting it wrong is silent.
+ * ACP's `inputTokens` is the FRESH input, and both adapters compute it that way:
+ * codex-acp writes `usage.inputTokens - usage.cachedInputTokens`, claude-agent-acp
+ * accumulates Anthropic's `input_tokens`, which excludes cache reads by the same
+ * convention. OpenAI's `prompt_tokens` is the WHOLE input, with
+ * `prompt_tokens_details.cached_tokens` naming the part of it that was served from
+ * cache -- a subset, not an addition.
+ *
+ * So the cached reads are added back. Measured on a real codex turn before this was
+ * fixed: codex's own accounting said 13,830 input of which 11,008 cached, and this
+ * bridge reported `prompt_tokens: 2822` alongside `cached_tokens: 11008` -- a subset
+ * larger than the set it belongs to, input understated 4.9x, and
+ * `prompt_tokens + completion_tokens != total_tokens` for anyone who checked.
+ *
+ * Cache WRITES are not added back. They are a separate charge in both models rather
+ * than part of what reading the prompt cost, and the agent has already counted them
+ * in `totalTokens`.
  */
 function toUsage(usage) {
   if (!usage) return null;
   const details = {};
   if (usage.cachedReadTokens != null) details.cached_tokens = usage.cachedReadTokens;
   if (usage.cachedWriteTokens != null) details.cache_creation_tokens = usage.cachedWriteTokens;
+  const promptTokens = (usage.inputTokens ?? 0) + (usage.cachedReadTokens ?? 0);
   return {
-    prompt_tokens: usage.inputTokens ?? 0,
+    prompt_tokens: promptTokens,
     completion_tokens: usage.outputTokens ?? 0,
-    total_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+    total_tokens: usage.totalTokens ?? promptTokens + (usage.outputTokens ?? 0),
     ...(Object.keys(details).length > 0 ? { prompt_tokens_details: details } : {}),
     ...(usage.thoughtTokens != null
       ? { completion_tokens_details: { reasoning_tokens: usage.thoughtTokens } }

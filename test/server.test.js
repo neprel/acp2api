@@ -26,7 +26,10 @@ async function start(t, { agents, specs, server: serverOpts } = {}) {
     lines.push(line);
     for (const l of [...listeners]) l(line);
   };
-  const registry = agents ?? new Map(config.agents.map((s) => [s.name, new Agent(s, config.server, log)]));
+  // `undefined` on purpose when a test does not inject: createServer then builds the
+  // registry itself, which is the only path where an Agent is handed the metrics it
+  // records outcomes into.
+  const registry = agents ?? (specs ? undefined : new Map(config.agents.map((s) => [s.name, new Agent(s, config.server, log)])));
   const server = createServer(config, { agents: registry, log });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   t.after(() => {
@@ -79,6 +82,9 @@ async function start(t, { agents, specs, server: serverOpts } = {}) {
       listeners.add(listener);
     });
 
+  // The registry the server actually recorded into, so a test can assert on the
+  // exported numbers rather than on a socket.
+  call.metrics = server.metrics;
   return call;
 }
 
@@ -445,9 +451,16 @@ test("a continued conversation bills each turn, not the session so far", async (
 
   assert.equal(first.prompt_tokens, 11);
   assert.equal(first.completion_tokens, 22);
-  assert.equal(second.prompt_tokens, 11, "turn two must not re-bill turn one's input");
+  // Turn two's prompt is 11 fresh tokens plus the 10 the fixture served from cache.
+  // What must NOT appear is turn one's 11 charged a second time.
+  assert.equal(second.prompt_tokens, 21, "turn two must not re-bill turn one's input");
   assert.equal(second.completion_tokens, 22);
-  assert.equal(second.total_tokens, 33);
+  assert.equal(second.total_tokens, 43);
+  assert.equal(
+    second.prompt_tokens + second.completion_tokens,
+    second.total_tokens,
+    "the parts must add up to the total, or every consumer picks a different answer",
+  );
 });
 
 test("cache reads reach the caller, because they are the only proof continuity paid off", async (t) => {
@@ -1318,4 +1331,53 @@ test("a tool-enabled turn streams its trace as it happens, not in one piece at t
     "the reasoning channel must reach the caller while the turn runs",
   );
   assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+});
+
+test("a real turn lands in the metrics, settled rather than cumulative", async (t) => {
+  // `specs` rather than an injected registry, so createServer builds the Agents --
+  // that is the only path on which an Agent is given the metrics to record into.
+  const call = await start(t, {
+    specs: [
+      {
+        name: "fake",
+        type: "general",
+        command: process.execPath,
+        args: [FIXTURE],
+        labels: { account: "test-account" },
+      },
+    ],
+  });
+  const ask = (content) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": "thread-metrics" },
+    });
+
+  await ask("one");
+  await ask("two");
+  const text = call.metrics.render();
+  const value = (re) => Number(text.match(re)?.[1]);
+
+  // The fixture charges 11 input per turn and reports a growing SESSION total. Two
+  // turns is 22 -- 33 would mean the cumulative counters were exported raw.
+  assert.equal(value(/acp2api_tokens_total\{[^}]*kind="input"\} (\d+)/), 22);
+  assert.equal(value(/acp2api_tokens_total\{[^}]*kind="output"\} (\d+)/), 44);
+  // Only the second turn reads cache, so this proves per-turn deltas rather than
+  // "the same number twice".
+  assert.equal(value(/acp2api_tokens_total\{[^}]*kind="cached_read"\} (\d+)/), 10);
+  assert.equal(value(/acp2api_turns_total\{[^}]*outcome="ok"\} (\d+)/), 2);
+  assert.equal(value(/acp2api_usage_reported_total\{[^}]*\} (\d+)/), 2);
+  // The operator's label is on the samples, which is the whole account story.
+  assert.ok(text.includes('account="test-account"'));
+});
+
+test("a rate-limited turn is counted as one, and not as an error", async (t) => {
+  const call = await start(t, {
+    specs: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
+  });
+  const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "QUOTA" }] }));
+  assert.equal(res.status, 429);
+  const text = call.metrics.render();
+  assert.match(text, /acp2api_turns_total\{agent="fake",outcome="rate_limited"\} 1/);
+  assert.ok(!/outcome="ok"/.test(text), "a refused turn is not also a successful one");
 });

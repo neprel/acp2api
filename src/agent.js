@@ -70,11 +70,16 @@ export class Agent {
   // Null until something asks for a session, and only ever set when `warmup` is
   // configured. See #warmBase.
   #base = null;
+  #metrics = null;
 
-  constructor(spec, server, log = () => {}) {
+  constructor(spec, server, log = () => {}, metrics = null) {
     this.#spec = spec;
     this.#server = server;
     this.#log = log;
+    // Optional. `turn()` is the one funnel every caller path goes through, so it is
+    // the only place that sees a FAILED turn as well as a finished one -- and a
+    // rate-limited turn is the single quota signal ACP offers for any agent.
+    this.#metrics = metrics;
     if (server.terminal) {
       this.#terminals = new Terminals({
         cwd: spec.cwd,
@@ -521,6 +526,16 @@ export class Agent {
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
+    // Outside the try on purpose: `catch` and `finally` both read them, and a
+    // declaration inside the block is invisible there. Getting this wrong turns a
+    // clean 429 into a 500, which is the difference between a router trying the
+    // next brain and a router calling it a crash.
+    const startedAt = Date.now();
+    // Overwritten by the catch. A turn that reaches the end of the try answered,
+    // whatever its stop reason -- "ok" means the bridge did its job, not that the
+    // agent liked the question.
+    let outcome = "ok";
+
     try {
       if (overrides) await this.#applyOptions(ctx, session, overrides);
 
@@ -550,6 +565,7 @@ export class Agent {
       // receives as the assistant's message, which is not a display preference.
       const asTrace = this.#server.commentary === "trace";
       let context = null; // {used, size} from the last usage_update, if any
+      let cost = null; // {amount, currency} from the last usage_update, if any
 
       // Updates arrive as notifications on the same stream as the response, and
       // JSON-RPC keeps them in order, so everything the agent sent before it
@@ -612,11 +628,20 @@ export class Agent {
         } else if (progress && (u.sessionUpdate === "plan" || u.sessionUpdate === "plan_update")) {
           const note = progress.note(u);
           if (note) narrate(note);
-        } else if (u.sessionUpdate === "usage_update" && Number.isFinite(u.size) && u.size > 0) {
-          // The only signal before a session runs out of context for good. Kept as
-          // the last reading rather than the largest: a compaction genuinely shrinks
-          // it, and a session that just compacted has room again.
-          context = { used: Number(u.used) || 0, size: Number(u.size) };
+        } else if (u.sessionUpdate === "usage_update") {
+          if (Number.isFinite(u.size) && u.size > 0) {
+            // The only signal before a session runs out of context for good. Kept as
+            // the last reading rather than the largest: a compaction genuinely shrinks
+            // it, and a session that just compacted has room again.
+            context = { used: Number(u.used) || 0, size: Number(u.size) };
+          }
+          // Real money, when the agent knows it. claude-agent-acp sends Claude Code's
+          // `total_cost_usd` here; codex-acp declares the field and never fills it.
+          // CUMULATIVE for the session like the token counters, so it is settled into
+          // a per-turn delta by the same baseline -- see `settleUsage` in server.js.
+          if (Number.isFinite(u.cost?.amount)) {
+            cost = { amount: Number(u.cost.amount), currency: u.cost.currency ?? null };
+          }
         }
       };
 
@@ -652,10 +677,25 @@ export class Agent {
         // rather than the turn, and it is the only warning anyone gets before the
         // agent runs out of context for good.
         context,
+        // Cumulative session cost, when the agent reports one. Also kept out of the
+        // OpenAI response -- there is no field for it there -- and settled into a
+        // per-turn delta for whoever is counting.
+        cost,
       };
     } catch (e) {
-      throw this.#classify(e);
+      const err = this.#classify(e);
+      // The outcome vocabulary is the STATUS CONTRACT this bridge already publishes
+      // to a failover chain -- 429 try the next brain, 502 fault, 503 could not
+      // spawn, 504 no answer. Naming outcomes after it means the metric and the
+      // router agree about what happened, instead of inventing a second taxonomy.
+      outcome = { 429: "rate_limited", 401: "unauthenticated", 499: "cancelled", 503: "unavailable", 504: "timeout" }[err.status] ?? "error";
+      throw err;
     } finally {
+      this.#metrics?.recordOutcome({
+        agent: this.name,
+        outcome,
+        seconds: (Date.now() - startedAt) / 1000,
+      });
       // Stop reading this session's updates. Leaving the sink in place would let a
       // late chunk from this turn land in the next one's accumulator.
       this.#sinks.delete(session.id);

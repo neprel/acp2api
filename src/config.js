@@ -65,6 +65,16 @@ const DEFAULTS = {
   // announced at startup, because it is worth seeing once.
   host: "127.0.0.1",
   port: 10021,
+  // Prometheus metrics, on an address of their own: "off", or "host:port".
+  //
+  // A SECOND listener rather than a route on the API port, for two reasons. The API
+  // has no authentication of its own and stays on loopback; metrics have to be
+  // reachable by a scraper, and those are different exposure decisions that should
+  // not be forced to agree. And a scrape every 15s should not share a socket with
+  // turns that run for minutes.
+  //
+  // Off by default -- a bridge that opens a port nobody asked for is a surprise.
+  metricsAddr: "off",
   cwd: ".",
   requestTimeoutMs: 600_000,
   permission: "allow",
@@ -296,6 +306,10 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
 
   req(Number.isInteger(s.port) && s.port > 0 && s.port < 65536, `server.port must be a port number, got ${s.port}`);
   req(typeof s.host === "string" && s.host.length > 0, "server.host must be a non-empty string");
+  req(
+    typeof s.metricsAddr === "string" && (s.metricsAddr === "off" || /^\S+:\d+$/.test(s.metricsAddr)),
+    `server.metricsAddr must be "off" or "host:port", got ${s.metricsAddr}`,
+  );
   req(["allow", "deny"].includes(s.permission), `server.permission must be "allow" or "deny", got ${s.permission}`);
   req(
     ["ignore", "warn", "error"].includes(s.unsupportedParams),
@@ -410,7 +424,31 @@ function normalizeAgent(a, i, server, seen) {
     options: a.options ?? {},
     mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
     description: a.description ?? "",
+    // Operator labels, attached to every metric this agent produces.
+    //
+    // The reason this is free-form rather than a set of named fields is `account`.
+    // Which subscription an agent spends is a property of the login in the home
+    // directory it was spawned with -- no ACP message reports it, and no amount of
+    // probing would make it authoritative. Only the operator knows, so the operator
+    // declares it. Having admitted that, `plan`, `owner`, `host` and whatever comes
+    // next cost nothing more.
+    labels: normalizeLabels(a.labels, `${at}.labels`),
   };
+}
+
+/** Labels must be safe to render into the exposition format, so they are checked here. */
+function normalizeLabels(labels, at) {
+  if (labels === undefined) return {};
+  req(labels && typeof labels === "object" && !Array.isArray(labels), `${at} must be a mapping`);
+  const out = {};
+  for (const [k, v] of Object.entries(labels)) {
+    req(/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k), `${at}.${k} is not a valid metric label name`);
+    // `agent` and `model` are set from the turn itself; letting a label overwrite
+    // them would make one agent's samples indistinguishable from another's.
+    req(k !== "agent" && k !== "model", `${at}.${k} is reserved`);
+    out[k] = String(v);
+  }
+  return out;
 }
 
 /**

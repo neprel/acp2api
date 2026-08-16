@@ -183,11 +183,44 @@ test("cache counters map onto prompt_tokens_details", () => {
     created: 7,
     text: "x",
     stopReason: "end_turn",
-    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33, cachedReadTokens: 9, cachedWriteTokens: 2 },
+    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 42, cachedReadTokens: 9, cachedWriteTokens: 2 },
   });
-  // A subset of prompt_tokens in OpenAI's model, not an addition to it.
   assert.deepEqual(c.usage.prompt_tokens_details, { cached_tokens: 9, cache_creation_tokens: 2 });
+  // ACP's inputTokens is the FRESH input; OpenAI's prompt_tokens is the whole of it,
+  // with cached_tokens naming the cached PART. So the cached reads are added back.
+  assert.equal(c.usage.prompt_tokens, 20);
+});
+
+test("cached_tokens is a subset of prompt_tokens, never larger than it", () => {
+  // The shape a real codex turn produced before this was fixed: 13,830 input of
+  // which 11,008 came from cache. codex-acp sends the difference as inputTokens.
+  const c = completion({
+    id: "c1",
+    model: "m",
+    created: 7,
+    text: "x",
+    stopReason: "end_turn",
+    usage: { inputTokens: 2822, outputTokens: 5, totalTokens: 13835, cachedReadTokens: 11008 },
+  });
+  assert.equal(c.usage.prompt_tokens, 13830);
+  assert.ok(
+    c.usage.prompt_tokens_details.cached_tokens <= c.usage.prompt_tokens,
+    "cached_tokens must be a subset of prompt_tokens",
+  );
+  assert.equal(c.usage.prompt_tokens + c.usage.completion_tokens, c.usage.total_tokens);
+});
+
+test("an agent that reports no cache leaves prompt_tokens as the input it sent", () => {
+  const c = completion({
+    id: "c1",
+    model: "m",
+    created: 7,
+    text: "x",
+    stopReason: "end_turn",
+    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33 },
+  });
   assert.equal(c.usage.prompt_tokens, 11);
+  assert.equal(c.usage.prompt_tokens_details, undefined);
 });
 
 test("deltaUsage subtracts the totals a session already reported", () => {

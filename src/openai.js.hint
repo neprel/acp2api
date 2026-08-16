@@ -102,10 +102,29 @@ A counter that moved BACKWARDS is read as the counter itself, not as a negative
 delta: that means the agent re-based its own accounting, and no consumer can do
 anything with a negative token count.
 
-`cachedReadTokens` is reported as `prompt_tokens_details.cached_tokens` — a subset
-of `prompt_tokens` in OpenAI's model, not an addition to it. It is the only
-evidence a caller ever gets that continuing a session saved anything, which is why
-it is worth carrying at all.
+# bad The two models disagree about what "input" means {#cached_is_a_subset}
+
+Fixed on 2026-08-16, after a live codex turn reported `cached_tokens: 11008` next
+to `prompt_tokens: 2822` — a subset larger than the set it belongs to.
+
+**ACP's `inputTokens` is the FRESH input.** Both adapters compute it that way:
+`codex-acp` writes `usage.inputTokens - usage.cachedInputTokens`, and
+`claude-agent-acp` accumulates Anthropic's `input_tokens`, which excludes cache
+reads by the same convention. **OpenAI's `prompt_tokens` is the WHOLE input**, with
+`prompt_tokens_details.cached_tokens` naming the cached PART of it.
+
+So `toUsage` adds the cached reads back. Before that, codex's own accounting said
+13,830 input of which 11,008 cached, and this bridge reported 2,822 — input
+understated 4.9x, and `prompt_tokens + completion_tokens != total_tokens` for
+anyone who checked. Nothing errored; the numbers were simply wrong, which is the
+only way this class of bug ever presents.
+
+Cache WRITES are NOT added back: a separate charge in both models rather than part
+of what reading the prompt cost, and already counted in `totalTokens` by the agent.
+
+The test fixture models the same arithmetic (`totalTokens = input + cachedRead +
+output`). If it is ever "simplified" back to `input + output`, the regression test
+passes while production is wrong again.
 
 # rule Response builders never invent fields {#response_shape}
 

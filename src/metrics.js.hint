@@ -1,0 +1,113 @@
+# goal src/metrics.js
+
+What this bridge spent, in the one format that scrapes. Off unless
+`server.metricsAddr` names an address.
+
+# decision The bridge is the measuring point, not the agents {#why_here}
+
+Every coding CLI has its own telemetry and no two are alike. codex exports
+`codex.turn.token_usage` over OTLP if you write an `[otel]` block into its
+`config.toml`; Claude Code exports `claude_code.token.usage` if you set
+`CLAUDE_CODE_ENABLE_TELEMETRY` and three `OTEL_*` variables. Different mechanism,
+different metric namespace, different labels, different lifecycle — per agent,
+repeated for every agent added later. The registry lists thirty-eight.
+
+This bridge is the one component all of them pass through, and it ALREADY
+normalizes their counters: `Usage` off the `session/prompt` response, turned from
+session-cumulative into per-turn by `deltaUsage`. So exporting from here is one
+mechanism and one label set for every agent alike, and an agent added tomorrow is
+measured on the day it is added rather than when someone gets round to wiring its
+vendor's exporter.
+
+**No dependency.** The Prometheus text format is a line per sample. A client
+library would be a fifth package to concatenate strings — see [#deps](../_.hint).
+
+# rule Where each number is recorded, and why not anywhere else {#record_sites}
+
+Two call sites, and the split is not arbitrary.
+
+| what | where | why there |
+| --- | --- | --- |
+| `turns_total`, `turn_duration_seconds` | `Agent#turn` | the one funnel every caller path goes through, and the ONLY place that sees a turn that threw |
+| tokens, cost, context fill | `settleUsage` in server.js | runs exactly once per turn and holds the only per-turn figures that exist |
+
+`settleUsage` reaches the recorder as `sessions.metrics?.` rather than taking it as
+an argument, because there are five call sites for it and threading a parameter
+through all five is five chances to miss one. The store already owns the
+per-conversation baselines and the agent name, which is exactly what a per-turn
+sample is made of.
+
+Recording BEFORE the settling would export the whole conversation's spend on every
+turn — that is [#usage_is_cumulative](openai.js.hint), one layer down.
+
+`outcome` is named after the STATUS CONTRACT this bridge already publishes to a
+failover chain — `rate_limited`, `unauthenticated`, `cancelled`, `unavailable`,
+`timeout`, `error` — so the metric and the router agree about what happened instead
+of inventing a second taxonomy. See [#limit_detection](../_.hint).
+
+# invariant Silence must not read as zero {#unmeasured_not_free}
+
+`turns_total` is incremented for every turn. `tokens_total` and
+`usage_reported_total` only when the agent reported counts, and no zero-valued
+series is emitted in their place.
+
+That gap IS the signal. An agent whose turns climb while its tokens stay flat is
+not a cheap agent, it is an unmeasured one, and a dashboard that showed it as `0`
+would be confidently wrong. Do not "fix" the missing series by initialising
+counters to zero.
+
+# bad Two labels that must never be added {#label_hazards}
+
+- **A conversation id.** Unbounded cardinality — the entire point of a conversation
+  here is that there can be arbitrarily many, and each one is short-lived.
+- **A second identity column.** In this bridge the OpenAI `model` IS the agent name,
+  so a `model` label would repeat `agent` exactly. Which CLI sits behind the name is
+  worth knowing and is what the operator's own labels are for. `agent` and `model`
+  are rejected as operator label names at config time for the same reason.
+
+# rule Operator labels are declared, not discovered {#operator_labels}
+
+`labels:` on an agent is a free-form map merged into every sample that agent
+produces. It exists for `account`.
+
+Which subscription an agent spends is a property of the login in the home directory
+it was spawned with. No ACP message reports it; no probe would make it
+authoritative; and two agents may legitimately share one account while two others
+do not. Only the operator knows, so the operator declares it — and having accepted
+a declared value, `plan`, `owner`, `host` and whatever comes next cost nothing
+further.
+
+Values are escaped for the exposition format (`\\`, `"`, newline) and label NAMES
+are validated at config time, because a broken label breaks the whole scrape rather
+than one line of it.
+
+# rule Quota is not here, and that is deliberate {#no_quota}
+
+How much of a subscription is LEFT is not in ACP for any agent — exhaustion arrives
+as an unstructured error string, which is why `server.limitPatterns` exists at all.
+The uniform signal is therefore `acp2api_turns_total{outcome="rate_limited"}`: it
+says a quota ran out, not how much remains.
+
+Anything better is one vendor's private file format — codex writes
+`rate_limits.primary.used_percent` into its rollout JSONL, Claude Code has its own
+— and a protocol bridge that grows a reader per vendor stops being a protocol
+bridge. That belongs in whatever deployment cares, beside the agent.
+
+# rule Counters are process-lifetime and in memory {#no_persistence}
+
+A restart resets them, which is what `rate()` and `increase()` are built to
+survive. Persisting would add a store and buy nothing a scrape interval cannot
+already see.
+
+The registry is built whether or not `metricsAddr` is set: recording costs a map
+write, and an operator who turns the listener on wants counters that have been
+running, not counters that start at the moment they looked.
+
+# done Acceptance
+
+- tokens are exported per kind, per agent, settled rather than cumulative
+- an agent that reports no usage emits no token series at all
+- operator labels appear on every sample and never leak between agents
+- a rate-limited turn is counted once, as `rate_limited`, and not also as `ok`
+- quotes and newlines in a label value cannot break the exposition format
+- `/metrics` answers `text/plain; version=0.0.4`; every other path is 404

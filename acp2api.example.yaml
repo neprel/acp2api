@@ -16,6 +16,26 @@ server:
   host: 127.0.0.1
   port: 10021
 
+  # Prometheus metrics, on an address of their own: "off", or "host:port".
+  #
+  # A second listener rather than a route on the port above, because the two are
+  # different exposure decisions. The API has no authentication and belongs on
+  # loopback; a scraper has to reach the metrics from somewhere else. Neither is
+  # authenticated, so the address IS the access control -- pick it deliberately.
+  #
+  # What it exports is what this bridge already knows, for every agent alike:
+  #   acp2api_turns_total{agent,outcome}   how turns ended. `outcome="rate_limited"`
+  #                                        is the only quota signal ACP defines.
+  #   acp2api_tokens_total{agent,kind}     input | cached_read | cached_write |
+  #                                        output | reasoning, per turn, settled.
+  #   acp2api_usage_reported_total{agent}  turns whose agent reported counts at all.
+  #                                        Compare with turns_total: an agent that
+  #                                        reports nothing is unmeasured, not free.
+  #   acp2api_cost_total{agent,currency}   money, when the agent says so.
+  #   acp2api_context_fill_ratio{agent}    how close a session is to full.
+  #   acp2api_turn_duration_seconds{agent} histogram.
+  # metricsAddr: 0.0.0.0:10022
+
   # Workspace handed to every ACP session, and the boundary for fs/read_text_file
   # and fs/write_text_file. Relative paths resolve against this file.
   cwd: ./work
@@ -191,6 +211,14 @@ agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus
     type: claude # bundled adapter: @agentclientprotocol/claude-agent-acp
+    # Attached to every metric this agent produces. Free-form on purpose: which
+    # SUBSCRIPTION an agent spends is a property of the login in the home directory
+    # it was spawned with, no ACP message reports it, and no probe would make it
+    # authoritative -- only you know. Having admitted that, `plan`, `owner` and
+    # whatever comes next cost nothing extra. `agent` and `model` are reserved.
+    labels:
+      account: work-anthropic
+      plan: max
     model: opus[1m] # set on the option whose CATEGORY is "model"
     reasoning: high # set on the option whose CATEGORY is "thought_level"
     # Set on the option whose CATEGORY is "mode": how much the agent may do

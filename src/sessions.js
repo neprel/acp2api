@@ -78,7 +78,13 @@ export class SessionStore {
     now = () => Date.now(),
     log = () => {},
     onClose = () => {},
+    // Optional. Held here rather than threaded through five call sites because this
+    // store already owns the per-conversation baselines and the agent name, which
+    // are exactly what a per-turn metric is made of. Null when metrics are off, and
+    // every call site reaches it as `sessions.metrics?.`.
+    metrics = null,
   } = {}) {
+    this.metrics = metrics;
     // Called with a conversation record as it is dropped, so whatever else was
     // hanging off it -- a tool bench holding a call open -- goes with it. Parking
     // does NOT fire this: a parked conversation is coming back.
@@ -308,6 +314,26 @@ export class SessionStore {
   rememberUsage(convId, usage) {
     const conv = this.#conversations.get(convId);
     if (conv && usage) conv.usage = usage;
+  }
+
+  /**
+   * The cumulative session cost already reported, for exactly the reason
+   * `usageBaseline` exists: `usage_update.cost` is what the SESSION has spent, and
+   * a retained session spends across a whole conversation.
+   */
+  costBaseline(convId) {
+    return this.#conversations.get(convId)?.cost ?? null;
+  }
+
+  /** Which agent a conversation belongs to -- the label every metric is keyed by. */
+  agentOf(convId) {
+    return this.#conversations.get(convId)?.agentName ?? null;
+  }
+
+  /** Stores the cumulative cost a turn reported, as the next turn's baseline. */
+  rememberCost(convId, cost) {
+    const conv = this.#conversations.get(convId);
+    if (conv && Number.isFinite(cost?.amount)) conv.cost = cost;
   }
 
   /**
