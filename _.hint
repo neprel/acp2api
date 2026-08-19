@@ -142,7 +142,7 @@ which carries the exact package or signed archive and the exact argv per agent â
 "does it work with this bridge" is answered by a loop rather than by 38 guesses.
 Each was installed and asked `initialize` + `session/new`; the ones that would take
 a model without an account were then driven through a real turn. The results are in
-the README. What belongs here is what they imply for this code.
+docs/agents.md. What belongs here is what they imply for this code.
 
 **`_meta.steering.supported` is advertised by three of thirty-eight** â€” Claude
 Agent, Codex and JetBrains Junie. `Agent#inject` already returns false without it,
