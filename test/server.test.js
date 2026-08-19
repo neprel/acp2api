@@ -1150,7 +1150,7 @@ test("a finished tool turn releases the conversation, so the next message is not
   // refused because there was no running turn to join, and the bridge answered
   // HTTP 200 with EMPTY TEXT -- which a client reads as the model saying nothing.
   // Hermes retried three times and reported "the model returned no content",
-  // sending everyone to look at the model. Seen on a production agent 2026-08-15.
+  // sending everyone to look at the model. Seen in production, 2026-08-15.
   const call = await start(t, { server: { busy: "queue" } });
   const ask = (messages) =>
     call("/v1/chat/completions", {
@@ -1185,7 +1185,7 @@ test("a turn suspended in a tool call is abandoned when the caller sends a new m
   // that ran out INSIDE a tool call -- `pending` is never cleared, and every later
   // message answers 409 "waiting for the result of a tool call" for the life of
   // the process. `sessionTtlMs` does not help: a pending conversation is
-  // deliberately neither parked nor evicted. Seen on a production agent 2026-08-15,
+  // deliberately neither parked nor evicted. Seen in production on 2026-08-15,
   // where one thread answered 409 for three hours while every other thread on the
   // same agent worked normally.
   //

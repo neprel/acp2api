@@ -1,6 +1,6 @@
 # The guide
 
-What acp2api does beyond the sixty-second install, one section per feature,
+What acp2api does beyond the quick start, one section per feature,
 each with the request that exercises it. Everything here was built against a
 fleet running in production.
 

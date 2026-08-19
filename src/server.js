@@ -490,8 +490,8 @@ async function handleCompletion(req, res, registry, config, log, params, session
     //       none of the tool messages sent match it
     //
     // for the life of the process. `sessionTtlMs` does not help: a pending
-    // conversation is deliberately neither parked nor evicted. Seen on
-    // a production agent 2026-08-15, where one Mattermost thread answered 409 for
+    // conversation is deliberately neither parked nor evicted. Seen in
+    // production on 2026-08-15, where one chat thread answered 409 for
     // three hours while every other thread on the same agent worked.
     //
     // A request carrying NO tool messages at all is not a confused continuation,
@@ -1031,7 +1031,7 @@ async function resumeToolCall(o) {
   // `match?.busy` branch, `agent.inject` refused because there was no running turn
   // to join, and the bridge answered HTTP 200 with empty text -- an honest-looking
   // success. Hermes retried it three times and reported "the model returned no
-  // content", which reads like a model fault. Seen on a production agent 2026-08-15.
+  // content", which reads like a model fault. Seen in production, 2026-08-15.
   //
   // The condition matches the other `finally` exactly: still pending means the turn
   // asked for more tools and is genuinely still running.

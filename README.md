@@ -22,7 +22,7 @@ no API key is read, replayed or forwarded. That is the point, and the reason
 this goes through ACP instead of borrowing a vendor's OAuth token for its
 private HTTP API: the CLI uses the login it already has, and nothing else.
 
-## Sixty seconds
+## Quick start
 
 ```sh
 npm install -g acp2api
