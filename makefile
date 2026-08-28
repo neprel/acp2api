@@ -18,7 +18,7 @@ install:
 	@npm install
 
 test:
-	@npm test
+	@node --test --test-concurrency=4 "test/*.test.js"
 
 # The example config is shipped in the package, so a broken one is a broken release.
 check:

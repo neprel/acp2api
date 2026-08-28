@@ -540,6 +540,40 @@ test("a function_call_output continues the same suspended turn", async (t) => {
   assert.match(second.output_text, /RESULT:the file said hello/);
 });
 
+test("a Responses tool call id cannot resume through the Chat API", async (t) => {
+  const call = await start(t);
+  const first = await (
+    await call("/v1/responses", post({
+      model: "fake",
+      input: 'USETOOL read_file {"path":"x"}',
+      tools: TOOLS,
+    }))
+  ).json();
+  const fc = first.output.find((item) => item.type === "function_call");
+
+  const chat = await call("/v1/chat/completions", post({
+    model: "fake",
+    messages: [
+      { role: "user", content: "this is not the Responses conversation" },
+      { role: "tool", tool_call_id: fc.call_id, content: "wrong API" },
+    ],
+  }));
+  assert.equal(chat.status, 200);
+  await chat.text();
+  await call.until(new RegExp(`tool result id\\(s\\) match no live turn: ${fc.call_id}`));
+
+  const resumed = await (
+    await call("/v1/responses", post({
+      model: "fake",
+      previous_response_id: first.id,
+      input: [{ type: "function_call_output", call_id: fc.call_id, output: "right API" }],
+      tools: TOOLS,
+    }))
+  ).json();
+  assert.equal(resumed.status, "completed");
+  assert.match(resumed.output_text, /RESULT:right API/);
+});
+
 test("new Responses input waits for release, then continues the same session", async (t) => {
   const call = await start(t, { server: { toolTimeoutMs: 50 } });
   const first = await (
@@ -592,6 +626,10 @@ test("store: false with served tools is rejected before opening a session", asyn
 
 test("a resumed response tool turn is bounded by the resuming request's timeout", async (t) => {
   const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  // A warm-up under the same short deadline may itself 504 on a loaded runner;
+  // the child is warm either way, so only wait for settlement and readiness.
+  await (await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION", store: false }))).text();
+  await call.until(/fake: fake-agent .* ready/);
   const first = await (
     await call(
       "/v1/responses",

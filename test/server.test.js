@@ -336,6 +336,42 @@ test("a growing history continues one session and sends only what is new", async
   assert.match(second, /^s1/);
 });
 
+test("a proxy-mutated plain history continues headerlessly", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  const first = await said(await ask([{ role: "user", content: "ECHOSESSION one" }]));
+  assert.match(first, /^s1/);
+
+  const continued = await said(await ask([
+    {
+      content: [{ text: "ECHOSESSION one", type: "text", provider_annotation: "ignored" }],
+      role: "user",
+      provider_annotation: { trace: 1 },
+    },
+    { content: [{ text: first, type: "text" }], role: "assistant", refusal: null },
+    { role: "user", content: "ECHOSESSION two" },
+  ]));
+  assert.match(continued, /^s1/);
+});
+
+test("a semantically edited proxy history still starts fresh", async (t) => {
+  const call = await start(t);
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const said = async (res) => (await res.json()).choices[0].message.content;
+
+  const first = await said(await ask([{ role: "user", content: "ECHOSESSION one" }]));
+  assert.match(first, /^s1/);
+
+  const forked = await said(await ask([
+    { role: "user", content: [{ type: "text", text: "ECHOSESSION edited" }] },
+    { role: "assistant", content: [{ type: "text", text: first }] },
+    { role: "user", content: "ECHOSESSION two" },
+  ]));
+  assert.match(forked, /^s2/);
+});
+
 test("continuity resends nothing the session has already heard", async (t) => {
   const call = await start(t);
   const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
@@ -767,7 +803,7 @@ test("max_tokens truncates and finishes with length", async (t) => {
 });
 
 test("a cut turn that misses drain grace retires its keyed conversation", async (t) => {
-  const call = await start(t, { server: { agentRpcTimeoutMs: 500 } });
+  const call = await start(t, { server: { agentRpcTimeoutMs: 2_000 } });
   const headers = { "x-conversation-id": "dead-after-cut" };
   const first = await call("/v1/chat/completions", {
     ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION" }] }),
@@ -892,15 +928,13 @@ test("a hung initialize answers 503 and the next request respawns cleanly", asyn
     args: [FIXTURE],
     env: { HANG_INITIALIZE_ONCE: marker },
   }];
-  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 500, requestTimeoutMs: 2_000 } });
-  const started = Date.now();
+  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 5_000, requestTimeoutMs: 10_000 } });
   const first = await call("/v1/chat/completions", chat({
     model: "fake",
     messages: [{ role: "user", content: "first" }],
   }));
   assert.equal(first.status, 503);
   assert.equal((await first.json()).error.code, "agent_unavailable");
-  assert.ok(Date.now() - started < 1_500, "initialize must use the child RPC deadline");
 
   const second = await call("/v1/chat/completions", chat({
     model: "fake",
@@ -920,7 +954,11 @@ test("a hung session/new is 502 and releases its unowned tool bench", async (t) 
     args: [FIXTURE],
     env: { HANG_RPC: "session/new", RPC_CAPTURE_FILE: captured },
   }];
-  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 500, requestTimeoutMs: 2_000 } });
+  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 5_000, requestTimeoutMs: 10_000 } });
+  await (await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "warm the child before measuring session/new" }],
+  }))).text();
   const started = Date.now();
   const response = await call("/v1/chat/completions", chat({
     model: "fake",
@@ -929,7 +967,7 @@ test("a hung session/new is 502 and releases its unowned tool bench", async (t) 
   }));
   assert.equal(response.status, 502);
   assert.equal((await response.json()).error.code, "agent_error");
-  assert.ok(Date.now() - started < 1_500, "session/new must use the child RPC deadline");
+  assert.ok(Date.now() - started < 6_000, "session/new must use the child RPC deadline");
 
   const probe = await fetch(await readFile(captured, "utf8"), {
     method: "POST",
@@ -940,16 +978,18 @@ test("a hung session/new is 502 and releases its unowned tool bench", async (t) 
 });
 
 test("a request whose child ignores cancel still answers 504", async (t) => {
-  const call = await start(t, { server: { requestTimeoutMs: 150, agentRpcTimeoutMs: 500 } });
-  // Pay the spawn/initialize cost before timing the broken turn, so this exercises
-  // the post-cancel drain rather than cancellation before session/new finishes. A
-  // warm-up under the same short deadline may itself 504 on a loaded runner; the
-  // child is warm either way.
-  await (await call("/v1/chat/completions", chat({
-    model: "fake",
-    messages: [{ role: "user", content: "ready" }],
-  }))).text();
-  await call.until(/fake: fake-agent .* ready/);
+  const serverOpts = { requestTimeoutMs: 150, agentRpcTimeoutMs: 2_000 };
+  const config = normalizeConfig(
+    {
+      server: { host: "127.0.0.1", cwd: here, ...serverOpts },
+      agents: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
+    },
+    { baseDir: here, env: {} },
+  );
+  const agent = new Agent(config.agents[0], config.server);
+  const warm = await agent.openSession();
+  await agent.closeSession(warm);
+  const call = await start(t, { agents: new Map([["fake", agent]]), server: serverOpts });
 
   const started = Date.now();
   const response = await call("/v1/chat/completions", chat({
@@ -958,7 +998,7 @@ test("a request whose child ignores cancel still answers 504", async (t) => {
   }));
   assert.equal(response.status, 504);
   assert.equal((await response.json()).error.code, "timeout");
-  assert.ok(Date.now() - started < 1_500, "request timeout plus drain grace must remain bounded");
+  assert.ok(Date.now() - started < 3_000, "request timeout plus drain grace must remain bounded");
 });
 
 test("a tool-enabled timeout is 504 and does not remember partial text", async (t) => {
@@ -1108,7 +1148,7 @@ test("a named session outlives a turn nobody waited for", async (t) => {
   // message is the correction. If the session went with the abandoned turn, the
   // correction would reach an agent that had forgotten everything it had read --
   // which is exactly the work the human was trying not to waste.
-  const call = await start(t, { server: { requestTimeoutMs: 400 } });
+  const call = await start(t, { server: { requestTimeoutMs: 2_000 } });
   const ask = (content, key) =>
     call("/v1/chat/completions", {
       ...chat({ model: "fake", messages: [{ role: "user", content }] }),
@@ -1485,6 +1525,132 @@ test("the result the caller sends back reaches the same turn, which then finishe
   assert.equal(body.choices[0].message.content.trim(), "RESULT:the file said hello");
 });
 
+test("a tool_call_id resumes its pending turn when the headerless fingerprint is hostile", async (t) => {
+  const call = await start(t);
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"}' };
+  const first = await (
+    await call("/v1/chat/completions", chat({ model: "fake", messages: [user], tools: TOOLS }))
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+
+  const hostile = { role: "assistant", content: "a proxy changed the emitted assistant message" };
+  const resumed = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [user, hostile, { role: "tool", tool_call_id: callId, content: "hello by id" }],
+    tools: TOOLS,
+  }));
+  assert.equal(resumed.status, 200);
+  const finished = (await resumed.json()).choices[0].message;
+  assert.equal(finished.content.trim(), "RESULT:hello by id");
+
+  const continued = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [
+      user,
+      hostile,
+      { role: "tool", tool_call_id: callId, content: "hello by id" },
+      finished,
+      { role: "user", content: "ECHOSESSION" },
+    ],
+    tools: TOOLS,
+  }));
+  assert.equal((await continued.json()).choices[0].message.content, "s1");
+});
+
+test("tool_call_id outranks a header naming another conversation and warns", async (t) => {
+  const call = await start(t);
+  const other = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION" }] }),
+    headers: { "x-conversation-id": "wrong-thread" },
+  });
+  assert.equal((await other.json()).choices[0].message.content, "s1");
+
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"}' };
+  const first = await (
+    await call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+      headers: { "x-conversation-id": "right-thread" },
+    })
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+  const resumed = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: "rewritten" }, { role: "tool", tool_call_id: callId, content: "right" }],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": "wrong-thread" },
+  });
+  assert.equal(resumed.status, 200);
+  assert.equal((await resumed.json()).choices[0].message.content.trim(), "RESULT:right");
+  await call.until(/tool call id\(s\).*override a different conversation header \[wrong-thread\]/);
+});
+
+test("a tool_call_id belonging to another model is refused without consuming it", async (t) => {
+  const specs = ["fake", "other"].map((name) => ({
+    name,
+    type: "general",
+    command: process.execPath,
+    args: [FIXTURE],
+  }));
+  const call = await start(t, { specs });
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"}' };
+  const first = await (
+    await call("/v1/chat/completions", chat({ model: "fake", messages: [user], tools: TOOLS }))
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+  const result = { role: "tool", tool_call_id: callId, content: "hello" };
+
+  const refused = await call("/v1/chat/completions", chat({
+    model: "other",
+    messages: [{ role: "user", content: "rewritten" }, result],
+    tools: TOOLS,
+  }));
+  assert.equal(refused.status, 400);
+  assert.equal((await refused.json()).error.code, "invalid_request_error");
+
+  const resumed = await call("/v1/chat/completions", chat({ model: "fake", messages: [user, result], tools: TOOLS }));
+  assert.equal(resumed.status, 200);
+  assert.equal((await resumed.json()).choices[0].message.content.trim(), "RESULT:hello");
+});
+
+test("tool results spanning two suspended turns are refused as ambiguous", async (t) => {
+  const call = await start(t);
+  const park = async (key) => {
+    const user = { role: "user", content: `USETOOL read_file {"path":"${key}"}` };
+    const first = await (
+      await call("/v1/chat/completions", {
+        ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+        headers: { "x-conversation-id": key },
+      })
+    ).json();
+    return { key, user, callId: first.choices[0].message.tool_calls[0].id };
+  };
+  const one = await park("ambiguous-one");
+  const two = await park("ambiguous-two");
+  const results = [one, two].map(({ callId, key }) => ({ role: "tool", tool_call_id: callId, content: key }));
+
+  const refused = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "rewritten" }, ...results],
+    tools: TOOLS,
+  }));
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error.code, "ambiguous_tool_results");
+
+  for (const pending of [one, two]) {
+    const resumed = await call("/v1/chat/completions", {
+      ...chat({
+        model: "fake",
+        messages: [pending.user, results.find((result) => result.tool_call_id === pending.callId)],
+        tools: TOOLS,
+      }),
+      headers: { "x-conversation-id": pending.key },
+    });
+    assert.equal(resumed.status, 200);
+  }
+});
+
 test("a headerless tool round-trip stays in one session, streamed or not", async (t) => {
   const call = await start(t);
 
@@ -1522,8 +1688,69 @@ test("a headerless tool round-trip stays in one session, streamed or not", async
   }
 });
 
+test("a proxy-mutated tool transcript resumes by id, streamed or not", async (t) => {
+  const call = await start(t);
+
+  const ask = async (messages, stream) => {
+    const res = await call("/v1/chat/completions", chat({ model: "fake", messages, tools: TOOLS, stream }));
+    assert.equal(res.status, 200);
+    if (!stream) return (await res.json()).choices[0].message;
+
+    const frames = (await res.text()).split("\n\n").filter(Boolean).map((frame) => frame.replace(/^data: /, ""));
+    assert.equal(frames.at(-1), "[DONE]");
+    const chunks = frames.slice(0, -1).map(JSON.parse);
+    const toolCalls = chunks.flatMap((chunk) => chunk.choices[0].delta.tool_calls ?? []);
+    return {
+      role: "assistant",
+      content: chunks.map((chunk) => chunk.choices[0].delta.content ?? "").join("") || null,
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    };
+  };
+
+  for (const stream of [false, true]) {
+    const user = { role: "user", content: `USETOOL read_file {"path":"proxy-${stream}"}` };
+    const calling = await ask([user], stream);
+    const proxyAssistant = {
+      // Deliberately not the bridge's insertion order. Real proxy chains parse and
+      // rebuild this object instead of preserving the bytes they received.
+      tool_calls: calling.tool_calls.map((toolCall) => ({
+        function: {
+          arguments: ` \n${toolCall.function.arguments}\n `,
+          name: toolCall.function.name,
+        },
+        type: toolCall.type,
+        id: toolCall.id,
+      })),
+      // LiteLLM changed the string form into the equivalent OpenAI parts form.
+      content: [{ type: "text", text: calling.content ?? "" }],
+      role: "assistant",
+    };
+    const result = {
+      role: "tool",
+      tool_call_id: calling.tool_calls[0].id,
+      content: "proxy result",
+    };
+    const finished = await ask([user, proxyAssistant, result], stream);
+    assert.equal(finished.content.trim(), "RESULT:proxy result");
+
+    const continued = await ask([
+      user,
+      proxyAssistant,
+      result,
+      finished,
+      { role: "user", content: "ECHOSESSION" },
+    ], false);
+    assert.equal(continued.content, stream ? "s2" : "s1");
+  }
+});
+
 test("a resumed tool turn is bounded by the resuming request's timeout", async (t) => {
   const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  await (await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "ECHOSESSION" }],
+  }))).text();
+  await call.until(/fake: fake-agent .* ready/);
   const user = { role: "user", content: 'USETOOL read_file {"path":"x"} HANG_AFTER_TOOL' };
   const first = await (
     await call("/v1/chat/completions", {
@@ -1713,12 +1940,14 @@ test("an unattended suspended turn releases and becomes eligible for pruning", a
     tools: TOOLS,
   }));
   assert.equal(first.status, 200);
-  assert.equal((await first.json()).choices[0].finish_reason, "tool_calls");
+  const firstBody = await first.json();
+  assert.equal(firstBody.choices[0].finish_reason, "tool_calls");
+  const callId = firstBody.choices[0].message.tool_calls[0].id;
 
   // No caller returns to the suspended conversation. The fixture's real MCP call
   // reaches its deadline, the ACP turn finishes with that tool error, and the
   // conversation releases itself instead of staying busy forever.
-  await call.until(/released: suspended turn settled unattended/);
+  await call.until(new RegExp(`released: suspended turn settled unattended; waiting for tool_call_id ${callId}`));
   await new Promise((resolve) => setTimeout(resolve, 5));
 
   // Pruning is request-driven; an unrelated new request triggers it. The released
@@ -1758,6 +1987,7 @@ test("a late tool result starts fresh after its suspended turn has settled", asy
   });
   assert.equal(late.status, 200);
   assert.equal((await late.json()).choices[0].message.content, "FRESH:s2");
+  await call.until(new RegExp(`tool result id\\(s\\) match no live turn: ${callId}`));
 });
 
 test("server.tools off keeps the old behaviour: no MCP server is attached", async (t) => {

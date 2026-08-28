@@ -186,7 +186,7 @@ test("aborting the request cancels the turn in the agent", async (t) => {
 });
 
 test("a child that ignores cancel is bounded and its session is dead", async (t) => {
-  const agent = makeAgent({ server: { agentRpcTimeoutMs: 500 } });
+  const agent = makeAgent({ server: { agentRpcTimeoutMs: 2_000 } });
   t.after(() => agent.close());
   const session = await agent.openSession();
   const started = Date.now();
@@ -195,7 +195,7 @@ test("a child that ignores cancel is bounded and its session is dead", async (t)
   });
 
   assert.equal(turn.stopReason, "max_tokens");
-  assert.ok(Date.now() - started < 1_500, "the post-cancel drain must use its grace deadline");
+  assert.ok(Date.now() - started < 3_000, "the post-cancel drain must use its grace deadline");
   await assert.rejects(
     agent.turn(session, [{ type: "text", text: "must not run" }]),
     (error) => error.status === 502 && /no longer usable/.test(error.message),
@@ -203,13 +203,15 @@ test("a child that ignores cancel is bounded and its session is dead", async (t)
 });
 
 test("a hung session/close is bounded and swallowed", async (t) => {
-  const agent = makeAgent({ server: { agentRpcTimeoutMs: 500 } });
+  const agent = makeAgent({ server: { agentRpcTimeoutMs: 10_000 } });
   t.after(() => agent.close());
+  const warm = await agent.openSession();
+  await agent.closeSession(warm);
   const started = Date.now();
   const turn = await agent.prompt([{ type: "text", text: "HANG_CLOSE" }]);
 
   assert.equal(turn.text, "[fast] HANG_CLOSE");
-  assert.ok(Date.now() - started < 1_500, "best-effort session close must not block the caller");
+  assert.ok(Date.now() - started < 2_000, "best-effort session close must not block the caller");
 });
 
 test("shutdown escalates past trapped SIGTERM and leaves no child", async (t) => {

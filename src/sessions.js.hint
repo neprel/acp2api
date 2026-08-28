@@ -54,6 +54,34 @@ only the unheard tail is sent. Three properties make this safe rather than cleve
   tool turn; none of those starts an overlapping `session/prompt`. Eviction also
   must not close work already paid for.
 
+# decision Fingerprint semantic messages, not their wire serialization {#canonical_message}
+
+Every digest and message comparison goes through the single `canonicalMessage`
+form. It keeps `role`; normalizes a string and one `{type: "text", text}` part to
+the same content; preserves multi-part order; and reduces other parts to only the
+fields the prompt renderer reads: image URL, or a file's id, data and filename.
+Tool calls keep id, type, function name and the **raw arguments string**, plus the
+message's `tool_call_id` and `name`. Text is never trimmed or otherwise rewritten.
+
+Raw arguments are deliberately not parsed and re-serialized. Two strings can be
+JSON-equivalent while still being different bytes the agent emitted; treating them
+as one conversation is a collision with no way to recover, while failing to match
+merely opens a fresh session. The same conservative rule makes multi-part order and
+every character of text significant.
+
+Provider annotations, refusal nulls, streamed call `index` and unknown message or
+part keys are excluded. They are transport or provider metadata the agent never
+hears, so a proxy adding them must not silently defeat continuity.
+
+# invariant What is matched is what the agent heard {#prompt_fingerprint_lockstep}
+
+`canonicalMessage`'s content fields mirror `openai.js#toPromptBlocks`, including
+its `contentToText` and file reading. If that renderer begins reading a new part
+type or field, canonicalization must add it in the same change; if it stops reading
+one, identity must stop depending on it. Otherwise prefix matching would claim two
+prompts are the same after sending the agent different input, or restart a session
+over metadata the agent never received.
+
 A suspended tool turn is the deliberate result-bearing path through busy matching. Its
 stored prefix is the pre-suspension conversation followed by the exact assistant
 message emitted to the caller: `{role: "assistant", content, tool_calls}`. A
@@ -78,19 +106,30 @@ Reuse is logged. Silence would be the failure mode otherwise: a caller whose
 preamble carries a timestamp would never match, continuity would quietly never
 happen, and nothing would say so.
 
+# invariant Fingerprint generations never mix {#fingerprint_epoch}
+
+Conversation prefixes exist only in this process's in-memory `SessionStore`.
+Restarting the server clears the store, and one running JavaScript image cannot
+change `canonicalMessage` underneath records it already created. An old-format and
+new-format prefix therefore cannot coexist; fingerprint changes need no migration
+path or compatibility fallback.
+
 # invariant Suspended turns are reachable and self-releasing {#suspended_lifecycle}
 
 The lifecycle is **find → resume → settle → release**. While a turn is inside a
-caller tool, its conversation stays busy but remains findable by the caller's
-explicit key or by the recorded prefix described above. Accepting the trailing
+caller tool, its conversation stays busy but remains findable by a handed-over
+`tool_call_id`, the caller's explicit key, or the recorded prefix described above.
+Chat lookup uses that order: id first, then key, then prefix. Accepting the trailing
 tool results advances that same turn; it never starts a second ACP prompt.
 
 Caller cooperation is not required for release. `setPending` watches the turn
 itself. If it settles after its HTTP request detached — tool deadline, ordinary
 finish or error — the store clears both `pending` and `busy`, refreshes `lastUsed`,
-and normal parking/forgetting rules apply. It must not release while a request is
-attached and shaping that settled outcome, because a new prompt could otherwise
-race the response still being finished.
+and normal parking/forgetting rules apply. Every path that clears `pending` also
+notifies the ToolBridge so its live call-id index clears before the conversation
+can close or be reused. It must not release while a request is attached and shaping
+that settled outcome, because a new prompt could otherwise race the response still
+being finished.
 
 Every suspended conversation must therefore satisfy both halves: at least one of
 key or prefix can reach it, and the turn promise will eventually make it eligible
@@ -106,9 +145,12 @@ the same suspended turn.
 
 A BUSY result is observation, not another claim. Keyed queue/409 handling and the
 pending-result path must see the existing owner without changing it. `peekKey`,
-`peekPrefix` and `find` are explicitly non-claiming; use them only when no new ACP
-turn can follow, such as an inject-only probe or response-store inspection. A new
-lookup API that is neither claiming nor explicitly read-only is wrong.
+`peekPrefix`, `peekPending` and `find` are explicitly non-claiming; `peekPending`
+returns the same pending-observation shape as a busy `matchKey` result so the
+existing resume path can adopt the running turn without claiming it again. Use
+read-only lookup only when no new ACP turn can follow, such as an inject-only probe,
+call-id resume, or response-store inspection. A new lookup API that is neither
+claiming nor explicitly read-only is wrong.
 
 # decision A keyed busy conversation refuses instead of forking {#keyed_busy_refusal}
 
@@ -211,6 +253,8 @@ held, because this module must not depend on the agent layer.
 - `find` resolves any response in a chain to the same session
 - a growing history continues one session; only the unheard tail is sent
 - a diverging history, and a changed system preamble, each start a fresh session
+- proxy-only content-shape and annotation changes continue headerlessly, while an
+  edited message still starts fresh
 - a busy conversation is neither matched nor evicted
 - a pending conversation is matched by its emitted tool-call prefix
 - an unattended pending turn clears busy when it settles and can then be pruned

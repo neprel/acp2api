@@ -26,14 +26,48 @@ import { createHash } from "node:crypto";
  */
 const digest = (parts) => createHash("sha256").update(JSON.stringify(parts)).digest("base64url").slice(0, 22);
 
-export const fingerprint = (m) => {
+const canonicalPart = (part) => {
+  if (part?.type === "text") return { type: "text", text: part.text ?? "" };
+  if (part?.type === "image_url") return { type: "image_url", url: part.image_url?.url ?? "" };
+  if (part?.type === "file" || part?.type === "input_file") {
+    const file = part.file ?? part;
+    return {
+      type: part.type,
+      file_id: file.file_id ?? null,
+      file_data: file.file_data ?? null,
+      filename: file.filename ?? null,
+    };
+  }
+  return { type: part?.type ?? null };
+};
+
+const canonicalContent = (content) => {
+  if (!Array.isArray(content)) return content ?? null;
+  if (content.length === 1 && content[0]?.type === "text") return content[0].text ?? "";
+  return content.map(canonicalPart);
+};
+
+/** The stable semantic fields used anywhere messages are compared. */
+export const canonicalMessage = (m) => ({
+  role: m?.role ?? null,
+  content: canonicalContent(m?.content),
   // `index` exists only on streamed tool-call deltas so SDKs can accumulate them;
   // it does not change which call was made. A client may resend either its final
   // accumulated message or the deltas it assembled itself, and both are the same
   // conversation prefix.
-  const toolCalls = m?.tool_calls?.map(({ index: _index, ...call }) => call) ?? null;
-  return digest([m?.role ?? null, m?.content ?? null, toolCalls, m?.tool_call_id ?? null, m?.name ?? null]);
-};
+  tool_calls: m?.tool_calls?.map((call) => ({
+    id: call?.id ?? null,
+    type: call?.type ?? null,
+    function: {
+      name: call?.function?.name ?? null,
+      arguments: call?.function?.arguments ?? null,
+    },
+  })) ?? null,
+  tool_call_id: m?.tool_call_id ?? null,
+  name: m?.name ?? null,
+});
+
+export const fingerprint = (message) => digest(canonicalMessage(message));
 
 /**
  * Splits messages into the standing preamble and the conversation.
@@ -83,6 +117,7 @@ export class SessionStore {
     now = () => Date.now(),
     log = () => {},
     onClose = () => {},
+    onPendingClear = () => {},
     // Optional. Held here rather than threaded through five call sites because this
     // store already owns the per-conversation baselines and the agent name, which
     // are exactly what a per-turn metric is made of. Null when metrics are off, and
@@ -94,6 +129,7 @@ export class SessionStore {
     // hanging off it -- a tool bench holding a call open -- goes with it. Parking
     // does NOT fire this: a parked conversation is coming back.
     this.onClose = onClose;
+    this.onPendingClear = onPendingClear;
     this.max = max;
     this.ttlMs = ttlMs;
     // When a conversation stops being a conversation at all. `ttlMs` now only
@@ -129,10 +165,22 @@ export class SessionStore {
   #releaseSettledPending(convId, pending) {
     const conv = this.#conversations.get(convId);
     if (!conv || conv.pending !== pending || !pending.settled || pending.attached) return;
-    conv.pending = null;
+    this.#clearPending(convId, conv);
     conv.busy = false;
     conv.lastUsed = this.now();
-    this.log("info", `session ${convId} (${conv.agentName}) released: suspended turn settled unattended`);
+    const calls = pending.callIds?.length ? `; waiting for tool_call_id ${pending.callIds.join(", ")}` : "";
+    this.log("info", `session ${convId} (${conv.agentName}) released: suspended turn settled unattended${calls}`);
+  }
+
+  #clearPending(convId, conv) {
+    const pending = conv.pending;
+    if (!pending) return;
+    conv.pending = null;
+    try {
+      this.onPendingClear(convId, conv, pending);
+    } catch {
+      /* a cleanup hook must not stop the pending turn from being released */
+    }
   }
 
   #reportLive(agentName) {
@@ -280,6 +328,21 @@ export class SessionStore {
     return Boolean(this.#conversations.get(convId)?.pending);
   }
 
+  /** Reads a suspended turn by conversation id without claiming its existing owner. */
+  peekPending(convId) {
+    const conv = this.#conversations.get(convId);
+    if (!conv?.pending) return null;
+    return {
+      convId,
+      session: conv.session,
+      sessionId: conv.sessionId,
+      bench: conv.bench,
+      pending: conv.pending,
+      prefix: conv.prefix,
+      matched: conv.prefix.length,
+    };
+  }
+
   /**
    * Records a turn suspended inside a tool call, or clears it.
    *
@@ -290,6 +353,7 @@ export class SessionStore {
   setPending(convId, pending) {
     const conv = this.#conversations.get(convId);
     if (!conv) return;
+    if (conv.pending && conv.pending !== pending) this.#clearPending(convId, conv);
     conv.pending = pending;
     conv.lastUsed = this.now();
     if (!pending) return;
@@ -591,6 +655,7 @@ export class SessionStore {
   async #close(convId, why, agents) {
     const conv = this.#conversations.get(convId);
     if (!conv) return;
+    this.#clearPending(convId, conv);
     this.#conversations.delete(convId);
     for (const id of conv.responses) this.#responses.delete(id);
     // Only if it still points here: a key rebound to a newer session by `open`

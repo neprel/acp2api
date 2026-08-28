@@ -47,7 +47,8 @@ behind the port is an agent that runs commands.
 2. `parseChatRequest` — refusals become 400 here, before any agent is touched.
 3. `params.report` — logs and, in `error` mode, rejects.
 4. Resolve the model to an agent, or 404 naming what exists.
-5. Synchronously claim an existing conversation, or observe that it is busy.
+5. Resolve trailing tool results by live call id, then synchronously claim an
+   existing conversation by key or prefix, or observe that it is busy.
 6. Enter `runTurnLifecycle`, which arms the timeout and disconnect watcher.
 7. Run or resume the turn, streaming or not.
 8. Translate the outcome and release ownership unless the turn is pending.
@@ -67,6 +68,28 @@ new claims: a 409 observer must not release that owner, while a request that ado
 and finishes a pending turn releases only after `pending` is cleared. The runner's
 `finally` owns timer cleanup and invokes the handler's guarded release on every
 exit, including errors, streaming returns and tool-call handovers.
+
+## invariant A live tool call id is the strongest Chat continuation identity {#tool_call_identity}
+
+For Chat requests ending in `role: "tool"` results, lookup order is live
+`tool_call_id` → conversation header → semantic prefix. The id was minted by this
+bridge for one still-running parked call, so it is content truth even when a proxy
+reorders JSON keys, changes harmless argument whitespace, or rewrites message
+parts. It selects the same pending observation used by keyed resume and never
+bypasses the existing owner/claim discipline.
+
+A live id outranks a conflicting conversation header or prefix and logs the
+override. Ids belonging to another model are refused before they can be consumed;
+ids naming two live suspended conversations are 409 `ambiguous_tool_results`.
+Stray ids are tolerated when at least one live id unambiguously selects the turn,
+because callers may echo a batch after some calls have already settled. A request
+whose ids match no live call logs that fact and follows the existing late-result
+path.
+
+This lookup is Chat-only. Responses continuation already carries the retained,
+proxy-proof `previous_response_id`, so Responses handovers must not enter the live
+call-id index. Indexing them would create a second continuation authority and let a
+Chat request adopt a Responses-semantics conversation through its function-call id.
 
 ## invariant A session that never answered is discarded
 It has heard messages nobody can account for, so offering it to the next request
@@ -259,6 +282,8 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - an unrelated failure is 502; an unknown model is 404 naming what is available
 - `temperature` returns 200 and reports itself in `x_acp2api.ignored`
 - a tool-sending client is answered through its MCP bench; `tool_choice` remains ignored
+- proxy-mutated Chat tool history resumes by live `tool_call_id`; cross-model and
+  multi-turn ids are refused without consuming either pending turn
 - `unsupportedParams: error` turns the ignorable ones into 400 as well
 - `max_tokens` finishes with `length`; `stop` cuts the text and finishes with `stop`
 - a growing history continues one session and sends only the new turn

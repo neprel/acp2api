@@ -39,6 +39,20 @@ What it costs, and what pays for it:
   leave an agent process waiting forever on a subscription that is still being
   paid for.
 
+# invariant A handed-over call id names only its live suspended turn {#live_call_index}
+
+`ToolBridge` mints the OpenAI `tool_call_id`, owns the parked call, and therefore
+owns the only call-id-to-conversation index. An id enters that index only when the
+parked call is handed to the HTTP caller and the conversation is recorded as
+pending. It leaves when the result resolves the call, the tool deadline fires, the
+bench closes, or `SessionStore` clears that pending turn for any other reason.
+
+`conversation(callId)` is a read-only lookup and validates the indexed entry
+against the bench's still-parked call before returning it. It can never resolve an
+id to a closed conversation or resurrect a turn whose pending state was cleared.
+Do not build a second registry in the HTTP or session layer: it would drift from
+`resolve`, which is the authority on whether the call still exists.
+
 # invariant The path token is the MCP credential {#no_key}
 
 The agent is a child of this process, reached over loopback. There is no API key on
@@ -85,6 +99,7 @@ answer could not have come from anywhere but the caller's result.
 
 - a caller's tools are offered to the agent, and a call comes back as tool_calls
 - the result the caller sends back reaches the same turn, which then finishes
+- every way a pending turn ends removes its handed-over call ids from lookup
 - a tool result for a call nobody is waiting on is refused, not run as a new turn
 - server.tools off keeps the old behaviour: no MCP server is attached
 - the MCP endpoint is reachable with only its path token

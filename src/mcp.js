@@ -60,7 +60,7 @@ class Bench {
     this.timeoutMs = timeoutMs;
     /** OpenAI tool definitions, as last declared by the caller. */
     this.tools = [];
-    /** callId -> {name, args, settle, timer, reported} */
+    /** callId -> {name, args, settle, timer, reported, convId} */
     this.pending = new Map();
     /** Woken when a call parks, so the HTTP layer can stop waiting for the turn. */
     this.wake = null;
@@ -69,6 +69,7 @@ class Bench {
 
 export class ToolBridge {
   #benches = new Map(); // token -> Bench
+  #calls = new Map(); // callId -> {token, convId}; handed-over live calls only
   #log;
   #timeoutMs;
 
@@ -109,12 +110,36 @@ export class ToolBridge {
   }
 
   /** Marks parked calls as handed over, so they are reported exactly once. */
-  reported(token, ids) {
+  reported(token, ids, convId = null) {
     const bench = this.#benches.get(token);
     if (!bench) return;
     for (const id of ids) {
       const call = bench.pending.get(id);
-      if (call) call.reported = true;
+      if (!call) continue;
+      call.reported = true;
+      if (convId) {
+        call.convId = convId;
+        this.#calls.set(id, { token, convId });
+      }
+    }
+  }
+
+  /** The conversation currently waiting for this handed-over call, or null. */
+  conversation(callId) {
+    const indexed = this.#calls.get(callId);
+    if (!indexed) return null;
+    const call = this.#benches.get(indexed.token)?.pending.get(callId);
+    if (!call || call.convId !== indexed.convId) {
+      this.#calls.delete(callId);
+      return null;
+    }
+    return indexed.convId;
+  }
+
+  /** Stops every call id for a turn from resolving after its pending state clears. */
+  releaseConversation(convId) {
+    for (const [callId, indexed] of this.#calls) {
+      if (indexed.convId === convId) this.#calls.delete(callId);
     }
   }
 
@@ -124,6 +149,7 @@ export class ToolBridge {
     const call = bench?.pending.get(callId);
     if (!call) return false;
     bench.pending.delete(callId);
+    this.#calls.delete(callId);
     clearTimeout(call.timer);
     call.settle({ content: [{ type: "text", text: String(text ?? "") }] });
     return true;
@@ -149,7 +175,8 @@ export class ToolBridge {
     const bench = this.#benches.get(token);
     if (!bench) return;
     this.#benches.delete(token);
-    for (const [, call] of bench.pending) {
+    for (const [callId, call] of bench.pending) {
+      this.#calls.delete(callId);
       clearTimeout(call.timer);
       call.settle({
         content: [{ type: "text", text: "the client ended the conversation before answering this tool call" }],
@@ -206,6 +233,7 @@ export class ToolBridge {
     return new Promise((settle) => {
       const timer = setTimeout(() => {
         bench.pending.delete(callId);
+        this.#calls.delete(callId);
         this.#log("warn", `tool call ${name} was never answered in ${bench.timeoutMs}ms`);
         settle({
           content: [{ type: "text", text: `the client did not answer this tool call within ${bench.timeoutMs}ms` }],

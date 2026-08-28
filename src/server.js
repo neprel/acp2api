@@ -74,6 +74,7 @@ export function createServer(config, { agents, log = () => {} } = {}) {
   sessions.onClose = (conv) => {
     if (conv.bench) tools.close(conv.bench);
   };
+  sessions.onPendingClear = (convId) => tools.releaseConversation(convId);
 
   const server = createHttpServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -563,15 +564,48 @@ async function handleCompletion(req, res, registry, config, log, params, session
   const injectOnly = Boolean(
     config.server.injectHeader && String(req.headers[config.server.injectHeader] ?? "").trim(),
   );
+  const idConversations = new Map();
+  for (const result of toolResults) {
+    const indexed = tools.conversation(result.id);
+    if (!indexed || idConversations.has(indexed)) continue;
+    const pending = sessions.peekPending(indexed);
+    if (pending) idConversations.set(indexed, { match: pending, ids: [result.id] });
+    else tools.releaseConversation(indexed);
+  }
+  for (const result of toolResults) {
+    const indexed = tools.conversation(result.id);
+    const found = indexed && idConversations.get(indexed);
+    if (found && !found.ids.includes(result.id)) found.ids.push(result.id);
+  }
+  const idCandidates = [...idConversations.values()];
+  const idCandidate = idCandidates.length === 1 ? idCandidates[0] : null;
+  const idAgent = idCandidate ? sessions.agentOf(idCandidate.match.convId) : null;
+  const idMatch = idCandidate && idAgent === model ? idCandidate.match : null;
   // `let`, not `const`: the suspended-turn branch abandons a wedged conversation
   // and continues as if nothing had matched.
-  let match = !config.server.continuity
-    ? null
-    : injectOnly
-      ? (callerKey && sessions.peekKey(model, callerKey, { whenBusy: config.server.busy })) ||
-        sessions.peekPrefix(model, systemId, prefix)
-      : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
-        sessions.matchPrefix(model, systemId, prefix);
+  let match;
+  if (idMatch) {
+    const contextual = (callerKey && sessions.peekKey(model, callerKey, { whenBusy: config.server.busy })) ||
+      sessions.peekPrefix(model, systemId, prefix);
+    if (contextual && contextual.convId !== idMatch.convId) {
+      log(
+        "warn",
+        `${model}: tool call id(s) ${idCandidate.ids.join(", ")} override a different ` +
+          `${callerKey ? `conversation header [${callerKey}]` : "prefix conversation"}`,
+      );
+    }
+    match = idMatch;
+  } else if (idCandidates.length === 0) {
+    match = !config.server.continuity
+      ? null
+      : injectOnly
+        ? (callerKey && sessions.peekKey(model, callerKey, { whenBusy: config.server.busy })) ||
+          sessions.peekPrefix(model, systemId, prefix)
+        : (callerKey && sessions.matchKey(model, callerKey, { whenBusy: config.server.busy })) ||
+          sessions.matchPrefix(model, systemId, prefix);
+  } else {
+    match = null;
+  }
 
   const timeout = () =>
     new AgentError(`${model}: no answer within ${config.server.requestTimeoutMs}ms`, 504, "timeout");
@@ -587,11 +621,27 @@ async function handleCompletion(req, res, registry, config, log, params, session
     // An inject-only probe may discover a suspended turn, but it cannot join one:
     // that turn is blocked inside a tool call, not accepting another prompt. Stop
     // before either consuming tool results or treating the probe as abandonment.
-    if (injectOnly && match?.pending) {
+    if (injectOnly && (idCandidates.length > 0 || match?.pending)) {
       return send(
         res,
         409,
         errorBody(`${model}: no turn is running for this conversation to join`, "no_running_turn"),
+      );
+    }
+
+    if (idCandidates.length > 1) {
+      throw new RequestError(
+        `${model}: tool results match more than one suspended turn: ` +
+          idCandidates.flatMap((candidate) => candidate.ids).join(", "),
+        409,
+        "ambiguous_tool_results",
+      );
+    }
+    if (idCandidate && idAgent !== model) {
+      throw new RequestError(
+        `tool_call_id ${idCandidate.ids.join(", ")} belongs to model "${idAgent}", not "${model}"`,
+        400,
+        "invalid_request_error",
       );
     }
 
@@ -649,6 +699,9 @@ async function handleCompletion(req, res, registry, config, log, params, session
     // with an error the caller never saw. Reusing that session would pretend its
     // state still ends at the recorded tool-call prefix. Start from the complete
     // history the caller supplied instead.
+    if (toolResults.length > 0 && idCandidates.length === 0) {
+      log("warn", `${model}: tool result id(s) match no live turn: ${toolResults.map((result) => result.id).join(", ")}`);
+    }
     if (match && toolResults.length > 0) {
       log("warn", `${model}: discarding a settled tool turn before accepting late results${callerKey ? ` [${callerKey}]` : ""}`);
       await sessions.discard(match.convId, registry);
@@ -1042,6 +1095,7 @@ async function settleResponseTurn(o) {
   };
 
   if (outcome.calls?.length) {
+    pending.callIds = outcome.calls.map((call) => call.id);
     tools.reported(pending.bench, outcome.calls.map((c) => c.id));
     pending.sink.detach();
     pending.attached = false;
@@ -1162,9 +1216,10 @@ async function settleToolTurn(o) {
   }
 
   if (outcome.calls?.length) {
+    pending.callIds = outcome.calls.map((call) => call.id);
     // Handed over exactly once, so a second boundary in the same turn reports only
     // what is new.
-    tools.reported(pending.bench, outcome.calls.map((c) => c.id));
+    tools.reported(pending.bench, outcome.calls.map((c) => c.id), convId);
     // Nobody is listening until the next request arrives; the sink keeps whatever
     // the agent says in the meantime.
     pending.sink.detach();

@@ -68,15 +68,16 @@ files:
       rule An explicit command bypasses preset resolution entirely: 295d885ca992e32df0ab34a87464dee2c88184753418ab14046a7a452fc58d36
       test config: fdcc46de9f5e7fa2693b208338ce025aff74197396377864598ab0482566dda6
   src/mcp.js:
-    hash: 4db5b16e8ab4a7e5146985c22665f311ccd3911132ca8b2f4ededf69f9dfd4b2
-    target: bab67bef83ebe5e4bc26f2169ae87f78af99911571409d28eef43f3be3f45079
+    hash: 2e3f6c0dc4aedd6e7af8523ed6ea629bd4e8413a3c554ffff80cdc4d0ccaa0dc
+    target: 8f599fec72f3c122b682789601687c6041f8e2c5d047747f1b1a8025bcb70413
     blocks:
       (preamble): b3b7f3f2811af89ddea17f4af0504e85a4fd7af4c6b1bd28105eff84b3e35840
       application_context The caller's own tools, served to the agent as an MCP server: c2187d5bce8d94ccece67d72acc47e41b9fda6937a7d415e4aec8fd29ab4ca22
       decision A tool call is PARKED, not answered: 6b276de48bdff1fc2f75f7d6aaaa1c79d396879accfdacdfebc1906d917627b9
+      invariant A handed-over call id names only its live suspended turn: 62c7d284b7e01ab17afc707c304d6c38a7d9442ad08fbf9f4eb162447095adf5
       invariant The path token is the MCP credential: 38b85478fe598ef163de963fad11b607bb4312e60cd41ff49c6f17ece12f2271
       "system_invariant Transport: stateless streamable HTTP": 36a1a37dc265fa561ef7c984df1cbb093b37b51892764070feaa74928c768e7e
-      verification_and_unit_test_criteria: c4a4ffc3f5ef1c4d697fbe8a4772a64f32c998001f6463872f706fe9aadb24cc
+      verification_and_unit_test_criteria: 6e14b34d06b29f2ade3ba56ec5fde641e5cfc4fedd3202b6c5727f8c74514d37
       scope_boundary What this is not: 428290e591d79576ecb4ab2f8cb471de74c76c85db79e6e7abf0166821e9b21c
   src/metrics.js:
     hash: 6172931a99be65a071a5510968fd179d762f604760cd0cf89a018c7488f4f5f5
@@ -163,16 +164,17 @@ files:
       invariant Responses only renames canonical usage: ec2a9dc4dd6040da0efc4461529b85c442c4e58175d4a2d170ae2320f32aa3b3
       test responses: c0873bf93ae37d0254fe34164e275523fc045b1900bcb58382f5984ba4563162
   src/server.js:
-    hash: 78214b93a9f8625bcff033d7095c8bb4ed4866df2f05b7f4ed44e3dcf15d06e7
-    target: bba26569888dc69e4c42b01440c907c910389bd9467e88bb380f4c7e64b1d3bd
+    hash: e3ff203327d87cb2bddced5c688db30aa28b7148542a6cbd9c4831c2ec1123f7
+    target: 53077ab86088bd56aaacf4c7f02c83341912f2de75dea974ccfe9757c877368b
     blocks:
       goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
       scope What this module owns: a057aff980e722734c52795a75b5d03c3c69dc0a71c85f91835705e3615bcb5d
       ui Routes: 51c9142ffada94904f93a1152e45928b55c355fbb32f1f4d69f3c3d59841c40c
       decision Authentication belongs to the router: dc5583b676c0bdcd116ebc866904d18e8a5acef9ca3001fb1f18c5b407b55572
       func handleCompletion: c5df34909a3b262b9c0fef2fd090d3d5857c547c7696385d773653582b130763
-      func handleCompletion > flow: 8edd2b8c0dc923662497f775e947dd0fdd90a1c70f6b40c6bde09275823b7c8d
+      func handleCompletion > flow: b84072f07fa34df127e5a30e6268bf5a60799bbdfbea2d035ecaaf02cf5330cb
       invariant Every HTTP surface uses the shared turn lifecycle: 5749510955e6937d141bb9730b2a60e483c8557d0186d20ed25ad5539bdb9522
+      invariant Every HTTP surface uses the shared turn lifecycle > invariant A live tool call id is the strongest Chat continuation identity: 3c00e81135643544e0ff0d99a5c57c88c0b187d965c8ec30c92cb3e49914433a
       invariant Every HTTP surface uses the shared turn lifecycle > invariant A session that never answered is discarded: e6bc789e724c205ef5274911a620b4ca380cad0ffd9c0352f1bace47cd01fd08
       invariant Every HTTP surface uses the shared turn lifecycle > invariant A dead session retires its conversation: 9188eb8c3213c0bf805aaa89fd326914c7a00efe8d41cc2bd5933bb21461e918
       invariant Every HTTP surface uses the shared turn lifecycle > rule A turn nobody waited for does not cost a KEYED session: 1e6598b0c96cad34a5f96eddd7f86ed4f2ec1526d2e4ea308d9d077e5de99d18
@@ -187,17 +189,20 @@ files:
       func handleResponse > invariant A failed first turn leaves nothing behind: 6ed4c657b23d4ea3dcf87dbf551fbaeafeffa2e0e2c6f4a58a5fd9b47adb59f4
       func handleResponse > invariant Responses tool turns keep the same escape hatches: 4d1fbac573cb38d12fa5519bfa47b0b2a05e46a2466c121ba95d48d5cf65507e
       invariant Closing the server closes every agent: 315bc80e3612937b67068e06fdb2059752ccb7edda060e44e7497387159f04b9
-      test server: 974241c0c4fb647f1dbbfc386f1f605d2b65f8095544e6fda528495837d54281
+      test server: 76830692f541566dcc333dc89a1b3d0373c78d3bdef665e0bb39e3e8c596319c
   src/sessions.js:
-    hash: ace3c1835e8f1c1c85d82cf8025ed1774256adc2918d10f475c91b19a1856bb1
-    target: 0e8220e1a212e3ed95a01e8eec2e1e090574d7161922abef5b732a0064cbe06b
+    hash: 638b2b173a6e9acf87caa69a5afe8c17236468601cb9e4d9dc8a63df1f6b6f8e
+    target: 401e35226ce8802a88d4e0d10df4e26dbd80292d3b046a400122c021e6a3179d
     blocks:
       goal Keep conversations alive without leaking logins: 21d91386497248afb75265c83c7e8844c46df84cd811f8d6d310d6b6af31273b
       invariant The unit of retention is a conversation, not a response: ec50861fa9dbcf1e5e4afe3d2fd2f68b4d8f9439dc442a68430ef69d387f1bea
       invariant Every path out of the store closes the ACP session: bafdc76cc6819cb9ed49e7b93c481f127c9c8c4ef7bc6d6fdca55c47f4ea1a48
-      rule Continuity turns a stateless caller into a conversation: 6ab76d4059b6d1a71e33ff9a778439dc1f20471a3503b700caab57f73192bebc
-      invariant Suspended turns are reachable and self-releasing: a0b82757ffe204a37a117ecdc9cd82096ba2b8ae8087543e32c004b79095abb8
-      invariant Matching and claiming are one synchronous operation: c97c8911f55f183b4b6f54b69efc402c824c3f182dba0cb9ee85e08dc1f51b2f
+      rule Continuity turns a stateless caller into a conversation: 8627cfc33086147daa36efae89f4acbc68766f06ed61f5d58dcc3719f311a480
+      decision Fingerprint semantic messages, not their wire serialization: 003fc7078b280f29e2ae3ec19f6828d866480612da5573ba5ff2949d6232d351
+      invariant What is matched is what the agent heard: 2e11c8cce4b820e1a1139005a50c45330f6f3038ec818251c9b515b1ed729b50
+      invariant Fingerprint generations never mix: 68bc85c5b5bf973ef93d0b50b4237ac9a9bb03f5f99c322e2928984eb65c122b
+      invariant Suspended turns are reachable and self-releasing: 5c4571252bfcb9cc90c014d5b7a275d0e228c18a5a6fce13dd0abb264320fd8f
+      invariant Matching and claiming are one synchronous operation: 18ba4c74d262418a0e5ae4a771be1ca077069fdeaf5d763964a7c74a19da83e9
       decision A keyed busy conversation refuses instead of forking: 16cc0b65b22842e3720dad603f6dcee83b6a5fc05a7fa4eab34b4eb7608839fd
       "openquestion Rename server.busy: fork": 0594f090c28d87909e8efdf53b1d73c2ac5000d66432b408d638be71a95660a6
       rule Going quiet costs a session, never a conversation: 868c95d3f841706584993362e2b15da462b3cf6b768111bc2138da73b72b3353
@@ -205,7 +210,7 @@ files:
       func prune: de3a0bbf6a714099aada126dcd8e451e2fc289380e6338a55aff2abe76e33b7c
       func prune > arg agents: d8422b3bcf479ebc8f5d12d6b672498c2900e731c1072b71127eb267dde4741e
       func prune > invariant No clock of its own: 6c9a7d4091d92c670d827c2f6c47075fc873a1200f8eb245e4d046ba06bd3396
-      test sessions: 102e6de3902409a9cfd428fcfc63afcea515198f44d94b75e135588d8125c4d6
+      test sessions: 83f8e3eeffb26fc76e9c96336421884a32a916064d46ae45078558f012d62b4c
   src/terminal.js:
     hash: bfa82662d6fbc00f51228945262bc6acfdf93d0370fa8226fd14a8c7f4107cb7
     target: 75c1a0237c2f7a39d02af711201a9e6f1188efb90c96e3f1177e9d12dc8b8893
