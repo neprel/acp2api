@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,7 +55,10 @@ test("metrics listener failures are one line and exit 2", async (t) => {
 });
 
 test("--probe prints live options and capabilities without configuring or prompting", async () => {
+  const root = mkdtempSync(join(tmpdir(), "acp2api-probe-workspace-"));
+  const workspace = join(root, "not-created-yet");
   const result = await run({
+    server: { cwd: workspace },
     agents: [{
       name: "fixture",
       type: "general",
@@ -69,6 +72,7 @@ test("--probe prints live options and capabilities without configuring or prompt
 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.stderr, "");
+  assert.equal(existsSync(workspace), true);
   const output = JSON.parse(result.stdout);
   assert.equal(output.agent, "fixture");
   assert.deepEqual(output.configOptions[0], {
@@ -83,4 +87,18 @@ test("--probe prints live options and capabilities without configuring or prompt
   });
   assert.equal(output.capabilities.steering.supported, true);
   assert.deepEqual(output.capabilities.sessionCapabilities.close, {});
+});
+
+test("--probe reports the real spawn failure", async () => {
+  const result = await run({
+    agents: [{
+      name: "missing",
+      type: "general",
+      command: "/definitely/missing/acp-agent",
+    }],
+  }, ["--probe", "missing"]);
+
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /spawn failed: spawn \/definitely\/missing\/acp-agent ENOENT/);
+  assert.match(result.stderr, /probe error: missing: spawn failed:/);
 });

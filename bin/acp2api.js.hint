@@ -53,10 +53,11 @@ port failures are startup input/environment problems, not stack-bearing server b
 
 # invariant The workspace exists before the first request {#mkdir_workspace}
 
-Every `cwd` — the server's and each agent's — is created at startup. It is a
-bind-mounted volume that does not exist on a fresh host, and an agent that cannot
-chdir into it fails per request, which reads as a broken agent rather than a missing
-directory.
+Every entry point that can spawn an agent first creates every configured `cwd` —
+the server's and each agent's. This includes `--probe`: a bind-mounted workspace may
+not exist on a fresh host, and bypassing setup makes the adapter die at spawn while
+the probe misleadingly reports only a closed ACP connection. Probe also forwards
+spawn errors through the CLI logger so a genuinely bad command remains legible.
 
 # rule Shutdown closes the server, which closes the agents {#shutdown}
 

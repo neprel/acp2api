@@ -58,17 +58,37 @@ if (opts.check) {
   process.exit(0);
 }
 
+// The workspace is a bind-mounted volume that does not exist on a fresh host. An
+// agent that cannot chdir into it fails at spawn, which reads as a broken adapter
+// rather than a missing directory. Every entry point that can spawn goes through
+// this first, including --probe.
+function ensureWorkspaces() {
+  for (const dir of new Set([config.server.cwd, ...config.agents.map((a) => a.cwd)])) {
+    mkdirSync(dir, { recursive: true });
+  }
+}
+
+ensureWorkspaces();
+
 if (opts.probe) {
   const spec = config.agents.find((agent) => agent.name === opts.probe);
   if (!spec) {
     console.error(`probe error: no agent named "${opts.probe}"; configured: ${config.agents.map((a) => a.name).join(", ")}`);
     process.exit(2);
   }
-  const agent = new Agent(spec, config.server);
+  let spawnError = null;
+  const agent = new Agent(spec, config.server, (level, message) => {
+    // Keep successful probe output as one JSON document, but never silence the
+    // spawn diagnostic that explains an otherwise generic connection close.
+    if (level === "error") {
+      spawnError = message;
+      log(level, message);
+    }
+  });
   try {
     console.log(JSON.stringify(await agent.probe(), null, 2));
   } catch (error) {
-    console.error(`probe error: ${error.message}`);
+    console.error(`probe error: ${spawnError ?? error.message}`);
     process.exitCode = 2;
   } finally {
     await agent.close();
@@ -82,13 +102,6 @@ if (opts.probe) {
 // loopback bind is worth reading once rather than discovering later.
 if (!/^(127\.\d+\.\d+\.\d+|localhost|::1)$/i.test(config.server.host)) {
   log("warn", `listening on ${config.server.host} -- there is no authentication here; put a router or proxy in front`);
-}
-
-// The workspace is a bind-mounted volume that does not exist on a fresh host. An
-// agent that cannot chdir into it fails per-request, which reads as a broken agent
-// rather than a missing directory.
-for (const dir of new Set([config.server.cwd, ...config.agents.map((a) => a.cwd)])) {
-  mkdirSync(dir, { recursive: true });
 }
 
 const server = createServer(config, { log });

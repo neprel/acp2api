@@ -3,8 +3,8 @@
 version: 2
 files:
   bin/acp2api.js:
-    hash: b3b5055391afc6774ef703cb8291f3c8b14c70c1d190d9f2b8436e3156f1329b
-    target: 4fc3735999a6f80c0d58badc8f1a5e1b9c41fbc58f0c5b7c134b9d7ce50323d0
+    hash: f3d6ab16ac93f62341d2dee97a9f6719ced896c88dbc2c80a5186894de7a0a49
+    target: ae3be85dd9c48f44095da87e3bf93fc51ce92ac59c1b43ad758f3d56119399e1
     blocks:
       goal Fail before binding, or run predictably: feeb79f4bf5b72fd71f75b023868d077e10714a7de2e05c564b970891c48a336
       scope What this module owns: 62e4db39d183e3ce20945fca7d48a9cc90d5d6159c3d8e20cc368cc1a72dcc24
@@ -13,7 +13,7 @@ files:
       rule --check must exercise the real path: 9f510befe17832ef2b9a37d094cd91615ffe280f319c79d3377ac3f96d7baa1e
       rule --probe is the safe live vocabulary check: b93305fb2cfc06df12d3722f3799ddff9591e14882111d261cfd4a3840bfa895
       rule Listener errors are operator errors: 6d7f82c6062250a9334e4be6e36e529875a0f546a6f703a063ed7355ec69fd4d
-      invariant The workspace exists before the first request: 7bc4e0a7e4d8a1bf3b5dea255ee08b1deea9a4f8b2449964eea2fbe970139e1a
+      invariant The workspace exists before the first request: 5cf8dfb880b71f0517d9b05dde2468c4ac769f1a38c94d41943a3863562b52a8
       rule Shutdown closes the server, which closes the agents: b92bfc1f2f9037c96eb91548528658729c4ff276ab05d018e3d7e20e5fd37aeb
       good Log lines are timestamped, levelled, and go to the right stream: 3240818d4cd5b088ffa251cf14cbe1f5213ad0e45f8d647df2ca7852cdfbb8c0
   src/agent.js:
