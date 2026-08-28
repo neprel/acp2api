@@ -279,6 +279,10 @@ test("a tool-enabled response timeout is 504", async (t) => {
 
 test("a streaming tool-enabled response timeout reports an error without completing", async (t) => {
   const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  // This test pins the post-header timeout shape, not cold process startup. Warm
+  // the fixture so spawning cannot consume the whole 300 ms before PARTIAL lands.
+  const warm = await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION", store: false }));
+  assert.equal(warm.status, 200);
   const res = await call(
     "/v1/responses",
     post({ model: "fake", input: "HANG", tools: TOOLS, stream: true }),
@@ -288,7 +292,7 @@ test("a streaming tool-enabled response timeout reports an error without complet
   const frames = sseFrames(await res.text());
   assert.equal(frames.at(-1).data, "[DONE]");
   const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
-  assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s1/.test(e.delta)));
+  assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s2/.test(e.delta)));
   assert.equal(frames.at(-2).event, "error");
   assert.equal(events.at(-1).error.code, "timeout");
   assert.ok(events.every((e) => e.type !== "response.completed"));

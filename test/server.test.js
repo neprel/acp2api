@@ -985,6 +985,13 @@ test("a tool-enabled timeout is 504 and does not remember partial text", async (
 
 test("a streaming tool-enabled timeout reports an error without a successful terminal frame", async (t) => {
   const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  // This test pins the post-header timeout shape, not cold process startup. Warm
+  // the fixture so spawning cannot consume the whole 300 ms before PARTIAL lands.
+  const warm = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "ECHOSESSION" }],
+  }));
+  assert.equal(warm.status, 200);
   const res = await call("/v1/chat/completions", chat({
     model: "fake",
     messages: [{ role: "user", content: "HANG" }],
@@ -996,7 +1003,7 @@ test("a streaming tool-enabled timeout reports an error without a successful ter
   const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
   assert.equal(frames.at(-1), "[DONE]");
   const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
-  assert.match(chunks.map((c) => c.choices?.[0]?.delta?.content ?? "").join(""), /PARTIAL:s1/);
+  assert.match(chunks.map((c) => c.choices?.[0]?.delta?.content ?? "").join(""), /PARTIAL:s2/);
   assert.equal(chunks.at(-1).error.code, "timeout");
   assert.ok(chunks.slice(0, -1).every((c) => c.choices[0].finish_reason === null));
 });
