@@ -22,9 +22,13 @@ non-empty string, `limitPatterns` are compiled `RegExp`s, and `mcpServers` are i
 ACP's exact wire shape. No defensive re-checking anywhere else — if a value can be
 wrong, it is rejected here.
 
-Consequence for changes: **a new option needs three things in the same commit** — an
-entry in `DEFAULTS`, a `req(...)` assertion, and a test asserting the rejection. Two
-out of three is a silent hole.
+Each structured level has one declarative schema: valid keys, type, coercion,
+default and enum values live together. Unknown keys are rejected from those schema
+keys with an edit-distance suggestion; only explicitly free-form mappings (`env`,
+`options`, labels, MCP headers/env) stop recursion. **A new option is added to its
+schema or it does not exist** — never add a parallel default, key list, or coercion
+branch that a future field can miss. Its commit also needs a test for acceptance and
+rejection.
 
 # func normalizeConfig {#normalize}
 
@@ -54,14 +58,30 @@ message and anything else as a stack trace.
 # rule ${VAR} expansion happens before validation, and yields strings {#env_strings}
 
 `${VAR}` and `${VAR:-fallback}` expand recursively over the whole document first, so
-validation sees final values. An unset variable with no fallback is **fatal** — the
-alternative is a server that silently starts with a half-expanded config.
+validation sees final values. A set-but-empty bare `${VAR}` stays empty; `:-` uses
+its fallback for either unset or empty, matching its shell meaning. An unset bare
+variable is **fatal** — the alternative is a server that silently starts with a
+half-expanded config. `$${VAR}` emits literal `${VAR}` text, which is required for
+free text such as warm-up prompts and MCP headers.
 
-Because expansion always produces strings, `port` and `requestTimeoutMs` are coerced
-from numeric strings before their integer checks, and `fs` from `"false"`/`"0"`.
-Any new numeric or boolean option needs the same treatment or it breaks the moment
-someone sources it from the environment. Coercion is deliberately narrow: only
-`/^\d+$/` converts, so nonsense still fails validation rather than becoming `NaN`.
+Because expansion produces strings, every integer/count/`*Ms` field uses the
+schema's integer coercion, every boolean uses its boolean coercion, and
+`maxContextFill` uses the float coercion. Coercion is deliberately narrow, so
+nonsense still fails validation rather than becoming `NaN` or truthy by accident.
+
+# rule Listener addresses are normalized here
+
+`server.port` is an integer from 1 through 65535. `metricsAddr` is either `"off"`
+or normalized once into `{host, port}`; consumers must not split the source string
+again. Hostnames/IPv4 use `host:port`; IPv6 is supported only in unambiguous
+bracketed form, `[::1]:9090`.
+
+# rule CORS is an explicit exposure decision
+
+`server.cors` defaults to `false`. A non-empty origin string permits that origin;
+`true` deliberately selects `*`. The server has no authentication, so browser
+access must never become default-open. Environment-expanded boolean strings use
+the same coercion as the other boolean fields.
 
 # func resolvePreset {#resolve_preset}
 
@@ -88,10 +108,15 @@ Merging the two would silently append adapter flags to someone's custom binary.
 - an explicit `command` overrides the preset and does not inherit its args
 - `resolvePreset` falls back to the bare bin name when the package is absent
 - duplicate agent names are rejected — they are the OpenAI model ids
+- unknown keys at every structured level name their path and closest valid key
 - `port`, `permission`, `unsupportedParams`, `type`, `name`, `args` each rejected when malformed
-- `${VAR}` expands, `${VAR:-default}` falls back, an unset bare `${VAR}` throws
-- numeric strings from `${VAR}` coerce for `port`/`requestTimeoutMs`, but `"http"` still fails
+- `${VAR}` preserves an empty value, `${VAR:-default}` falls back for empty/unset,
+  `$${VAR}` stays literal, and an unset bare `${VAR}` throws
+- every numeric and boolean field accepts its env-expanded string form, but nonsense still fails
+- `metricsAddr` parses hostname/IPv4 and bracketed IPv6, and rejects malformed or out-of-range ports
+- `cors` defaults off, accepts one origin or an explicit wildcard, and rejects malformed values
 - `limitPatterns` compile case-insensitively and replace the default list when given
+- an invalid `limitPatterns` regex is a path-qualified `ConfigError`, not a raw `SyntaxError`
 - MCP mappings convert to `[{name, value}]`; stdio gets `args`/`env` even when omitted
 - `continuity` accepts a boolean, and a "false"/"0" string from ${VAR}
 - `loadConfig` prefixes errors with the file path and reports an unreadable file

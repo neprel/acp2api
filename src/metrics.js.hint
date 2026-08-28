@@ -24,12 +24,13 @@ library would be a fifth package to concatenate strings — see [#deps](../_.hin
 
 # rule Where each number is recorded, and why not anywhere else {#record_sites}
 
-Two call sites, and the split is not arbitrary.
+Three ownership sites, and the split is not arbitrary.
 
 | what | where | why there |
 | --- | --- | --- |
 | `turns_total`, `turn_duration_seconds` | `Agent#turn` | the one funnel every caller path goes through, and the ONLY place that sees a turn that threw |
 | tokens, cost, context fill | `settleUsage` in server.js | runs exactly once per turn and holds the only per-turn figures that exist |
+| `sessions_live` | SessionStore open/park/revive/close transitions | the store is the owner that knows whether a conversation has a resident ACP session |
 
 `settleUsage` reaches the recorder as `sessions.metrics?.` rather than taking it as
 an argument, because there are five call sites for it and threading a parameter
@@ -55,6 +56,11 @@ That gap IS the signal. An agent whose turns climb while its tokens stay flat is
 not a cheap agent, it is an unmeasured one, and a dashboard that showed it as `0`
 would be confidently wrong. Do not "fix" the missing series by initialising
 counters to zero.
+
+The same absence rule applies to `sessions_live`: when an agent's last resident
+session parks or closes, its series is removed rather than exported as zero. A
+scrape therefore never gains a zero-only agent merely because it once held a
+session.
 
 # bad Two labels that must never be added {#label_hazards}
 
@@ -109,5 +115,6 @@ running, not counters that start at the moment they looked.
 - an agent that reports no usage emits no token series at all
 - operator labels appear on every sample and never leak between agents
 - a rate-limited turn is counted once, as `rate_limited`, and not also as `ok`
+- live-session series follow open/park/revive/close and disappear at zero
 - quotes and newlines in a label value cannot break the exposition format
 - `/metrics` answers `text/plain; version=0.0.4`; every other path is 404

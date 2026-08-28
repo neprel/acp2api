@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Agent } from "../src/agent.js";
@@ -11,15 +13,34 @@ import { SessionStore } from "../src/sessions.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "fake-agent.js");
 
-async function start(t, { server: serverOpts } = {}) {
+function sseFrames(text) {
+  return text.split("\n\n").filter(Boolean).map((frame) => {
+    const lines = frame.split("\n");
+    return {
+      event: lines.find((line) => line.startsWith("event: "))?.slice(7) ?? null,
+      data: lines.find((line) => line.startsWith("data: "))?.slice(6),
+    };
+  });
+}
+
+async function start(t, { server: serverOpts, specs } = {}) {
   const config = normalizeConfig(
     {
       server: { host: "127.0.0.1", cwd: here, ...serverOpts },
-      agents: [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
+      agents: specs ?? [{ name: "fake", type: "general", command: process.execPath, args: [FIXTURE] }],
     },
     { baseDir: here, env: {} },
   );
-  const s = createServer(config, { agents: new Map(config.agents.map((a) => [a.name, new Agent(a, config.server)])) });
+  const lines = [];
+  const listeners = new Set();
+  const log = (_level, line) => {
+    lines.push(line);
+    for (const listener of [...listeners]) listener(line);
+  };
+  const s = createServer(config, {
+    agents: specs ? undefined : new Map(config.agents.map((a) => [a.name, new Agent(a, config.server)])),
+    log,
+  });
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
   t.after(() => {
     // Destroyed rather than drained -- see the note in server.test.js. A request
@@ -29,7 +50,24 @@ async function start(t, { server: serverOpts } = {}) {
     return new Promise((r) => s.close(r));
   });
   const base = `http://127.0.0.1:${s.address().port}`;
-  return (path, init = {}) => fetch(base + path, { headers: { "content-type": "application/json" }, ...init });
+  const call = (path, init = {}) => fetch(base + path, { headers: { "content-type": "application/json" }, ...init });
+  call.until = (re) =>
+    new Promise((resolve, reject) => {
+      if (lines.some((line) => re.test(line))) return resolve();
+      const timer = setTimeout(() => {
+        listeners.delete(listener);
+        reject(new Error(`nothing matched ${re} in the server log:\n  ${lines.join("\n  ")}`));
+      }, 10_000);
+      const listener = (line) => {
+        if (!re.test(line)) return;
+        clearTimeout(timer);
+        listeners.delete(listener);
+        resolve();
+      };
+      listeners.add(listener);
+    });
+  call.metrics = s.metrics;
+  return call;
 }
 
 const post = (body) => ({ method: "POST", body: JSON.stringify(body) });
@@ -130,6 +168,41 @@ test("previous_response_id continues in the SAME ACP session", async (t) => {
   assert.equal(ids.output_text, "s1");
 });
 
+test("Responses usage includes cached input through the canonical mapping", async (t) => {
+  const call = await start(t);
+  const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
+  const second = await (
+    await call("/v1/responses", post({ model: "fake", input: "two", previous_response_id: first.id }))
+  ).json();
+
+  assert.equal(second.usage.input_tokens, 21);
+  assert.equal(second.usage.input_tokens_details.cached_tokens, 10);
+  assert.equal(second.usage.output_tokens, 22);
+  assert.equal(second.usage.total_tokens, 43);
+  assert.equal(second.usage.input_tokens + second.usage.output_tokens, second.usage.total_tokens);
+});
+
+test("two concurrent Responses continuations cannot prompt one session", async (t) => {
+  const call = await start(t);
+  const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
+
+  const running = call(
+    "/v1/responses",
+    post({ model: "fake", input: "SLOWTURN", previous_response_id: first.id }),
+  );
+  await call.until(/claimed response continuation/);
+  const second = await call(
+    "/v1/responses",
+    post({ model: "fake", input: "must not run", previous_response_id: first.id }),
+  );
+
+  assert.equal(second.status, 409);
+  assert.equal((await second.json()).error.code, "conversation_busy");
+  const firstContinuation = await running;
+  assert.equal(firstContinuation.status, 200);
+  assert.ok(!(await firstContinuation.json()).output_text.includes("must not run"));
+});
+
 test("a chain can be continued from any response in it, not only its tip", async (t) => {
   const call = await start(t);
   const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
@@ -151,6 +224,26 @@ test("store: false answers but retains nothing", async (t) => {
   assert.equal(res.output_text, "[fast] hi");
   // Nothing to fetch and nothing to continue -- the session was closed with the turn.
   assert.equal((await call(`/v1/responses/${res.id}`)).status, 404);
+});
+
+test("tools cannot be added to an unbenched Responses continuation", async (t) => {
+  const call = await start(t);
+  const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
+
+  const rejected = await call("/v1/responses", post({
+    model: "fake",
+    input: 'USETOOL read_file {"path":"x"}',
+    previous_response_id: first.id,
+    tools: TOOLS,
+  }));
+  assert.equal(rejected.status, 400);
+  assert.match((await rejected.json()).error.message, /start a new conversation without previous_response_id/);
+
+  assert.equal((await call(`/v1/responses/${first.id}`)).status, 200, "the stored response id must survive rejection");
+  const continued = await (
+    await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION", previous_response_id: first.id }))
+  ).json();
+  assert.equal(continued.output_text, "s1", "the original conversation must remain usable");
 });
 
 test("reasoning.effort is applied per request, on a live conversation", async (t) => {
@@ -177,13 +270,52 @@ test("a quota failure is 429 here too", async (t) => {
   assert.equal(res.status, 429);
 });
 
+test("a tool-enabled response timeout is 504", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const res = await call("/v1/responses", post({ model: "fake", input: "HANG", tools: TOOLS }));
+  assert.equal(res.status, 504);
+  assert.equal((await res.json()).error.code, "timeout");
+});
+
+test("a streaming tool-enabled response timeout reports an error without completing", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const res = await call(
+    "/v1/responses",
+    post({ model: "fake", input: "HANG", tools: TOOLS, stream: true }),
+  );
+  assert.equal(res.status, 200, "partial output commits the streaming status before the timeout");
+
+  const frames = sseFrames(await res.text());
+  assert.equal(frames.at(-1).data, "[DONE]");
+  const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
+  assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s1/.test(e.delta)));
+  assert.equal(frames.at(-2).event, "error");
+  assert.equal(events.at(-1).error.code, "timeout");
+  assert.ok(events.every((e) => e.type !== "response.completed"));
+});
+
+test("a Responses stream reports an agent failure after output as an SSE error", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/responses", post({ model: "fake", input: "BOOM_AFTER_OUTPUT", stream: true }));
+  assert.equal(res.status, 200);
+
+  const frames = sseFrames(await res.text());
+  assert.equal(frames.at(-1).data, "[DONE]");
+  const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
+  assert.ok(events.some((e) => e.type === "response.reasoning_summary_text.delta"));
+  assert.equal(frames.at(-2).event, "error");
+  assert.equal(events.at(-1).error.code, "agent_error");
+  assert.ok(events.every((e) => e.type !== "response.completed"));
+});
+
 test("the event stream is typed, ordered and terminated", async (t) => {
   const call = await start(t);
   const res = await call("/v1/responses", post({ model: "fake", input: "hello", stream: true }));
   assert.match(res.headers.get("content-type"), /text\/event-stream/);
-  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
-  assert.equal(frames.at(-1), "[DONE]");
-  const events = frames.slice(0, -1).map((f) => JSON.parse(f));
+  const frames = sseFrames(await res.text());
+  assert.equal(frames.at(-1).data, "[DONE]");
+  const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
+  assert.deepEqual(frames.slice(0, -1).map((f) => f.event), events.map((e) => e.type));
 
   assert.deepEqual(
     events.map((e) => e.type).filter((t, i, a) => a.indexOf(t) === i),
@@ -207,6 +339,47 @@ test("the event stream is typed, ordered and terminated", async (t) => {
   const added = events.filter((e) => e.type === "response.output_item.added");
   assert.deepEqual(added.map((e) => e.output_index), [0, 1]);
   assert.equal(events.at(-1).response.output_text, "[fast] hello");
+});
+
+test("a stalled Responses stream keeps named events ordered and densely sequenced", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp2api-responses-slow-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const marker = join(dir, "long-output-finished");
+  const call = await start(t, {
+    specs: [{
+      name: "fake",
+      type: "general",
+      command: process.execPath,
+      args: [FIXTURE],
+      env: { LONG_CAPTURE_FILE: marker },
+    }],
+    server: { requestTimeoutMs: 10_000 },
+  });
+  const res = await call("/v1/responses", post({ model: "fake", input: "LONG_OUTPUT", stream: true }));
+
+  // Hold the response unread until the real ACP turn has emitted and settled.
+  for (;;) {
+    let emitted = false;
+    try {
+      emitted = (await readFile(marker, "utf8")).includes("done");
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+    const settled = /acp2api_turns_total\{agent="fake",outcome="ok"\} 1/.test(call.metrics.render());
+    if (emitted && settled) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  const frames = sseFrames(await res.text());
+  assert.equal(frames.at(-1).data, "[DONE]");
+  const events = frames.slice(0, -1).map((frame) => JSON.parse(frame.data));
+  assert.deepEqual(frames.slice(0, -1).map((frame) => frame.event), events.map((event) => event.type));
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, i) => i));
+  assert.equal(
+    events.filter((event) => event.type === "response.output_text.delta").map((event) => event.delta).join(""),
+    "x".repeat(2 * 1_048_576),
+  );
+  assert.equal(events.at(-1).type, "response.completed", "terminal events stay behind held delta text");
 });
 
 test("the store parks a conversation on expiry and on eviction", async () => {
@@ -319,6 +492,27 @@ test("/v1/responses serves a caller's tools and reports a call as a function_cal
   assert.match(fc.call_id, /^call_/);
 });
 
+test("Responses does not report tools as ignored while serving them", async (t) => {
+  const call = await start(t);
+  const body = await (
+    await call("/v1/responses", post({
+      model: "fake",
+      input: 'USETOOL read_file {"path":"x"}',
+      tools: TOOLS,
+      temperature: 0,
+    }))
+  ).json();
+
+  assert.deepEqual(body.x_acp2api.ignored, ["temperature"]);
+  assert.ok(body.output.some((item) => item.type === "function_call"));
+});
+
+test("a tool-enabled response failure exits through the handler's timer cleanup", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 5_000 } });
+  const res = await call("/v1/responses", post({ model: "fake", input: "BOOM", tools: TOOLS }));
+  assert.equal(res.status, 502);
+});
+
 test("a function_call_output continues the same suspended turn", async (t) => {
   const call = await start(t);
   const first = await (
@@ -342,6 +536,84 @@ test("a function_call_output continues the same suspended turn", async (t) => {
   assert.match(second.output_text, /RESULT:the file said hello/);
 });
 
+test("new Responses input waits for release, then continues the same session", async (t) => {
+  const call = await start(t, { server: { toolTimeoutMs: 50 } });
+  const first = await (
+    await call("/v1/responses", post({ model: "fake", input: 'USETOOL read_file {"path":"x"}', tools: TOOLS }))
+  ).json();
+  assert.ok(first.output.some((o) => o.type === "function_call"));
+
+  const blocked = await call("/v1/responses", post({
+    model: "fake",
+    previous_response_id: first.id,
+    input: "ECHOSESSION",
+    tools: TOOLS,
+  }));
+  assert.equal(blocked.status, 409);
+  const error = (await blocked.json()).error;
+  assert.equal(error.code, "tool_result_expected");
+  assert.match(error.message, /matching function_call_output/);
+  assert.match(error.message, /without previous_response_id/);
+
+  // The caller does nothing to unblock the turn. Its real MCP deadline settles
+  // it, and the store's watcher releases the conversation without losing the
+  // Responses session history.
+  await call.until(/released: suspended turn settled unattended/);
+  const continued = await call("/v1/responses", post({
+    model: "fake",
+    previous_response_id: first.id,
+    input: "ECHOSESSION",
+    tools: TOOLS,
+  }));
+  assert.equal(continued.status, 200);
+  assert.equal((await continued.json()).output_text, "s1");
+});
+
+test("store: false with served tools is rejected before opening a session", async (t) => {
+  const call = await start(t);
+  const refused = await call("/v1/responses", post({
+    model: "fake",
+    input: 'USETOOL read_file {"path":"x"}',
+    tools: TOOLS,
+    store: false,
+  }));
+  assert.equal(refused.status, 400);
+  assert.equal((await refused.json()).error.code, "store_required");
+
+  const next = await (
+    await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION" }))
+  ).json();
+  assert.equal(next.output_text, "s1", "the rejected request must not spend a session");
+});
+
+test("a resumed response tool turn is bounded by the resuming request's timeout", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const first = await (
+    await call(
+      "/v1/responses",
+      post({ model: "fake", input: 'USETOOL read_file {"path":"x"} HANG_AFTER_TOOL', tools: TOOLS }),
+    )
+  ).json();
+  const fc = first.output.find((o) => o.type === "function_call");
+
+  const started = Date.now();
+  const resumed = await call(
+    "/v1/responses",
+    {
+      ...post({
+        model: "fake",
+        previous_response_id: first.id,
+        input: [{ type: "function_call_output", call_id: fc.call_id, output: "hello" }],
+        tools: TOOLS,
+      }),
+      signal: AbortSignal.timeout(2_000),
+    },
+  );
+  assert.equal(resumed.status, 504);
+  assert.equal((await resumed.json()).error.code, "timeout");
+  assert.ok(Date.now() - started < 1_500, "the resuming request must use its own deadline");
+});
+
 test("a streaming turn that stops for a tool ends with the call in the terminal event", async (t) => {
   // The call is not invented as a delta sequence -- it arrives whole -- but the
   // stream must still be well formed and must not end pretending the turn is over
@@ -354,9 +626,10 @@ test("a streaming turn that stops for a tool ends with the call in the terminal 
   assert.equal(res.status, 200);
   assert.match(res.headers.get("content-type"), /text\/event-stream/);
 
-  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
-  assert.equal(frames.at(-1), "[DONE]");
-  const events = frames.slice(0, -1).map((f) => JSON.parse(f));
+  const frames = sseFrames(await res.text());
+  assert.equal(frames.at(-1).data, "[DONE]");
+  const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
+  assert.deepEqual(frames.slice(0, -1).map((f) => f.event), events.map((e) => e.type));
   assert.equal(events[0].type, "response.created");
   const done = events.at(-1);
   assert.equal(done.type, "response.completed");

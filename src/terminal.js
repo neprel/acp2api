@@ -78,9 +78,10 @@ class Terminal {
         this.exit = { exitCode: code ?? null, signal: signal ?? null };
         resolve(this.exit);
       });
-      child.once("error", () => {
+      child.once("error", (err) => {
         // A spawn failure still has to settle: an agent waiting on exit would
         // otherwise wait for the life of the session.
+        this.tail.push(Buffer.from(`${err.message}\n`));
         this.exit ??= { exitCode: null, signal: null };
         resolve(this.exit);
       });
@@ -143,7 +144,8 @@ export class Terminals {
   }
 
   create({ command, args = [], env = [], cwd = null, outputByteLimit = null }) {
-    if (this.#open.size >= this.max) {
+    const running = [...this.#open.values()].filter((term) => !term.exit).length;
+    if (running >= this.max) {
       throw new Error(`too many terminals open (${this.max}); release one first`);
     }
     const dir = cwd ? resolve(this.cwd, cwd) : this.cwd;

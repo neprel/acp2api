@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chunk, completion, deltaUsage, parseChatRequest, RequestError, toPromptBlocks } from "../src/openai.js";
+import {
+  chunk,
+  completion,
+  deltaUsage,
+  parseChatRequest,
+  RequestError,
+  toolCallDeltas,
+  toPromptBlocks,
+} from "../src/openai.js";
 
 test("a single user turn is passed through with no scaffolding", () => {
   assert.deepEqual(toPromptBlocks([{ role: "user", content: "hi" }]), [{ type: "text", text: "hi" }]);
@@ -29,6 +37,26 @@ test("developer messages are treated as system", () => {
     { role: "user", content: "go" },
   ]);
   assert.equal(block.text, "rules\n\ngo");
+});
+
+test("streaming tool calls carry complete SDK-accumulator entries indexed in order", () => {
+  assert.deepEqual(toolCallDeltas([
+    { id: "call_a", name: "read_file", arguments: '{"path":"a"}' },
+    { id: "call_b", name: "write_file", arguments: '{"path":"b"}' },
+  ]), [
+    {
+      index: 0,
+      id: "call_a",
+      type: "function",
+      function: { name: "read_file", arguments: '{"path":"a"}' },
+    },
+    {
+      index: 1,
+      id: "call_b",
+      type: "function",
+      function: { name: "write_file", arguments: '{"path":"b"}' },
+    },
+  ]);
 });
 
 test("content part arrays flatten, data: images become image blocks", () => {

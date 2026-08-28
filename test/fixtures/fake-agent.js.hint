@@ -21,15 +21,51 @@ The prompt text selects the behaviour, so a test asks for the failure it wants.
 | --- | --- | --- |
 | `QUOTA` | fails with usage-limit phrasing | the 429 path |
 | `BOOM` | fails with an unrelated error | that 502 stays 502 |
-| `HANG` | never finishes on its own | cancellation and the 504 path |
+| `DIE` | exits the child during `session/prompt` without answering | mid-turn crash classification and respawn |
+| `BOOM_AFTER_OUTPUT` | emits a thought, then fails with an unrelated error | post-header SSE error framing |
+| `SPLIT_STOP` | emits `STOP` across two text chunks | streaming stop-prefix holdback |
+| `HANG` | emits identifiable partial text, then never finishes on its own | cancellation, the 504 path, and partial-answer honesty |
+| `IGNORE_CANCEL` | keeps streaming after `session/cancel` and never answers the prompt | the post-cancel drain deadline and dead-session rule |
+| `HANG_CLOSE` | answers normally, then leaves that session's `session/close` request pending | close is bounded, logged, and swallowed |
+| `HANG_AFTER_TOOL` | calls a client tool, accepts its result, then never finishes on its own | resumed-turn timeout and disconnect handling |
+| `DELAY_RESUME` | marks the session so its next `session/resume` waits 100 ms | deterministically opens the parked-continuation race window |
+| `LATE_RESULT` | calls a client tool initially; a replay containing its result answers with `FRESH:<session id>` | late results restart from caller history on a new session |
 | `REFUSE` | completes with `stopReason: "refusal"` | stop-reason mapping |
 | `COUNT` | streams 20 words, checking the abort each one | `max_tokens` and `stop` |
+| `LONG_OUTPUT` | streams 256 chunks of 8 KiB over real ACP stdio | slow-reader HTTP backpressure measurement |
 | `ECHOMCP` | answers with the `mcpServers` it received | that MCP config reaches `session/new` |
 | `ECHOSESSION` | answers with its own session id | which session a turn actually ran in |
 | anything else | echoes after a thought chunk and a tool call | the ordinary path |
 
 Adding a keyword means adding a row here. A branch nobody can find from this table
 is a branch the next person will duplicate.
+
+# rule Pre-session and process fixture modes
+
+Failures before a prompt exists are selected through the fixture environment:
+
+| variable | behaviour |
+| --- | --- |
+| `HANG_INITIALIZE_ONCE=<marker>` | the first child to create the marker never answers `initialize`; respawns answer normally |
+| `HANG_RPC=session/new` | `session/new` never answers |
+| `RPC_CAPTURE_FILE=<path>` | writes the first MCP URL received by `session/new`, so cleanup can be probed over real HTTP |
+| `PID_FILE=<path>` | writes the fixture pid at startup |
+| `WARM_CAPTURE_FILE=<path>` | appends `warm` for `WARMCOUNT` prompts and `fork` for fork requests, across respawns |
+| `TRAP_SIGTERM=1` | ignores SIGTERM so shutdown must escalate to SIGKILL |
+| `GARBAGE_STDOUT=1` | writes non-JSON lines before initialization and during a prompt, among valid frames |
+| `LONG_CAPTURE_FILE=<path>` | marks when a `LONG_OUTPUT` turn has emitted all 2 MiB, before the HTTP reader resumes |
+| `NO_CONFIG_OPTIONS=1` | returns no config options from `session/new` |
+| `PROBE_GUARD=1` | fails if a probe sends `session/set_config_option` or `session/prompt` |
+
+Keep these modes environmental: no prompt or session exists when initialize and
+process shutdown behaviour must be selected.
+
+# invariant A session rejects overlapping prompts {#no_overlapping_prompts}
+
+The fixture throws `overlapping session/prompt on <session id>` if a second prompt
+arrives before the first settles. This is deliberately loud: real codex deadlocks
+in that situation, so every concurrency test must fail at the wire boundary rather
+than merely time out or accept crossed output.
 
 # rule The option set must stay unstable {#unstable_options}
 
@@ -50,8 +86,9 @@ accident — which is exactly what happened while the continuity tests were writ
 # invariant Every prompt turn is cancellable {#cancellable}
 
 `state.abort` is created at the start of each turn, not only for `HANG`. Any
-long-running branch must check it, or a cancellation test hangs until the suite
-times out instead of failing.
+ordinary long-running branch must check it, or a cancellation test hangs until the
+suite times out instead of failing. `IGNORE_CANCEL` is the named exception: it is
+the deliberately broken child used to prove the production drain deadline.
 
 # invariant The fixture advertises what it implements
 
@@ -59,3 +96,7 @@ times out instead of failing.
 production close path is exercised rather than skipped. If a branch stops being
 implemented, stop advertising it — a capability the agent claims and does not honour
 is exactly the bug this fixture should be catching.
+
+Forked state records the `mcpServers` on the fork request rather than inheriting the
+parent's field by accident. `ECHOMCP` can therefore distinguish a truthful fork
+declaration from a fixture that merely hid a missing one.

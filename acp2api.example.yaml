@@ -3,7 +3,8 @@
 # Copy, edit, then:  acp2api --config acp2api.yaml --check
 #
 # ${VAR} and ${VAR:-default} expand from the environment, so nothing secret has to
-# be written here.
+# be written here. A set-but-empty ${VAR} stays empty; `:-` uses its default for an
+# unset or empty variable. Write $${VAR} when the literal text is intended.
 
 server:
   # There is NO authentication here, by design: acp2api is a local bridge and
@@ -15,6 +16,11 @@ server:
   # this port: an agent that runs commands and writes files.
   host: 127.0.0.1
   port: 10021
+
+  # Browser access is off by default. This server has no authentication, so enable
+  # it only for an origin you trust. Use true only when every origin is intended.
+  # cors: https://app.example
+  cors: false
 
   # Prometheus metrics, on an address of their own: "off", or "host:port".
   #
@@ -33,8 +39,11 @@ server:
   #                                        reports nothing is unmeasured, not free.
   #   acp2api_cost_total{agent,currency}   money, when the agent says so.
   #   acp2api_context_fill_ratio{agent}    how close a session is to full.
+  #   acp2api_sessions_live{agent}         resident sessions; absent until an
+  #                                        agent has opened its first session.
   #   acp2api_turn_duration_seconds{agent} histogram.
   # metricsAddr: 0.0.0.0:10022
+  # Bracket IPv6 addresses, for example: "[::1]:10022".
 
   # Workspace handed to every ACP session, and the boundary for fs/read_text_file
   # and fs/write_text_file. Relative paths resolve against this file.
@@ -102,6 +111,12 @@ server:
   # truncated 200 that a router would count as a success.
   requestTimeoutMs: 900000
 
+  # Deadline for ACP control RPCs such as initialize, session/new, configuration,
+  # resume and fork. The prompt itself may run for requestTimeoutMs; after a prompt
+  # is cancelled, this value also caps its drain grace (at five seconds). Session
+  # cleanup remains best-effort and is capped at one second.
+  agentRpcTimeoutMs: 30000
+
   # What makes a failure a 429 ("out of quota, try the next brain") instead of a 502
   # ("broken"). ACP has no quota error code, so this pattern list is the whole
   # detection mechanism. Setting it REPLACES the built-in list.
@@ -117,9 +132,9 @@ server:
   # among them any more: it is served, see `tools:` below.
   unsupportedParams: warn
 
-  # Retained ACP sessions. Each is a live child process holding a login, so both
-  # bounds matter: the cap stops a client spawning CLIs without end, and the TTL
-  # gives back the sessions nobody has come back to.
+  # Retained ACP sessions. Each is resident context inside the agent process, so
+  # both bounds matter: the cap stops a client opening sessions without end, and
+  # the TTL gives back the sessions nobody has come back to.
   #
   # Neither of them FORGETS anything any more. Past the TTL a conversation is
   # PARKED: it closes its ACP session -- freeing the login and the memory -- and
@@ -158,8 +173,11 @@ server:
 
   # What a request for a NAMED conversation whose turn is still running should do.
   #
-  #   fork   the default. It gets a session of its own -- two turns cannot
-  #          interleave inside one agent.
+  #   fork   the default. A named conversation is refused with 409
+  #          conversation_busy: its key asserts identity, and two turns cannot
+  #          share that identity without interleaving inside one agent. A
+  #          headerless caller matched only by history still gets a session of
+  #          its own when the matching conversation is busy.
   #   queue  it is steered INTO the running turn, and the agent takes it at its
   #          next step.
   #
@@ -167,8 +185,8 @@ server:
   # waiting out the minutes a coding-agent turn takes and sending the correction
   # afterwards. It needs an agent that advertises `_meta.steering.supported`
   # (claude-agent-acp >= 0.66.0, codex-acp >= 1.1.14); anything else falls back to
-  # `fork`, because ACP itself has no mid-turn input and guessing at one can wedge
-  # the agent.
+  # `fork` (409 for the named conversation), because ACP itself has no mid-turn
+  # input and guessing at one can wedge the agent.
   #
   # Steering REDIRECTS rather than appends: it pre-empts the current generation,
   # and what becomes of the unfinished plan is the model's decision.
@@ -257,9 +275,10 @@ agents:
     model: gpt-5.6-sol
     reasoning: high
 
-  # Tools are a property of the AGENT, not of the request: an ACP agent runs its own
-  # tool loop, so OpenAI's `tools` array has nowhere to go (and is refused with a
-  # 400 that says so). MCP servers are how an agent gets tools.
+  # These are fixed, AGENT-owned tools that the agent uses inside its own loop.
+  # They are distinct from an OpenAI request's `tools`: caller tools follow the
+  # `server.tools` policy above and, by default, can return `tool_calls` for the
+  # caller to execute.
   #
   # `headers` and `env` accept a mapping here and are converted to the
   # [{name, value}] arrays ACP wants. Claude speaks http and sse; Codex, http.

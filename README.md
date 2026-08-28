@@ -103,10 +103,42 @@ in [`acp2api.example.yaml`](acp2api.example.yaml). The essentials:
 
 ```sh
 acp2api --config acp2api.yaml --check   # validate and exit
+acp2api --config acp2api.yaml --probe claude-opus  # live models/options, no prompt
 ```
+
+Agent model lists move independently of acp2api. When a configured value stops
+working, `--probe` is the supported way to print that agent's current option ids,
+categories, types, named values, and capability highlights. It performs only ACP
+startup and session setup; it never sends a prompt or spends a turn.
 
 Routes: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (SSE with
 `stream: true`), `POST/GET/DELETE /v1/responses`.
+
+## Running in a container
+
+The server needs the workspace and the CLI's existing login inside the container.
+For the Claude adapter, `~/.claude` must exist on the host and be mounted at the
+container user's home. Build the exact npm artifact, install that artifact in a
+Node 22 container, and keep the published port on host loopback:
+
+```sh
+ACP2API_TARBALL=$(npm pack --silent)
+docker run --rm -it \
+  -p 127.0.0.1:10021:10021 \
+  -v "$PWD/$ACP2API_TARBALL:/tmp/acp2api.tgz:ro" \
+  -v "$PWD/acp2api.yaml:/etc/acp2api.yaml:ro" \
+  -v "$PWD:/workspace" \
+  -v "$HOME/.claude:/root/.claude" \
+  node:22-bookworm sh -lc \
+  'npm install -g --include=optional /tmp/acp2api.tgz && exec acp2api --config /etc/acp2api.yaml'
+```
+
+The container config must use `server.host: 0.0.0.0` so Docker can reach the
+listener and `server.cwd: /workspace` so the agent sees the mounted files. The
+host-side `127.0.0.1` binding above preserves the bridge's no-auth local posture.
+Mount the corresponding login directory for another adapter. If a configured
+model name has moved, run the same image with `--probe <agent-name>` appended;
+the probe prints the live option values without sending a prompt.
 
 ## Status codes — the failover contract
 
@@ -127,7 +159,7 @@ stays a 429 instead of a stream that merely stops.
 ## Develop
 
 ```sh
-make test      # 183 tests, offline, against a real stdio fake agent
+make test      # offline, against a real stdio fake agent
 make check     # validate the example config
 make spec      # the code still carries every surface its .hint declares
 make verify    # clean install + test + check + spec + pack

@@ -221,6 +221,16 @@ export function toolCallCompletion({ id, model, created, calls, text, reasoning,
   };
 }
 
+/** Tool-call entries as chat SSE deltas, indexed for SDK accumulators. */
+export function toolCallDeltas(calls) {
+  return calls.map((call, index) => ({
+    index,
+    id: call.id,
+    type: "function",
+    function: { name: call.name, arguments: call.arguments },
+  }));
+}
+
 /**
  * Rough token estimate: ~4 characters per token.
  *
@@ -241,7 +251,7 @@ export const estimateTokens = (text) => Math.ceil(text.length / 4);
  */
 export function makeLimiter({ maxTokens, stop }) {
   if (!maxTokens && (!stop || stop.length === 0)) return null;
-  return (text) => {
+  const limiter = (text) => {
     for (const needle of stop ?? []) {
       const at = text.indexOf(needle);
       // The stop sequence itself is not part of the answer, per OpenAI semantics.
@@ -252,6 +262,22 @@ export function makeLimiter({ maxTokens, stop }) {
     }
     return null;
   };
+  // A streaming caller cannot retract a prefix after the next chunk completes it
+  // into a stop sequence. Expose only the prefix that cannot still become a match;
+  // Agent.turn flushes the held suffix when the turn ends normally.
+  limiter.visibleText = (text) => {
+    let held = 0;
+    for (const needle of stop ?? []) {
+      for (let length = Math.min(needle.length - 1, text.length); length > held; length--) {
+        if (text.endsWith(needle.slice(0, length))) {
+          held = length;
+          break;
+        }
+      }
+    }
+    return held ? text.slice(0, -held) : text;
+  };
+  return limiter;
 }
 
 /** The ACP usage counters this bridge reads, and the shape `deltaUsage` returns. */
@@ -315,7 +341,7 @@ export function deltaUsage(usage, before) {
  * than part of what reading the prompt cost, and the agent has already counted them
  * in `totalTokens`.
  */
-function toUsage(usage) {
+export function toUsage(usage) {
   if (!usage) return null;
   const details = {};
   if (usage.cachedReadTokens != null) details.cached_tokens = usage.cachedReadTokens;

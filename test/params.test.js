@@ -97,6 +97,7 @@ test("no limiter is built when nothing needs limiting", () => {
 test("a stop sequence cuts the text and excludes itself", () => {
   const limit = makeLimiter({ maxTokens: null, stop: ["STOP"] });
   assert.equal(limit("all good so far"), null);
+  assert.equal(limit.visibleText("keep this ST"), "keep this ");
   assert.deepEqual(limit("keep this STOP drop this"), { stopReason: "end_turn", text: "keep this " });
 });
 

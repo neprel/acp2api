@@ -1,13 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { runInNewContext } from "node:vm";
+import { setFlagsFromString } from "node:v8";
 import { Agent, AgentError } from "../src/agent.js";
 import { normalizeConfig } from "../src/config.js";
 import { createServer } from "../src/server.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixtures", "fake-agent.js");
+setFlagsFromString("--expose_gc");
+const collectGarbage = runInNewContext("gc");
+
+async function temporary(t) {
+  const dir = await mkdtemp(join(tmpdir(), "acp2api-server-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 /** Starts the server on an ephemeral port and returns a fetch bound to it. */
 async function start(t, { agents, specs, server: serverOpts } = {}) {
@@ -104,6 +116,30 @@ test("/v1/models lists agents as OpenAI models", async (t) => {
   assert.deepEqual(body.data, [{ id: "fake", object: "model", created: 0, owned_by: "general" }]);
 });
 
+test("CORS is opt-in, answers preflight, and marks actual responses", async (t) => {
+  const local = await start(t);
+  const closed = await local("/health", { headers: { origin: "https://app.example" } });
+  assert.equal(closed.headers.get("access-control-allow-origin"), null);
+
+  const call = await start(t, { server: { cors: "https://app.example" } });
+  const preflight = await call("/v1/chat/completions", {
+    method: "OPTIONS",
+    headers: {
+      origin: "https://app.example",
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "content-type, x-conversation-id",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), "https://app.example");
+  assert.match(preflight.headers.get("access-control-allow-methods"), /POST/);
+  assert.match(preflight.headers.get("access-control-allow-headers"), /x-conversation-id/);
+
+  const actual = await call("/health", { headers: { origin: "https://app.example" } });
+  assert.equal(actual.status, 200);
+  assert.equal(actual.headers.get("access-control-allow-origin"), "https://app.example");
+});
+
 test("a non-streaming completion returns content, reasoning and usage", async (t) => {
   const call = await start(t);
   const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hello" }] }));
@@ -138,6 +174,78 @@ test("a streaming completion emits SSE deltas and terminates with [DONE]", async
   assert.ok(parsed.slice(0, -1).every((p) => p.choices[0].finish_reason === null));
 });
 
+test("a slow streaming reader retains only a turn-sized response", async (t) => {
+  const dir = await temporary(t);
+  const marker = join(dir, "long-output-finished");
+  const call = await start(t, {
+    specs: [{
+      name: "fake",
+      type: "general",
+      command: process.execPath,
+      args: [FIXTURE],
+      env: { LONG_CAPTURE_FILE: marker },
+    }],
+    server: { requestTimeoutMs: 10_000 },
+  });
+  const headers = { "x-conversation-id": "slow-reader" };
+  await (await call("/v1/chat/completions", { ...chat({ model: "fake", messages: [{ role: "user", content: "warm" }] }), headers })).text();
+  collectGarbage();
+  collectGarbage();
+  const before = process.memoryUsage();
+  const res = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "LONG_OUTPUT" }], stream: true }),
+    headers,
+  });
+
+  // Do not consume `res.body`: once the client socket fills, every subsequent SSE
+  // write is retained by the server. The fixture marker says the entire turn has
+  // crossed ACP, so this is the high-water point rather than a timing guess.
+  for (;;) {
+    try {
+      if ((await readFile(marker, "utf8")).includes("done")) break;
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // The child can finish writing before the parent has handled every ACP frame.
+  // Wait for Agent#turn's outcome metric as proof that coalescing has seen them all.
+  while (!/acp2api_turns_total\{agent="fake",outcome="ok"\} 2/.test(call.metrics.render())) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  collectGarbage();
+  collectGarbage();
+  const after = process.memoryUsage();
+  // RSS includes V8 pages reserved after transient JSON parsing and does not fall
+  // when their objects die. After an explicit collection, live JS heap plus live
+  // ArrayBuffers is the retained queue this regression is about. Three turns'
+  // worth is deliberately generous for one accumulator, one coalesced payload and
+  // the client/server socket buffers.
+  const retained = Math.max(0, after.heapUsed - before.heapUsed) +
+    Math.max(0, after.arrayBuffers - before.arrayBuffers);
+  assert.ok(retained <= 3 * 2 * 1_048_576, `2 MiB turn retained ${retained} live bytes with a stalled reader`);
+
+  const parse = (body) => body.split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  const slowFrames = parse(await res.text());
+  assert.equal(slowFrames.at(-1), "[DONE]");
+  const slowChunks = slowFrames.slice(0, -1).map((frame) => JSON.parse(frame));
+  const slowText = slowChunks.map((part) => part.choices[0]?.delta?.content ?? "").join("");
+  assert.equal(slowText, "x".repeat(2 * 1_048_576));
+  assert.equal(slowChunks.at(-1).choices[0].finish_reason, "stop", "the terminal frame stays after held text");
+
+  // Coalescing changes frame boundaries only. A client that never stalls must
+  // reconstruct the exact same answer in the exact same terminal order.
+  const fast = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "LONG_OUTPUT" }], stream: true }),
+    headers,
+  });
+  const fastFrames = parse(await fast.text());
+  const fastChunks = fastFrames.slice(0, -1).map((frame) => JSON.parse(frame));
+  assert.equal(fastChunks.map((part) => part.choices[0]?.delta?.content ?? "").join(""), slowText);
+  assert.equal(fastFrames.at(-1), "[DONE]");
+  assert.equal(fastChunks.at(-1).choices[0].finish_reason, "stop");
+});
+
 test("a quota failure is a real 429 even on a streaming request", async (t) => {
   const call = await start(t);
   for (const stream of [false, true]) {
@@ -154,6 +262,22 @@ test("an unrelated agent failure is 502", async (t) => {
   const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "BOOM" }] }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error.code, "agent_error");
+});
+
+test("a child that dies mid-turn costs one 502, then a keyed conversation respawns fresh", async (t) => {
+  const call = await start(t);
+  const ask = (content) => call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+    headers: { "x-conversation-id": "crash-thread" },
+  });
+
+  const died = await ask("DIE");
+  assert.equal(died.status, 502);
+  assert.equal((await died.json()).error.code, "agent_error");
+
+  const recovered = await ask("ECHOSESSION");
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json()).choices[0].message.content, "s1");
 });
 
 test("temperature is accepted, reported back, and does not fail the request", async (t) => {
@@ -385,7 +509,7 @@ test("an agent that never claimed it can steer is never sent a steering request"
   assert.ok(!answer.includes("ALSO-THIS"));
 });
 
-test("busy: fork keeps two concurrent turns apart, which is still the default", async (t) => {
+test("busy: fork refuses a concurrent keyed turn, which is still the default", async (t) => {
   const call = await start(t);
   const ask = (content) =>
     call("/v1/chat/completions", {
@@ -395,13 +519,31 @@ test("busy: fork keeps two concurrent turns apart, which is still the default", 
 
   const running = ask("SLOWTURN please");
   await call.until(/new session for/);
-  const second = await (await ask("SEPARATE")).json();
-
-  // A session of its own, so it answers for itself rather than joining anything.
-  assert.match(second.choices[0].message.content, /SEPARATE/);
-  assert.ok(!second.choices[0].message.content.includes("SLOWTURN"));
+  const second = await ask("SEPARATE");
+  assert.equal(second.status, 409);
+  assert.equal((await second.json()).error.code, "conversation_busy");
   const answer = (await (await running).json()).choices[0].message.content;
   assert.ok(!answer.includes("SEPARATE"), `the running turn must not have heard it, got ${answer}`);
+});
+
+test("two concurrent continuations cannot prompt one live keyed session", async (t) => {
+  const call = await start(t);
+  const key = "race-live";
+  const ask = (content) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+
+  assert.equal((await ask("ECHOSESSION establish")).status, 200);
+  const running = ask("SLOWTURN first continuation");
+  await call.until(/continuing session keyed \[race-live\]/);
+  const refused = await ask("second continuation must not run");
+
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error.code, "conversation_busy");
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.ok(!answer.includes("second continuation"));
 });
 
 test("a prompt is never queued into a session with no turn running", async (t) => {
@@ -624,6 +766,31 @@ test("max_tokens truncates and finishes with length", async (t) => {
   assert.ok(body.choices[0].message.content.length <= 12);
 });
 
+test("a cut turn that misses drain grace retires its keyed conversation", async (t) => {
+  const call = await start(t, { server: { agentRpcTimeoutMs: 500 } });
+  const headers = { "x-conversation-id": "dead-after-cut" };
+  const first = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION" }] }),
+    headers,
+  });
+  assert.equal(first.status, 200);
+  assert.equal((await first.json()).choices[0].message.content, "s1");
+
+  const cut = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "IGNORE_CANCEL" }], max_tokens: 1 }),
+    headers,
+  });
+  assert.equal(cut.status, 200);
+  assert.equal((await cut.json()).choices[0].finish_reason, "length");
+
+  const next = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION" }] }),
+    headers,
+  });
+  assert.equal(next.status, 200);
+  assert.equal((await next.json()).choices[0].message.content, "s2");
+});
+
 test("stop cuts the answer and finishes with stop", async (t) => {
   const call = await start(t);
   const res = await call(
@@ -633,6 +800,18 @@ test("stop cuts the answer and finishes with stop", async (t) => {
   const body = await res.json();
   assert.equal(body.choices[0].message.content, "word1 word2 word3 ");
   assert.equal(body.choices[0].finish_reason, "stop");
+});
+
+test("a streamed stop sequence split across chunks is never emitted", async (t) => {
+  const call = await start(t);
+  const res = await call(
+    "/v1/chat/completions",
+    chat({ model: "fake", messages: [{ role: "user", content: "SPLIT_STOP" }], stop: "STOP", stream: true }),
+  );
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((frame) => frame.replace(/^data: /, ""));
+  const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
+  assert.equal(chunks.map((chunk) => chunk.choices[0].delta.content ?? "").join(""), "alpha ");
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
 });
 
 test("stream_options.include_usage appends a usage-only chunk before [DONE]", async (t) => {
@@ -701,6 +880,142 @@ test("the request timeout is a 504, not a truncated 200", async (t) => {
   assert.equal(res.status, 504);
   assert.equal((await res.json()).error.code, "timeout");
   t.after(() => agent.close());
+});
+
+test("a hung initialize answers 503 and the next request respawns cleanly", async (t) => {
+  const dir = await temporary(t);
+  const marker = join(dir, "initialize-hung-once");
+  const specs = [{
+    name: "fake",
+    type: "general",
+    command: process.execPath,
+    args: [FIXTURE],
+    env: { HANG_INITIALIZE_ONCE: marker },
+  }];
+  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 500, requestTimeoutMs: 2_000 } });
+  const started = Date.now();
+  const first = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "first" }],
+  }));
+  assert.equal(first.status, 503);
+  assert.equal((await first.json()).error.code, "agent_unavailable");
+  assert.ok(Date.now() - started < 1_500, "initialize must use the child RPC deadline");
+
+  const second = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "second" }],
+  }));
+  assert.equal(second.status, 200);
+  assert.equal((await second.json()).choices[0].message.content, "[fast] second");
+});
+
+test("a hung session/new is 502 and releases its unowned tool bench", async (t) => {
+  const dir = await temporary(t);
+  const captured = join(dir, "mcp-url");
+  const specs = [{
+    name: "fake",
+    type: "general",
+    command: process.execPath,
+    args: [FIXTURE],
+    env: { HANG_RPC: "session/new", RPC_CAPTURE_FILE: captured },
+  }];
+  const call = await start(t, { specs, server: { agentRpcTimeoutMs: 500, requestTimeoutMs: 2_000 } });
+  const started = Date.now();
+  const response = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "use a tool" }],
+    tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }],
+  }));
+  assert.equal(response.status, 502);
+  assert.equal((await response.json()).error.code, "agent_error");
+  assert.ok(Date.now() - started < 1_500, "session/new must use the child RPC deadline");
+
+  const probe = await fetch(await readFile(captured, "utf8"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+  });
+  assert.equal((await probe.json()).error.code, -32602, "the failed session must not leave its bench reachable");
+});
+
+test("a request whose child ignores cancel still answers 504", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 150, agentRpcTimeoutMs: 500 } });
+  // Pay the spawn/initialize cost before timing the broken turn, so this exercises
+  // the post-cancel drain rather than cancellation before session/new finishes.
+  assert.equal((await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "ready" }],
+  }))).status, 200);
+
+  const started = Date.now();
+  const response = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "IGNORE_CANCEL" }],
+  }));
+  assert.equal(response.status, 504);
+  assert.equal((await response.json()).error.code, "timeout");
+  assert.ok(Date.now() - started < 1_500, "request timeout plus drain grace must remain bounded");
+});
+
+test("a tool-enabled timeout is 504 and does not remember partial text", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const first = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: "HANG" }],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": "tools-timeout" },
+  });
+  assert.equal(first.status, 504);
+  assert.equal((await first.json()).error.code, "timeout");
+
+  const next = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [
+      { role: "user", content: "HANG" },
+      { role: "assistant", content: "PARTIAL:s1" },
+      { role: "user", content: "ECHOSESSION" },
+    ],
+  }));
+  assert.equal(next.status, 200);
+  assert.equal((await next.json()).choices[0].message.content, "s2");
+});
+
+test("a streaming tool-enabled timeout reports an error without a successful terminal frame", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const res = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "HANG" }],
+    tools: TOOLS,
+    stream: true,
+  }));
+  assert.equal(res.status, 200, "partial output commits the streaming status before the timeout");
+
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  assert.equal(frames.at(-1), "[DONE]");
+  const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+  assert.match(chunks.map((c) => c.choices?.[0]?.delta?.content ?? "").join(""), /PARTIAL:s1/);
+  assert.equal(chunks.at(-1).error.code, "timeout");
+  assert.ok(chunks.slice(0, -1).every((c) => c.choices[0].finish_reason === null));
+});
+
+test("a chat stream reports an agent failure after output as an SSE error", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "BOOM_AFTER_OUTPUT" }],
+    stream: true,
+  }));
+  assert.equal(res.status, 200);
+
+  const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+  assert.equal(frames.at(-1), "[DONE]");
+  const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+  assert.ok(chunks.some((c) => c.choices?.[0]?.delta?.content === "PARTIAL:before boom"));
+  assert.equal(chunks.at(-1).error.code, "agent_error");
+  assert.ok(chunks.every((c) => c.choices?.[0]?.finish_reason !== "stop"));
 });
 
 test("closing the server shuts every agent down", async (t) => {
@@ -889,6 +1204,29 @@ test("a thread that went quiet resumes its session instead of starting cold", as
     /^s1/,
     "a parked thread must come back to its own session, not a new one",
   );
+});
+
+test("two concurrent continuations cannot both resume one parked session", async (t) => {
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const ask = (content, key) =>
+    call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [{ role: "user", content }] }),
+      headers: { "x-conversation-id": key },
+    });
+
+  assert.equal((await ask("DELAY_RESUME ECHOSESSION", "race-park")).status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal((await ask("ECHOSESSION unrelated", "race-other")).status, 200);
+  await call.until(/parked: s1/);
+
+  const running = ask("ECHOSESSION resumed", "race-park");
+  await call.until(/resuming s1 \[race-park\]/);
+  const refused = await ask("second continuation must not run", "race-park");
+
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error.code, "conversation_busy");
+  const answer = (await (await running).json()).choices[0].message.content;
+  assert.equal(answer, "s1");
 });
 
 test("a session the agent cannot resume becomes a fresh one, not an error", async (t) => {
@@ -1100,6 +1438,16 @@ test("a caller's tools are offered to the agent, and a call comes back as tool_c
   assert.match(body.choices[0].message.content, /TOOLS:read_file/);
 });
 
+test("a tool-enabled agent failure exits through the handler's timer cleanup", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 5_000 } });
+  const res = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "BOOM" }],
+    tools: TOOLS,
+  }));
+  assert.equal(res.status, 502);
+});
+
 test("the result the caller sends back reaches the same turn, which then finishes", async (t) => {
   // This is what a suspended turn is FOR. No new session, no replayed history --
   // the agent is still inside the call it made, and gets its answer.
@@ -1125,6 +1473,111 @@ test("the result the caller sends back reaches the same turn, which then finishe
   // Only this segment: what the agent said BEFORE the call went to the response
   // that carried the call, and repeating it here would deliver it twice.
   assert.equal(body.choices[0].message.content.trim(), "RESULT:the file said hello");
+});
+
+test("a headerless tool round-trip stays in one session, streamed or not", async (t) => {
+  const call = await start(t);
+
+  const ask = async (messages, stream) => {
+    const res = await call("/v1/chat/completions", chat({ model: "fake", messages, tools: TOOLS, stream }));
+    assert.equal(res.status, 200);
+    if (!stream) return (await res.json()).choices[0].message;
+
+    const frames = (await res.text()).split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
+    assert.equal(frames.at(-1), "[DONE]");
+    const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+    const toolCalls = chunks.flatMap((c) => c.choices[0].delta.tool_calls ?? []);
+    return {
+      role: "assistant",
+      content: chunks.map((c) => c.choices[0].delta.content ?? "").join("") || null,
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    };
+  };
+
+  for (const stream of [false, true]) {
+    const user = { role: "user", content: `USETOOL read_file {"path":"${stream ? "stream" : "plain"}"}` };
+    const calling = await ask([user], stream);
+    const callId = calling.tool_calls[0].id;
+    const result = { role: "tool", tool_call_id: callId, content: "hello" };
+    const finished = await ask([user, calling, result], stream);
+
+    const check = await ask([
+      user,
+      calling,
+      result,
+      finished,
+      { role: "user", content: "ECHOSESSION" },
+    ], false);
+    assert.equal(check.content, stream ? "s2" : "s1", "the tool result must not open a second session");
+  }
+});
+
+test("a resumed tool turn is bounded by the resuming request's timeout", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 300 } });
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"} HANG_AFTER_TOOL' };
+  const first = await (
+    await call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+      headers: { "x-conversation-id": "tools-resume-timeout" },
+    })
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+
+  const started = Date.now();
+  const resumed = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [
+        user,
+        first.choices[0].message,
+        { role: "tool", tool_call_id: callId, content: "hello" },
+      ],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": "tools-resume-timeout" },
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(resumed.status, 504);
+  assert.equal((await resumed.json()).error.code, "timeout");
+  assert.ok(Date.now() - started < 1_500, "the resuming request must use its own deadline");
+});
+
+test("disconnecting a resumed tool turn does not reuse its still-running session", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 5_000 } });
+  const key = "tools-resume-disconnect";
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"} HANG_AFTER_TOOL' };
+  const first = await (
+    await call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+      headers: { "x-conversation-id": key },
+    })
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+
+  const controller = new AbortController();
+  const resumed = call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [
+        user,
+        first.choices[0].message,
+        { role: "tool", tool_call_id: callId, content: "hello" },
+      ],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": key },
+    signal: controller.signal,
+  });
+  await call.until(/answered 1 tool call/);
+  controller.abort();
+  await assert.rejects(resumed, { name: "AbortError" });
+
+  const next = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION" }], tools: TOOLS }),
+    headers: { "x-conversation-id": key },
+  });
+  assert.equal(next.status, 200);
+  assert.equal((await next.json()).choices[0].message.content, "s2");
 });
 
 test("a tool result for a call nobody is waiting on is refused, not run as a new turn", async (t) => {
@@ -1209,6 +1662,94 @@ test("a turn suspended in a tool call is abandoned when the caller sends a new m
   assert.notEqual(body.choices[0].message.content.trim(), "");
 });
 
+test("an inject-only probe leaves a suspended tool turn intact", async (t) => {
+  const call = await start(t, { server: { busy: "queue" } });
+  const key = "tools-probe";
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"}' };
+  const first = await (
+    await call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+      headers: { "x-conversation-id": key },
+    })
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+
+  const probe = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "probe" }], tools: TOOLS }),
+    headers: { "x-conversation-id": key, "x-acp2api-inject": "1" },
+  });
+  assert.equal(probe.status, 409);
+  assert.equal((await probe.json()).error.code, "no_running_turn");
+
+  const resumed = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [user, first.choices[0].message, { role: "tool", tool_call_id: callId, content: "hello" }],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": key },
+  });
+  assert.equal(resumed.status, 200);
+  assert.match((await resumed.json()).choices[0].message.content, /RESULT:hello/);
+});
+
+test("an unattended suspended turn releases and becomes eligible for pruning", async (t) => {
+  const call = await start(t, {
+    server: { toolTimeoutMs: 50, sessionTtlMs: 1 },
+  });
+  const first = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: 'USETOOL read_file {"path":"x"}' }],
+    tools: TOOLS,
+  }));
+  assert.equal(first.status, 200);
+  assert.equal((await first.json()).choices[0].finish_reason, "tool_calls");
+
+  // No caller returns to the suspended conversation. The fixture's real MCP call
+  // reaches its deadline, the ACP turn finishes with that tool error, and the
+  // conversation releases itself instead of staying busy forever.
+  await call.until(/released: suspended turn settled unattended/);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  // Pruning is request-driven; an unrelated new request triggers it. The released
+  // conversation is now idle and parks, proving `busy` no longer exempts it.
+  const next = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "ECHOSESSION" }],
+  }));
+  assert.equal(next.status, 200);
+  await call.until(/parked:/);
+});
+
+test("a late tool result starts fresh after its suspended turn has settled", async (t) => {
+  const call = await start(t, { server: { toolTimeoutMs: 50 } });
+  const key = "tools-late";
+  const user = { role: "user", content: 'USETOOL read_file {"path":"x"} LATE_RESULT' };
+  const first = await (
+    await call("/v1/chat/completions", {
+      ...chat({ model: "fake", messages: [user], tools: TOOLS }),
+      headers: { "x-conversation-id": key },
+    })
+  ).json();
+  const callId = first.choices[0].message.tool_calls[0].id;
+  await call.until(/released: suspended turn settled unattended/);
+
+  const late = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [
+        user,
+        first.choices[0].message,
+        { role: "tool", tool_call_id: callId, content: "arrived too late" },
+      ],
+      tools: TOOLS,
+    }),
+    headers: { "x-conversation-id": key },
+  });
+  assert.equal(late.status, 200);
+  assert.equal((await late.json()).choices[0].message.content, "FRESH:s2");
+});
+
 test("server.tools off keeps the old behaviour: no MCP server is attached", async (t) => {
   const call = await start(t, { server: { tools: "off" } });
   const res = await call("/v1/chat/completions", {
@@ -1271,8 +1812,12 @@ test("a streaming completion that stops for a tool emits the call and finishes c
   assert.equal(frames.at(-1), "[DONE]", "a stream that stops for a tool still terminates properly");
   const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
   const calls = chunks.flatMap((c) => c.choices[0].delta.tool_calls ?? []);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].function.name, "read_file");
+  assert.deepEqual(calls, [{
+    index: 0,
+    id: calls[0].id,
+    type: "function",
+    function: { name: "read_file", arguments: '{"path":"x"}' },
+  }]);
   assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
 });
 

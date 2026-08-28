@@ -162,7 +162,11 @@ export class Metrics {
   }
 
   sessions(agent, live) {
-    this.gauge("acp2api_sessions_live", { agent }, live);
+    const labels = renderLabels(this.#withAgent({ agent }));
+    if (live > 0) return this.gauge("acp2api_sessions_live", { agent }, live);
+    const series = this.#gauges.get("acp2api_sessions_live");
+    series?.delete(labels);
+    if (series?.size === 0) this.#gauges.delete("acp2api_sessions_live");
   }
 
   /** The whole registry in Prometheus text exposition format. */

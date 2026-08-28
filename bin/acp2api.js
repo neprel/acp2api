@@ -5,11 +5,13 @@ import { ConfigError, loadConfig } from "../src/config.js";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "../src/server.js";
 import { metricsServer } from "../src/metrics.js";
+import { Agent } from "../src/agent.js";
 
 const USAGE = `acp2api -- OpenAI-compatible HTTP server over ACP coding agents
 
   acp2api --config <file>     path to the YAML config (env: ACP2API_CONFIG)
   acp2api --check             validate the config and exit
+  acp2api --probe <agent>     print the agent's live ACP options; sends no prompt
 `;
 
 const log = (level, message) => {
@@ -20,7 +22,12 @@ const log = (level, message) => {
 let opts;
 try {
   ({ values: opts } = parseArgs({
-    options: { config: { type: "string", short: "c" }, check: { type: "boolean" }, help: { type: "boolean", short: "h" } },
+    options: {
+      config: { type: "string", short: "c" },
+      check: { type: "boolean" },
+      probe: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
   }));
 } catch (e) {
   console.error(`${e.message}\n\n${USAGE}`);
@@ -51,6 +58,24 @@ if (opts.check) {
   process.exit(0);
 }
 
+if (opts.probe) {
+  const spec = config.agents.find((agent) => agent.name === opts.probe);
+  if (!spec) {
+    console.error(`probe error: no agent named "${opts.probe}"; configured: ${config.agents.map((a) => a.name).join(", ")}`);
+    process.exit(2);
+  }
+  const agent = new Agent(spec, config.server);
+  try {
+    console.log(JSON.stringify(await agent.probe(), null, 2));
+  } catch (error) {
+    console.error(`probe error: ${error.message}`);
+    process.exitCode = 2;
+  } finally {
+    await agent.close();
+  }
+  process.exit(process.exitCode ?? 0);
+}
+
 // Said once, at startup, and not as a refusal: where to listen is the operator's
 // decision. But there is no api key here -- authentication belongs to the router in
 // front -- and this process spawns an agent that executes commands, so a non-
@@ -67,6 +92,10 @@ for (const dir of new Set([config.server.cwd, ...config.agents.map((a) => a.cwd)
 }
 
 const server = createServer(config, { log });
+server.on("error", (error) => {
+  console.error(`cannot listen on ${config.server.host}:${config.server.port}: ${error.message}`);
+  process.exit(2);
+});
 server.listen(config.server.port, config.server.host, () => {
   log("info", `listening on http://${config.server.host}:${config.server.port} (workspace ${config.server.cwd})`);
   for (const a of config.agents) {
@@ -79,12 +108,15 @@ server.listen(config.server.port, config.server.host, () => {
 // a scraper has to reach the other one from somewhere else. Off unless asked for.
 let metrics = null;
 if (config.server.metricsAddr !== "off") {
-  const cut = config.server.metricsAddr.lastIndexOf(":");
-  const mHost = config.server.metricsAddr.slice(0, cut);
-  const mPort = Number(config.server.metricsAddr.slice(cut + 1));
+  const { host: mHost, port: mPort } = config.server.metricsAddr;
+  const displayHost = mHost.includes(":") ? `[${mHost}]` : mHost;
   metrics = metricsServer(server.metrics, { createServer: createHttpServer });
+  metrics.on("error", (error) => {
+    console.error(`cannot listen for metrics on ${displayHost}:${mPort}: ${error.message}`);
+    process.exit(2);
+  });
   metrics.listen(mPort, mHost, () => {
-    log("info", `metrics on http://${config.server.metricsAddr}/metrics`);
+    log("info", `metrics on http://${displayHost}:${mPort}/metrics`);
   });
 }
 
@@ -94,7 +126,10 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
     log("info", `${signal} -- shutting down`);
     metrics?.close();
-    server.close(() => process.exit(0));
+    server.close(async () => {
+      await server.whenClosed();
+      process.exit(0);
+    });
     setTimeout(() => process.exit(1), 10_000).unref();
   });
 }

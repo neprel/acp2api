@@ -69,6 +69,37 @@ test("the number of concurrent commands is bounded", () => {
   terms.release(id);
 });
 
+test("finished commands do not consume the concurrent-command cap", async () => {
+  const terms = new Terminals({ cwd: process.cwd(), max: 1 });
+  const first = terms.create({ command: process.execPath, args: ["-e", "0"] });
+  await terms.waitForExit(first);
+  const second = terms.create({ command: process.execPath, args: ["-e", "0"] });
+  assert.equal((await terms.waitForExit(second)).exitCode, 0);
+  terms.releaseAll();
+});
+
+test("Terminals.create applies its output limit", async () => {
+  const terms = new Terminals({ cwd: process.cwd(), outputByteLimit: 5 });
+  const id = terms.create({ command: process.execPath, args: ["-e", "process.stdout.write('abcdefgh')"] });
+  await terms.waitForExit(id);
+  assert.deepEqual(terms.output(id), {
+    output: "defgh",
+    truncated: true,
+    exitStatus: { exitCode: 0, signal: null },
+  });
+  terms.release(id);
+});
+
+test("Terminals.create applies its wall-clock timeout", async () => {
+  const logs = [];
+  const terms = new Terminals({ cwd: process.cwd(), timeoutMs: 25, log: (...args) => logs.push(args) });
+  const id = terms.create({ command: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] });
+  const exit = await terms.waitForExit(id);
+  assert.equal(exit.signal, "SIGKILL");
+  assert.ok(logs.some(([, message]) => message.includes("killed after 25ms")));
+  terms.release(id);
+});
+
 test("releasing a command that is still running kills it rather than orphaning it", async () => {
   const terms = new Terminals({ cwd: process.cwd() });
   const id = terms.create({ command: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] });
@@ -84,6 +115,8 @@ test("a spawn failure settles instead of hanging whoever waits on it", async () 
   const id = terms.create({ command: "/nonexistent/definitely-not-a-command" });
   const exit = await terms.waitForExit(id);
   assert.ok(exit, "expected the wait to settle");
+  assert.match(terms.output(id).output, /definitely-not-a-command/);
+  assert.match(terms.output(id).output, /ENOENT/);
   terms.release(id);
 });
 

@@ -16,13 +16,15 @@ a test would need to reach through HTTP.
 ```
 acp2api --config <file>   # or ACP2API_CONFIG
 acp2api --check           # validate and exit
+acp2api --probe <agent>   # live ACP options/capabilities, no prompt
 acp2api --help
 ```
 
 ## rule Exit codes {#exit_codes}
 
 - `0` — `--help`, `--check` on a valid config, or a clean shutdown
-- `2` — bad arguments, no config given, or a `ConfigError`
+- `2` — bad arguments, no config given, a `ConfigError`, a probe failure, or a
+  listener that cannot bind
 
 A `ConfigError` prints as a single line. Anything else prints as-is, stack included:
 the first is the user's problem, the second is ours, and they should not look alike.
@@ -33,6 +35,21 @@ It runs the same `loadConfig` the server does, so a config that passes `--check`
 cannot fail at startup for a config reason. Do not give it a lighter validation
 path; `make check` guards the example config shipped in the package, and a weaker
 check there would ship a broken example.
+
+# rule --probe is the safe live vocabulary check {#probe}
+
+`--probe <agent-name>` constructs that configured `Agent` and reuses its bounded
+ACP connection and session-opening machinery. It sends `initialize` and
+`session/new`, prints config option ids/categories/types/named values plus steering,
+session and MCP capability highlights, then closes cleanly. It never applies the
+configured model/options, runs warm-up, or sends `session/prompt`: discovering that
+a model list moved must not spend a subscription turn.
+
+# rule Listener errors are operator errors
+
+Both API and metrics listeners handle `error`. A bind failure prints exactly one
+line naming the address and reason, then exits 2; `EADDRINUSE`, `EACCES`, and socket
+port failures are startup input/environment problems, not stack-bearing server bugs.
 
 # invariant The workspace exists before the first request {#mkdir_workspace}
 

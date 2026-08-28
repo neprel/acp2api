@@ -115,6 +115,12 @@ Three exits, and all three are needed:
 - a settled `done` promise on spawn failure — an agent waiting on the exit of a
   command that never started would wait for the life of the session.
 
+The cap counts commands that are still running, not retained terminal records. A
+finished command remains readable until the agent releases it, but it consumes no
+process slot and cannot prevent the next command from starting. Spawn failures put
+their error message into the terminal tail before settling, so the agent sees why
+the command never started instead of an empty failed terminal.
+
 # test terminal
 
 - the tail keeps the end of the output and reports truncation
@@ -124,5 +130,7 @@ Three exits, and all three are needed:
 - `exitStatus` is absent while running and present once finished
 - a cwd outside the workspace is refused
 - the concurrent-command cap is enforced
+- a finished command does not consume a concurrent-command slot
+- the configured timeout and output ceiling are exercised through `Terminals.create`
 - releasing a running command kills it
-- a spawn failure settles the wait rather than hanging it
+- a spawn failure settles the wait and leaves its error in the terminal tail

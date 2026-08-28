@@ -29,22 +29,19 @@ When something becomes implementable, move its name from `REFUSED`/`IGNORED` int
 the name behind. A parameter honoured in `server.js` but still listed as ignored
 reports a lie to the caller in `x_acp2api.ignored`.
 
-# decision Tool definitions moved from refused to ignored in 1.2.0 {#tools_ignored}
+# decision Caller tools are classified first, then `server.tools` decides whether they are served {#tools_ignored}
 
-The earlier rule here said `tools` could leave `REFUSED` only when real `tool_calls`
-came back. That rule is **superseded**, deliberately, and the reasoning is worth
-keeping because it will look like a regression otherwise.
+The parameter classifier has no server configuration, so it initially treats
+`tools` as ignorable while preserving the definitions for the server. With the
+default `server.tools: mcp`, the server removes `tools` from `ignored_params`,
+exposes the definitions through a per-conversation MCP bench, and can return
+`tool_calls` for the caller to satisfy. With `server.tools: off`, it drops and
+reports `tools` as ignored.
 
-It assumed the caller had another way to get the work done, so a 400 merely
-redirected them. The deciding case is a client whose **only** model is an ACP agent:
-there the refusal left it with no brain at all, which is a worse answer than a
-one-step loop.
-
-What makes ignoring acceptable now is capability parity, not resignation. An ACP
-agent has its own tools, and the caller's own tool servers can be handed to it
-through `mcpServers` — so it *acts* rather than asking, and the work happens inside
-its loop instead of the caller's. What the caller loses is orchestration, not
-outcomes.
+`tool_choice` always remains ignored because ACP cannot force the agent's
+selection, and the legacy `functions` / `function_call` forms remain ignored.
+Do not describe caller tools as the agent's statically configured `mcpServers`;
+those are a separate, agent-owned tool surface.
 
 The obligation that remains: tool calls and results already present in the history
 must be rendered faithfully — see
@@ -86,7 +83,9 @@ line per call forever, and the interesting event is the first one.
 # test params
 
 - style parameters (`temperature`, `top_p`, `seed`) are ignored, never refused
-- tool definitions (`tools`, `tool_choice`, `functions`, `function_call`) are ignored, not refused
+- `tools` is preserved for the server's configured serving policy while the
+  classifier initially marks it ignored; `tool_choice` and old `functions` /
+  `function_call` remain ignored
 - what remains contract-changing (`response_format`, `audio`, `modalities`) is still refused
 - `n: 1` and `n: null` pass; `n: 3` is refused
 - an unknown future field is ignored rather than refused

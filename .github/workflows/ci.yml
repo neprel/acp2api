@@ -46,6 +46,7 @@ jobs:
       # `npm ci` and not `npm install`: the lockfile is the point of a CI run.
       - run: npm ci
       - run: npm test
+      - run: make check
 
   # What `npm publish` would actually upload. A `files` list that has drifted --
   # a new src/*.js that nobody added, an example config left behind -- produces a

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Metrics, metricsServer } from "../src/metrics.js";
+import { SessionStore } from "../src/sessions.js";
 
 const lines = (m) => m.render().split("\n");
 const sample = (m, prefix) => lines(m).filter((l) => l.startsWith(prefix));
@@ -71,6 +72,27 @@ test("context fill is a ratio, and the last reading wins", () => {
   m.recordUsage({ agent: "codex", context: { used: 50, size: 100 } });
   m.recordUsage({ agent: "codex", context: { used: 25, size: 100 } });
   assert.ok(sample(m, "acp2api_context_fill_ratio{").includes('acp2api_context_fill_ratio{agent="codex"} 0.25'));
+});
+
+test("the live-session gauge follows store residency without a zero series", async () => {
+  const metrics = new Metrics();
+  const store = new SessionStore({ metrics });
+  const agents = new Map([["codex", { closeSession: async () => {} }]]);
+  const conv = store.open("codex", { id: "s1" });
+  assert.deepEqual(sample(metrics, "acp2api_sessions_live{"), [
+    'acp2api_sessions_live{agent="codex"} 1',
+  ]);
+
+  await store.park(conv, agents);
+  assert.equal(sample(metrics, "acp2api_sessions_live{").length, 0);
+  assert.doesNotMatch(metrics.render(), /acp2api_sessions_live/);
+
+  store.revive(conv, { id: "s1" });
+  assert.deepEqual(sample(metrics, "acp2api_sessions_live{"), [
+    'acp2api_sessions_live{agent="codex"} 1',
+  ]);
+  await store.discard(conv, agents);
+  assert.doesNotMatch(metrics.render(), /acp2api_sessions_live/);
 });
 
 test("cost is summed in the currency the agent named", () => {

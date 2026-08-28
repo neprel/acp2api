@@ -10,7 +10,14 @@
  * Prompt text drives the behaviour, so a test can ask for the case it wants:
  *   QUOTA       -> fails the way an exhausted subscription does (429 path)
  *   BOOM        -> fails with an unrelated error (must stay 502, not 429)
- *   HANG        -> never finishes on its own (cancellation path)
+ *   DIE         -> exits the child during a prompt without answering
+ *   BOOM_AFTER_OUTPUT -> emits a thought, then fails with an unrelated error
+ *   SPLIT_STOP  -> emits one stop sequence across two text chunks
+ *   HANG        -> emits partial text, then never finishes on its own
+ *   IGNORE_CANCEL -> keeps streaming after session/cancel
+ *   HANG_CLOSE  -> answers the prompt, then never answers session/close
+ *   HANG_AFTER_TOOL -> calls a client tool, then hangs after its result
+ *   DELAY_RESUME -> makes this session's next resume pause briefly
  *   REFUSE      -> completes with stopReason "refusal"
  *   COUNT       -> streams word by word, so max_tokens and stop have somewhere to cut
  *   ECHOSESSION -> answers with its own session id (continuity, parking, resume)
@@ -26,8 +33,19 @@
  *   RUNCMD      -> two shell results, in both shapes an agent may send them
  * anything else is echoed back after one thought chunk.
  */
+import { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+
+const never = () => new Promise(() => {});
+
+// Pre-session failures cannot be selected by prompt text. A marker makes the
+// initialize hang happen once across child respawns, so the same Agent can prove
+// its poisoned connection memo was cleared and a later request starts cleanly.
+const hangInitializeOnce = process.env.HANG_INITIALIZE_ONCE;
+if (process.env.PID_FILE) writeFileSync(process.env.PID_FILE, String(process.pid));
+if (process.env.TRAP_SIGTERM) process.on("SIGTERM", () => {});
+if (process.env.GARBAGE_STDOUT) process.stdout.write("fixture startup noise, not JSON\n");
 
 const MODELS = [
   { value: "fast", name: "Fast" },
@@ -44,7 +62,7 @@ const EFFORTS = [
 const sessions = new Map();
 let opened = 0;
 
-const optionsFor = (state) => [
+const optionsFor = (state) => process.env.NO_CONFIG_OPTIONS ? [] : [
   { id: "model", name: "Model", category: "model", type: "select", currentValue: state.model, options: MODELS },
   // Deliberately named `effort`, like claude-agent-acp, so the tests prove that
   // selection happens by category and not by a hardcoded id.
@@ -92,22 +110,44 @@ function chargeTurn(state) {
   return { ...u };
 }
 
+const exclusivePrompt = (prompt) => async (request) => {
+  const state = sessions.get(request.params.sessionId);
+  if (!state) throw new Error(`no such session ${request.params.sessionId}`);
+  if (state.prompting) throw new Error(`overlapping session/prompt on ${request.params.sessionId}`);
+  state.prompting = true;
+  try {
+    return await prompt(request, state);
+  } finally {
+    state.prompting = false;
+  }
+};
+
 const app = acp
   .agent({ name: "fake-agent" })
-  .onRequest(acp.methods.agent.initialize, () => ({
-    protocolVersion: acp.PROTOCOL_VERSION,
-    agentCapabilities: {
-      loadSession: false,
-      sessionCapabilities: { close: {}, resume: {}, fork: {} },
-    },
-    // Both shipped adapters advertise steering HERE, at the top level, and not
-    // inside `agentCapabilities` -- looking in the wrong object is what once
-    // produced the conclusion that codex could not steer at all. `NOSTEER=1` drops
-    // it, so a test can prove the bridge refuses to inject into an agent that never
-    // claimed the capability rather than trying something that might deadlock.
-    ...(process.env.NOSTEER ? {} : { _meta: { steering: { supported: true } } }),
-    agentInfo: { name: "fake-agent", version: "1.0.0" },
-  }))
+  .onRequest(acp.methods.agent.initialize, async () => {
+    if (hangInitializeOnce) {
+      try {
+        closeSync(openSync(hangInitializeOnce, "wx"));
+        await never();
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+    }
+    return {
+      protocolVersion: acp.PROTOCOL_VERSION,
+      agentCapabilities: {
+        loadSession: false,
+        sessionCapabilities: { close: {}, resume: {}, fork: {} },
+      },
+      // Both shipped adapters advertise steering HERE, at the top level, and not
+      // inside `agentCapabilities` -- looking in the wrong object is what once
+      // produced the conclusion that codex could not steer at all. `NOSTEER=1` drops
+      // it, so a test can prove the bridge refuses to inject into an agent that never
+      // claimed the capability rather than trying something that might deadlock.
+      ...(process.env.NOSTEER ? {} : { _meta: { steering: { supported: true } } }),
+      agentInfo: { name: "fake-agent", version: "1.0.0" },
+    };
+  })
   // The measured contract of both adapters: answer immediately and leave the
   // running prompt alone, so that prompt still reports the whole turn.
   //
@@ -123,6 +163,7 @@ const app = acp
     const outcome = process.env.STEER_OUTCOME || "injected";
     if (outcome !== "injected") return { outcome };
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
+    if (process.env.GARBAGE_STDOUT) process.stdout.write("fixture prompt noise, not JSON\n");
     state.heard = [...(state.heard ?? []), text];
     // Releases the running SLOWTURN, which has been waiting for exactly this. The
     // turn then answers with everything it heard, injection included -- which is
@@ -130,7 +171,11 @@ const app = acp
     state.steered?.();
     return { outcome: "injected" };
   })
-  .onRequest(acp.methods.agent.session.new, ({ params }) => {
+  .onRequest(acp.methods.agent.session.new, async ({ params }) => {
+    if (process.env.RPC_CAPTURE_FILE) {
+      writeFileSync(process.env.RPC_CAPTURE_FILE, params.mcpServers?.[0]?.url ?? "");
+    }
+    if (process.env.HANG_RPC === "session/new") await never();
     // Monotonic, NOT derived from the live count: ids must never be reused after a
     // session closes, or a test asserting "this is a different session" passes by
     // accident when the id happens to come round again.
@@ -161,8 +206,9 @@ const app = acp
   // put and only stops being active -- which is what makes a parked session
   // resumable, and what this fixture has to model for the bridge to be tested
   // honestly.
-  .onRequest(acp.methods.agent.session.close, ({ params }) => {
+  .onRequest(acp.methods.agent.session.close, async ({ params }) => {
     const state = sessions.get(params.sessionId);
+    if (state?.hangClose) await never();
     if (state) state.closed = true;
     return {};
   })
@@ -172,24 +218,31 @@ const app = acp
     const parent = sessions.get(params.sessionId);
     if (!parent) throw new Error(`unknown session ${params.sessionId}`);
     const sessionId = `s${++opened}`;
+    if (process.env.WARM_CAPTURE_FILE) appendFileSync(process.env.WARM_CAPTURE_FILE, "fork\n");
     sessions.set(sessionId, {
       ...parent,
       forkedFrom: params.sessionId,
       heard: [...(parent.heard ?? [])],
+      mcp: params.mcpServers ?? [],
       turns: 0,
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, thoughtTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     });
     return { sessionId, configOptions: optionsFor(sessions.get(sessionId)) };
   })
-  .onRequest(acp.methods.agent.session.resume, ({ params }) => {
+  .onRequest(acp.methods.agent.session.resume, async ({ params }) => {
     const state = sessions.get(params.sessionId);
     // An id this agent never issued, or one that was deleted, cannot come back.
     if (!state) throw new Error(`unknown session ${params.sessionId}`);
+    if (state.delayResume) {
+      state.delayResume = false;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     state.closed = false;
     state.resumed = (state.resumed ?? 0) + 1;
     return { sessionId: params.sessionId, configOptions: optionsFor(state) };
   })
   .onRequest(acp.methods.agent.session.setConfigOption, ({ params }) => {
+    if (process.env.PROBE_GUARD) throw new Error("probe sent session/set_config_option");
     const state = sessions.get(params.sessionId);
     if (!state) throw new Error(`no such session ${params.sessionId}`);
     if (params.configId === "verbose") state.verbose = params.value;
@@ -198,19 +251,49 @@ const app = acp
     return { configOptions: optionsFor(state) };
   })
   .onNotification(acp.methods.agent.session.cancel, ({ params }) => {
-    sessions.get(params.sessionId)?.abort?.abort();
-  })
-  .onRequest(acp.methods.agent.session.prompt, async ({ params, client }) => {
     const state = sessions.get(params.sessionId);
-    if (!state) throw new Error(`no such session ${params.sessionId}`);
+    if (!state?.ignoreCancel) state?.abort?.abort();
+  })
+  .onRequest(acp.methods.agent.session.prompt, exclusivePrompt(async ({ params, client }, state) => {
+    if (process.env.PROBE_GUARD) throw new Error("probe sent session/prompt");
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("");
+    if (text.includes("WARMCOUNT") && process.env.WARM_CAPTURE_FILE) {
+      appendFileSync(process.env.WARM_CAPTURE_FILE, "warm\n");
+    }
     state.heard = [...(state.heard ?? []), text];
+    if (text.includes("DELAY_RESUME")) state.delayResume = true;
 
     if (text.includes("QUOTA")) throw new Error("Claude usage limit reached. Your limit will reset at 3pm.");
-    if (text.includes("BOOM")) throw new Error("connection reset by peer");
+    if (text.includes("BOOM") && !text.includes("BOOM_AFTER_OUTPUT")) throw new Error("connection reset by peer");
+    if (text.includes("DIE")) process.exit(42);
 
     const say = (update) => client.notify(acp.methods.client.session.update, { sessionId: params.sessionId, update });
     state.abort = new AbortController();
+
+    if (text.includes("HANG_CLOSE")) state.hangClose = true;
+
+    // Large enough to fill the HTTP socket while a client is not reading. This is
+    // a measurement turn, not a synthetic response object: every byte crosses the
+    // real ACP stdio connection and the real streaming HTTP path.
+    if (text.includes("LONG_OUTPUT")) {
+      const chunk = "x".repeat(8_192);
+      for (let i = 0; i < 256; i += 1) {
+        if (state.abort.signal.aborted) throw new Error("cancelled");
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: chunk } });
+      }
+      if (process.env.LONG_CAPTURE_FILE) appendFileSync(process.env.LONG_CAPTURE_FILE, "done\n");
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    // Deliberately violates the fixture's usual cancellation discipline: this is
+    // the broken child the production drain deadline exists to contain.
+    if (text.includes("IGNORE_CANCEL")) {
+      state.ignoreCancel = true;
+      for (;;) {
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "word " } });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
 
     // A turn slow enough to be steered into, which answers with EVERYTHING this
     // session has been told -- so a test can see whether the injected text was
@@ -236,6 +319,10 @@ const app = acp
     }
 
     await say({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking(${state.effort})` } });
+    if (text.includes("BOOM_AFTER_OUTPUT")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PARTIAL:before boom" } });
+      throw new Error("connection reset by peer");
+    }
     await say({ sessionUpdate: "tool_call", toolCallId: "t1", title: "noop", status: "completed", kind: "other" });
 
     // A turn with visible activity: a plan that advances, an edit that carries a
@@ -408,9 +495,27 @@ const app = acp
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
-    if (text.includes("HANG")) {
+    // Checked before HANG so a replayed history can ask which session received it
+    // without hanging again on the old turn's keyword.
+    if (text.includes("ECHOSESSION")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
+      return { stopReason: "end_turn" };
+    }
+
+    if (text.includes("HANG") && !text.includes("HANG_AFTER_TOOL") && !text.includes("HANG_CLOSE")) {
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `PARTIAL:${params.sessionId}` },
+      });
       await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
       return { stopReason: "cancelled" };
+    }
+
+    // A replay containing a completed client-tool exchange should be answerable as
+    // history on a fresh session, not interpreted as another request for the tool.
+    if (text.includes("LATE_RESULT") && text.includes("[result of ")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `FRESH:${params.sessionId}` } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
     // Behaves like a real ACP agent that was handed an MCP server: connects to it,
@@ -441,6 +546,10 @@ const app = acp
         content: { type: "text", text: `TOOLS:${listed.result.tools.map((t) => t.name).join(",")} ` },
       });
       const called = await rpc("tools/call", { name, arguments: args ? JSON.parse(args) : {} }, 3);
+      if (text.includes("HANG_AFTER_TOOL")) {
+        await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
+        return { stopReason: "cancelled" };
+      }
       const got = called.result?.content?.[0]?.text ?? `ERROR:${called.error?.message}`;
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `RESULT:${got}` } });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
@@ -456,13 +565,6 @@ const app = acp
       return { stopReason: "end_turn" };
     }
 
-    // Answers with its own session id, so a test can prove a conversation was
-    // continued in the SAME ACP session rather than silently restarted.
-    if (text.includes("ECHOSESSION")) {
-      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: params.sessionId } });
-      return { stopReason: "end_turn" };
-    }
-
     // Streams one word at a time so `stop` and `max_tokens` have somewhere to cut.
     if (text.includes("COUNT")) {
       for (let i = 1; i <= 20; i++) {
@@ -472,6 +574,12 @@ const app = acp
       return { stopReason: "end_turn" };
     }
 
+    if (text.includes("SPLIT_STOP")) {
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "alpha ST" } });
+      await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OP omega" } });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
     for (const part of [`[${state.model}] `, text]) {
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: part } });
     }
@@ -479,6 +587,6 @@ const app = acp
       stopReason: text.includes("REFUSE") ? "refusal" : "end_turn",
       usage: chargeTurn(state),
     };
-  });
+  }));
 
 app.connect(acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)));

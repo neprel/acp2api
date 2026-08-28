@@ -15,6 +15,8 @@ import { Terminals } from "./terminal.js";
  * serve both. See `Agent#inject`.
  */
 const STEERING_METHOD = "_session/steering";
+const CLOSE_GRACE_MS = 1_000;
+const DRAIN_GRACE_MS = 5_000;
 
 /** Thrown for anything the HTTP layer should report with a specific status. */
 export class AgentError extends Error {
@@ -56,6 +58,8 @@ export class Agent {
   #server;
   #log;
   #conn = null; // in-flight or established connection promise
+  #child = null;
+  #connection = null;
   #closing = false;
   // sessionId -> the turn currently reading that session's updates.
   //
@@ -97,6 +101,66 @@ export class Agent {
 
   get spec() {
     return this.#spec;
+  }
+
+  /** The only deadline implementation for requests sent to the ACP child. */
+  #bounded(promise, ms, what, { status = 502, code = "agent_error", after = null, onTimeout = () => {} } = {}) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        fn(value);
+      };
+      const expire = () => {
+        if (settled) return;
+        onTimeout();
+        const error = new AgentError(`${this.name}: ${what} within ${ms}ms`, status, code);
+        // Kept off the public error shape. Internal fallbacks need to distinguish
+        // a deadline from an ordinary RPC refusal without changing its HTTP code.
+        error.rpcTimeout = true;
+        finish(reject, error);
+      };
+      const arm = () => {
+        if (settled || timer) return;
+        timer = setTimeout(expire, ms);
+        timer.unref?.();
+      };
+
+      Promise.resolve(promise).then(
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
+      );
+      if (after) Promise.resolve(after).then(arm, arm);
+      else arm();
+    });
+  }
+
+  #closeGraceMs() {
+    return Math.min(this.#server.agentRpcTimeoutMs, CLOSE_GRACE_MS);
+  }
+
+  #drainGraceMs() {
+    return Math.min(this.#server.agentRpcTimeoutMs, DRAIN_GRACE_MS);
+  }
+
+  #terminate(child) {
+    if (!child || child.exitCode !== null || child.signalCode) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer = null;
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      child.once("exit", done);
+      child.kill("SIGTERM");
+      timer = setTimeout(() => {
+        if (child.exitCode === null && !child.signalCode) child.kill("SIGKILL");
+      }, CLOSE_GRACE_MS);
+      timer.unref?.();
+    });
   }
 
   #clientApp() {
@@ -197,18 +261,25 @@ export class Agent {
         stdio: ["pipe", "pipe", "inherit"],
         env: { ...process.env, ...env },
       });
+      this.#child = child;
 
       child.once("error", (e) => this.#log("error", `${name}: spawn failed: ${e.message}`));
       child.once("exit", (code, signal) => {
         // Drop the memo so the next request respawns rather than writing into a
         // dead pipe. A crashed agent must not take the whole server down.
-        this.#conn = null;
+        if (this.#child === child) {
+          this.#child = null;
+          this.#connection = null;
+          this.#conn = null;
+          this.#base = null;
+        }
         if (!this.#closing) this.#log("warn", `${name}: agent exited (code=${code} signal=${signal})`);
       });
 
       const stream = acp.ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
       const connection = this.#clientApp().connect(stream);
-      const init = await connection.agent.request(acp.methods.agent.initialize, {
+      this.#connection = connection;
+      const initRequest = connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {
           fs: { readTextFile: this.#server.fs, writeTextFile: this.#server.fs },
@@ -231,10 +302,25 @@ export class Agent {
             : {}),
         },
       });
+      const init = await this.#bounded(
+        initRequest,
+        this.#server.agentRpcTimeoutMs,
+        "agent did not answer initialize",
+        {
+          status: 503,
+          code: "agent_unavailable",
+          onTimeout: () => {
+            this.#conn = null;
+            connection.close();
+            child.kill();
+          },
+        },
+      );
       this.#log("info", `${name}: ${init.agentInfo?.name ?? command} v${init.agentInfo?.version ?? "?"} ready`);
       return { child, connection, init };
     })().catch((e) => {
       this.#conn = null;
+      if (e instanceof AgentError) throw e;
       throw new AgentError(`${this.#spec.name}: cannot start "${this.#spec.command}": ${e.message}`, 503, "agent_unavailable");
     });
     return this.#conn;
@@ -251,7 +337,6 @@ export class Agent {
    */
   async #applyOptions(ctx, session, wants) {
     let opts = session.options;
-    if (opts.length === 0) return;
 
     // Model first, then reasoning: choosing a model CHANGES the option set. Claude
     // drops the `effort` selector entirely once Haiku is selected, so an id looked
@@ -281,11 +366,22 @@ export class Agent {
       if (opt.type === "boolean") {
         Object.assign(payload, { type: "boolean", value: value === true || value === "true" });
       } else {
-        const choice = selectValues(opt.options).find((o) => o.value === String(value));
-        if (!choice) throw new AgentError(`${this.name}: "${configId}" has no value "${value}"`, 400, "unsupported_option");
+        const offered = selectValues(opt.options);
+        const choice = offered.find((o) => o.value === String(value));
+        if (!choice) {
+          throw new AgentError(
+            `${this.name}: "${configId}" has no value "${value}"; offered: ${offered.map((o) => o.value).join(", ")}`,
+            400,
+            "unsupported_option",
+          );
+        }
         Object.assign(payload, { value: choice.value });
       }
-      const res = await ctx.request(acp.methods.agent.session.setConfigOption, payload);
+      const res = await this.#bounded(
+        ctx.request(acp.methods.agent.session.setConfigOption, payload),
+        this.#server.agentRpcTimeoutMs,
+        "session/set_config_option did not answer",
+      );
       // The response carries the full refreshed set, and setting one option can
       // change another's choices (models restrict reasoning levels), so keep going
       // against the latest state rather than the snapshot from session/new. The
@@ -359,22 +455,52 @@ export class Agent {
   }
 
   /** `session/new` plus the agent's configured options. The cold path. */
-  async #newSession(ctx, extraMcp) {
+  async #newSession(ctx, extraMcp, { configure = true } = {}) {
     const builder = ctx.buildSession(this.#spec.cwd);
     for (const server of this.#mcpFor(extraMcp)) builder.withMcpServer(server);
     // `toRequest()` rather than `start()`: starting returns an `ActiveSession` that
     // registers its own update handler, and this class routes updates itself so a
     // resumed session can be read the same way a new one is. The builder is still
     // what shapes the request -- `mcpServers` has a fiddly array form.
-    const res = await ctx.request(acp.methods.agent.session.new, builder.toRequest());
+    const res = await this.#bounded(
+      ctx.request(acp.methods.agent.session.new, builder.toRequest()),
+      this.#server.agentRpcTimeoutMs,
+      "session/new did not answer",
+    );
     const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name, mcp: extraMcp ?? [] };
-    try {
-      await this.#applyOptions(ctx, session, this.#spec);
-    } catch (e) {
-      await this.closeSession(session);
-      throw this.#classify(e);
+    if (configure) {
+      try {
+        await this.#applyOptions(ctx, session, this.#spec);
+      } catch (e) {
+        await this.closeSession(session);
+        throw this.#classify(e);
+      }
     }
     return session;
+  }
+
+  /** Opens one unconfigured session and reports the ACP surface without prompting. */
+  async probe() {
+    const { connection, init } = await Promise.resolve().then(() => this.#connect());
+    const session = await this.#newSession(connection.agent, undefined, { configure: false });
+    try {
+      return {
+        agent: this.name,
+        configOptions: session.options.map((option) => ({
+          id: option.id,
+          category: option.category ?? null,
+          type: option.type,
+          values: selectValues(option.options).map(({ value, name }) => ({ value, name })),
+        })),
+        capabilities: {
+          steering: init._meta?.steering ?? null,
+          sessionCapabilities: init.agentCapabilities?.sessionCapabilities ?? {},
+          mcpCapabilities: init.agentCapabilities?.mcpCapabilities ?? {},
+        },
+      };
+    } finally {
+      await this.closeSession(session);
+    }
   }
 
   /**
@@ -401,11 +527,18 @@ export class Agent {
     if (this.#spec.warmup && init.agentCapabilities?.sessionCapabilities?.fork) {
       try {
         const base = await this.#warmBase(ctx);
-        const res = await ctx.request(acp.methods.agent.session.fork, {
-          sessionId: base.id,
-          cwd: this.#spec.cwd,
-          mcpServers: ctx.buildSession(this.#spec.cwd).toRequest().mcpServers,
-        });
+        const builder = ctx.buildSession(this.#spec.cwd);
+        for (const server of this.#mcpFor()) builder.withMcpServer(server);
+        const { cwd, mcpServers } = builder.toRequest();
+        const res = await this.#bounded(
+          ctx.request(acp.methods.agent.session.fork, {
+            sessionId: base.id,
+            cwd,
+            mcpServers,
+          }),
+          this.#server.agentRpcTimeoutMs,
+          "session/fork did not answer",
+        );
         const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name };
         // Applied again rather than assumed inherited. A fork is a new session and
         // the protocol does not promise it carries the parent's selections; two
@@ -415,6 +548,7 @@ export class Agent {
         this.#log("info", `${this.name}: forked ${session.id} from warm base ${base.id}`);
         return session;
       } catch (e) {
+        if (e?.rpcTimeout) throw e;
         this.#log("warn", `${this.name}: fork failed (${e?.message ?? e}); opening a cold session`);
       }
     }
@@ -452,7 +586,11 @@ export class Agent {
       // The agent fingerprints cwd + mcpServers and compares them on resume, so
       // both are sent exactly as `session/new` sent them. A config change between
       // the two is precisely the case that should NOT resume.
-      const res = await ctx.request(acp.methods.agent.session.resume, { sessionId, cwd, mcpServers });
+      const res = await this.#bounded(
+        ctx.request(acp.methods.agent.session.resume, { sessionId, cwd, mcpServers }),
+        this.#server.agentRpcTimeoutMs,
+        "session/resume did not answer",
+      );
       return {
         id: res?.sessionId ?? sessionId,
         options: res?.configOptions ?? [],
@@ -460,6 +598,7 @@ export class Agent {
         mcp: extra ?? [],
       };
     } catch (e) {
+      if (e?.rpcTimeout) throw e;
       this.#log("info", `${this.name}: cannot resume ${sessionId} (${e?.message ?? e}); opening a new session`);
       return null;
     }
@@ -472,9 +611,15 @@ export class Agent {
     this.#sinks.delete(session.id);
     const conn = this.#conn && (await this.#conn.catch(() => null));
     if (!conn?.init.agentCapabilities?.sessionCapabilities?.close) return;
-    await conn.connection.agent
-      .request(acp.methods.agent.session.close, { sessionId: session.id })
-      .catch(() => {});
+    try {
+      await this.#bounded(
+        conn.connection.agent.request(acp.methods.agent.session.close, { sessionId: session.id }),
+        this.#closeGraceMs(),
+        "session/close did not answer",
+      );
+    } catch (e) {
+      this.#log("warn", `${this.name}: could not close session ${session.id} (${e?.message ?? e})`);
+    }
   }
 
   /**
@@ -506,6 +651,9 @@ export class Agent {
    * cannot express at all.
    */
   async turn(session, blocks, { signal, onEvent = () => {}, limit = null, overrides = null } = {}) {
+    if (session?.closed || session?.dead) {
+      throw new AgentError(`${this.name}: session ${session?.id ?? "?"} is no longer usable`, 502, "agent_error");
+    }
     // Already gone before the turn began -- the caller hung up while the session
     // was being opened, which on a cold agent is seconds.
     //
@@ -521,7 +669,13 @@ export class Agent {
     const { connection } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
 
+    let beginDrain;
+    const drainStarted = new Promise((resolve) => { beginDrain = resolve; });
+    let cancelSent = false;
     const onAbort = () => {
+      if (cancelSent) return;
+      cancelSent = true;
+      beginDrain();
       ctx.notify(acp.methods.agent.session.cancel, { sessionId: session.id }).catch(() => {});
     };
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -540,6 +694,7 @@ export class Agent {
       if (overrides) await this.#applyOptions(ctx, session, overrides);
 
       let text = "";
+      let emittedTextLength = 0;
       let reasoning = "";
       let cut = null; // stop reason imposed by `limit`, once it fires
       // Text seen since the last tool call. A coding agent writes a sentence
@@ -564,6 +719,12 @@ export class Agent {
       // answer and into the trace. Off by default: it changes what the caller
       // receives as the assistant's message, which is not a display preference.
       const asTrace = this.#server.commentary === "trace";
+      const emitVisibleText = () => {
+        const visible = limit?.visibleText?.(text) ?? text;
+        if (visible.length <= emittedTextLength) return;
+        onEvent({ type: "text", delta: visible.slice(emittedTextLength) });
+        emittedTextLength = visible.length;
+      };
       let context = null; // {used, size} from the last usage_update, if any
       let cost = null; // {amount, currency} from the last usage_update, if any
 
@@ -579,8 +740,8 @@ export class Agent {
         if (cut) return;
 
         if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text") {
-          pending += u.content.text;
           if (asTrace) {
+            pending += u.content.text;
             // Nothing is emitted here: a run cannot be streamed before it is known
             // whether a tool call follows it, and a delta once sent cannot be taken
             // back out of the answer. `limit` reads the run in flight, because that
@@ -595,19 +756,27 @@ export class Agent {
             return;
           }
 
-          const before = text.length;
           text += u.content.text;
+          if (!limit) {
+            // The current notification already IS the unheard delta. Slicing it
+            // back out of the growing turn flattens the whole accumulated string
+            // for every chunk, producing quadratic allocation on long streams.
+            onEvent({ type: "text", delta: u.content.text });
+            emittedTextLength = text.length;
+            return;
+          }
           const verdict = limit?.(text);
           if (verdict) {
             // `limit` may shorten the text -- a stop sequence is not part of the
             // answer -- so emit only what survived, then cancel and drain.
             cut = verdict.stopReason;
             text = verdict.text;
-            if (text.length > before) onEvent({ type: "text", delta: text.slice(before) });
+            if (text.length > emittedTextLength) onEvent({ type: "text", delta: text.slice(emittedTextLength) });
+            emittedTextLength = text.length;
             onAbort();
             return;
           }
-          onEvent({ type: "text", delta: u.content.text });
+          emitVisibleText();
         } else if (u.sessionUpdate === "agent_thought_chunk" && u.content?.type === "text") {
           reasoning += u.content.text;
           onEvent({ type: "reasoning", delta: u.content.text });
@@ -654,16 +823,35 @@ export class Agent {
       // already in flight, so this one response still reports the whole of it --
       // measured 2026-08-13 with a 45 s command in progress: the original work
       // finished, the injected command ran, and both appeared in this answer.
-      const response = await ctx.request(acp.methods.agent.session.prompt, {
-        sessionId: session.id,
-        prompt: blocks,
-      });
+      let response;
+      try {
+        response = await this.#bounded(
+          ctx.request(acp.methods.agent.session.prompt, {
+            sessionId: session.id,
+            prompt: blocks,
+          }),
+          this.#drainGraceMs(),
+          "session/prompt did not drain after cancel",
+          {
+            after: drainStarted,
+            onTimeout: () => { session.dead = true; },
+          },
+        );
+      } catch (e) {
+        // A limiter already decided the honest result. Cancellation is a request
+        // to stop, not permission to wait forever for the agent to acknowledge it.
+        if (!(e?.rpcTimeout && cut)) throw e;
+        response = { stopReason: "cancelled", usage: null };
+      }
       if (asTrace) {
         // Whatever is still held when the turn ends had no tool call after it, so
         // it is the answer. Emitted in one delta because that is genuinely when it
         // became knowable -- see the note in the message-chunk branch above.
         text = pending.trim();
         if (text) onEvent({ type: "text", delta: text });
+      } else if (!cut && text.length > emittedTextLength) {
+        // No later chunk can complete a held stop prefix once the turn is over.
+        onEvent({ type: "text", delta: text.slice(emittedTextLength) });
       }
       return {
         text,
@@ -706,6 +894,7 @@ export class Agent {
       // request while the session serves many, so a leaked listener would cancel
       // somebody else's turn.
       signal?.removeEventListener("abort", onAbort);
+      if (session.dead) await this.closeSession(session);
     }
   }
 
@@ -753,11 +942,15 @@ export class Agent {
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
     if (!init?._meta?.steering?.supported) return false;
 
-    const res = await connection.agent.request(STEERING_METHOD, {
-      sessionId: session.id,
-      prompt: blocks,
-      _meta: { steering: { idleBehavior: "promptRequired" } },
-    });
+    const res = await this.#bounded(
+      connection.agent.request(STEERING_METHOD, {
+        sessionId: session.id,
+        prompt: blocks,
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      }),
+      this.#server.agentRpcTimeoutMs,
+      "_session/steering did not answer",
+    );
 
     // `injected` is the one that means what this method promises. The others are
     // named rather than lumped together, because they are different facts:
@@ -802,15 +995,18 @@ export class Agent {
     // for it, and killing the CLI would leave the build it launched running with
     // nobody left to stop it.
     this.#terminals?.releaseAll();
-    // The warm base belongs to nobody but this agent, so nothing else will close it.
-    const base = this.#base?.session;
+    // The whole child is ending, so its private warm session goes with it; a
+    // session/close round trip here would put shutdown behind the child we need to
+    // terminate.
     this.#base = null;
-    if (base) await this.closeSession(base).catch(() => {});
-    const conn = this.#conn;
+    this.#conn?.catch(() => {});
     this.#conn = null;
-    if (!conn) return;
-    const { child, connection } = await conn.catch(() => ({}));
+    const child = this.#child;
+    const connection = this.#connection;
+    this.#child = null;
+    this.#connection = null;
+    const stopped = this.#terminate(child);
     connection?.close();
-    child?.kill();
+    await stopped;
   }
 }

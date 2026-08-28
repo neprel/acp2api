@@ -61,6 +61,13 @@ forking on each such change would mean never continuing anything.
 The header name is `server.conversationHeader`; set it to `""` to ignore it.
 Requests without it fall back to prefix matching.
 
+If a named conversation is already serving a turn, the default `server.busy:
+fork` refuses the second request with **409 `conversation_busy`**. The key asserts
+that both requests belong to one conversation, so opening another session would
+silently rebind that key and orphan the running turn. Headerless callers do not
+assert that identity: when their matching conversation is busy, they continue to
+get a session of their own.
+
 ## Saying something while the turn is still running
 
 A coding-agent turn runs for minutes behind a single completion. Without a way in,
@@ -272,6 +279,12 @@ actually wants. Claude speaks `http` and `sse`, Codex `http`.
 
 ## What OpenAI parameters do
 
+Browser access is deliberately off. acp2api has no authentication of its own, so
+default-open CORS would turn a local coding agent into a capability any web page
+could call. Set `server.cors` to one trusted origin, such as
+`https://app.example`, or to `true` only when the wildcard `*` is intentional.
+Enabled CORS covers preflight requests and every API response.
+
 `session/prompt` carries exactly `{sessionId, prompt, _meta}` — no sampling knobs,
 no tools, no response format. An ACP agent is an *agent*, not a raw model endpoint:
 it owns its inference settings. There is no lower layer to reach either;
@@ -286,7 +299,9 @@ So parameters are split by **what breaks if we proceed**, not by what is support
 | `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (token counts are approximate; there is no tokenizer here) |
 | `stream_options.include_usage` | native |
 | `temperature`, `top_p`, `seed`, penalties, `logprobs`, unknown fields | **accepted and ignored.** Every client library sends `temperature` unasked; failing on it would reject nearly every real request over a difference the caller cannot perceive |
-| `tools`, `tool_choice`, `functions` | **accepted and ignored.** An ACP agent runs its own tool loop, so it acts rather than returning `tool_calls` — give it the same capabilities through `mcpServers` and the work still happens, just inside its loop. Tool calls and results already in the history are rendered faithfully |
+| `tools` | **served by default.** The bridge exposes caller tools through a per-conversation MCP server and can return `tool_calls`; set `server.tools: off` to drop them and report `tools` in `ignored_params`. See [Your tools in the agent's hands](#your-tools-in-the-agents-hands) |
+| `tool_choice` | **accepted and ignored.** The ACP agent chooses whether to call a served tool |
+| `functions`, `function_call` | **accepted and ignored.** Use `tools` for caller-served functions |
 | `response_format`, `n > 1`, `audio` | **400.** Nothing gives the caller its guarantee back |
 
 Ignored parameters are never silent: they are logged once per (model, parameter)
@@ -301,17 +316,29 @@ Attachments work: an OpenAI `file` part with `file_data` becomes an ACP `resourc
 block (text inline, anything else as a blob). `file_id` is refused — it names an
 OpenAI-hosted file that does not exist here.
 
+`server.agentRpcTimeoutMs` bounds ACP control calls (`initialize`, session setup,
+configuration, fork and resume). It does not cap a normal agent turn—that remains
+under `requestTimeoutMs`—but it does bound how long a cancelled turn may ignore
+`session/cancel` before its session is retired.
+
 `model` and `reasoning` are matched by
 [category](https://agentclientprotocol.com/protocol/session-setup), never by option
 id, because the ids differ per agent — Claude calls its reasoning selector `effort`,
 Codex calls it `reasoning_effort`. A `model` the agent does not offer is a **400**,
 never a silent fallback: you named that agent to get that model.
 
-To see what an agent offers, run its adapter and send `initialize` + `session/new`:
+Agent model lists move. On 2026-08-27, an adapter replaced `opus` with `opus[1m]`;
+the correct 400 prevented a silent fallback, but did not reveal the new spelling.
+Probe the configured agent directly:
 
 ```sh
-npx @agentclientprotocol/claude-agent-acp
+acp2api --config acp2api.yaml --probe claude-opus
 ```
+
+The command prints live config options (id, semantic category, type, and named
+values) plus steering, session, and MCP capability highlights. It reuses the same
+ACP connection and session setup as the server, then closes cleanly. It never sends
+a prompt, so diagnosing a moved model list does not spend a subscription turn.
 
 ## /v1/responses is the better fit
 
@@ -342,10 +369,17 @@ agent already holds it. `reasoning.effort` can likewise be raised for one hard
 question mid-conversation and dropped again — chat completions has no field for that
 at all.
 
-Retained sessions are live child processes holding logins, so they are bounded by
-`server.maxSessions` (evicted by last *use*, so an actively continued conversation
-outlives a newer idle one) and `server.sessionTtlMs`. Both close the ACP session, as
+Retained conversations hold live ACP sessions inside the agent process, so resident
+sessions are bounded by `server.maxSessions` (parked by last *use*, so an actively
+continued conversation outlives a newer idle one) and `server.sessionTtlMs`. Both
+close the resident ACP session while retaining its id for `session/resume`.
+`server.forgetTtlMs` ends the conversation outright. Deleting its last stored
+response, shutting down, and a first turn that fails before answering also close
+and discard it.
 
+There is no authentication: acp2api is a local bridge, and authorization is the
+job of the router in front of it. It binds loopback by default and warns at startup
+if `server.host` makes it reachable elsewhere.
 
 Agent *thinking* is streamed and returned as `reasoning_content` alongside
 `content` — the non-standard-but-universal field vLLM, DeepSeek and OpenRouter all

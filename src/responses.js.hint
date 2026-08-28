@@ -18,6 +18,14 @@ read its own past a second time, as text, alongside its real memory of it.
 So `toInputBlocks` renders **only** what arrived in this request. Any change that
 reconstructs a transcript from stored responses is wrong.
 
+This is also why a suspended tool turn cannot use chat's discard-and-replay escape
+hatch. Chat receives the whole history again; Responses receives only the new
+input. While the tool turn is pending, new input without a matching
+`function_call_output` therefore gets 409 `tool_result_expected` with instructions
+to provide the result or omit `previous_response_id`. Once the turn settles
+unattended and releases itself, later input continues the same retained session and
+keeps its context.
+
 # rule reasoning.effort is per request, and re-applied every turn {#per_request_effort}
 
 The one genuinely per-request agent setting ACP can carry, via the `thought_level`
@@ -32,16 +40,24 @@ a field OpenAI does not have.
 
 ## result
 `{model, blocks, instructions, previousResponseId, store, stream, reasoning,
-maxTokens, stop, ignored}`.
+maxTokens, stop, ignored, tools, toolResults}`.
 
 ## rule store defaults to true
 OpenAI stores by default, and without retention `previous_response_id` could never
-be satisfied. `store: false` closes the session with the turn.
+be satisfied. `store: false` closes the session with the turn. When caller tools
+are actively served, the server rejects `store: false` with 400 `store_required`:
+the agent may suspend inside a call, and retaining the response id is the only
+honest way for a later `function_call_output` request to reach that turn.
 
 ## error unsupported_parameter
-`tools`, `tool_choice`, `text` (structured output), `include`, `truncation` — the
-same style/contract split as chat completions, under this API's names. See
+`tool_choice`, `text` (structured output), `include`, `truncation` — the same
+style/contract split as chat completions, under this API's names. `tools` is read:
+the server may expose the caller's functions to the ACP agent through MCP. See
 [_.hint#param_policy](../_.hint).
+
+On a continuation, declaring tools is accepted only when the conversation already
+owns a tool bench. Adding tools to an unbenched retained session is 400: MCP servers
+are fixed at `session/new`, and silently reopening would lose Responses context.
 
 # func responseObject {#shape}
 
@@ -63,17 +79,31 @@ scattered through a request handler. Switching between reasoning and message tex
 closes the open item first — the two are separate output items, not one interleaved
 stream.
 
+Each data frame also carries `event: <payload.type>`; the terminal `[DONE]` sentinel
+remains data-only. A post-header failure uses `event: error` with the standard error
+envelope. Chat completions deliberately remains data-only.
+
+# invariant Responses only renames canonical usage
+
+`renameUsage` consumes [openai.js.hint#canonical_usage](./openai.js.hint) and changes
+field names only. Cache arithmetic and totals must never be reimplemented here.
+
 # test responses
 
 - `input` accepts a bare string, `{role, content}` messages, and `input_text` parts
 - `instructions` become an unlabelled system preamble
 - unsupported input item types are rejected rather than silently dropped
 - `previous_response_id`, `reasoning.effort`, `max_output_tokens`, `store` are mapped
-- `tools` and `text` are 400; `temperature` is ignored and reported
+- `tools` and trailing `function_call_output` items are mapped; `text` is 400;
+  `temperature` is ignored and reported
 - stop reasons map to `status`, with `incomplete_details` when truncated
 - reasoning appears as its own output item before the message
 - a conversation continues in the **same** ACP session, provable by its session id
 - a chain continues from any response in it, not only the tip
 - an unknown `previous_response_id` is 404; a mismatched model is 400
 - `store: false` answers and retains nothing
-- the event stream is typed, densely sequenced, correctly nested, and ends in `[DONE]`
+- `store: false` with served tools is 400 `store_required`
+- tools on an unbenched continuation are 400 without damaging the stored chain
+- new input with no tool outputs gets 409 while the tool response is pending; after
+  unattended settlement releases it, new input continues the same ACP session
+- event lines match payload types; the stream is densely sequenced, correctly nested, and ends in `[DONE]`

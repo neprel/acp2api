@@ -7,7 +7,7 @@ success are in [_.hint#silent_success](../_.hint).
 
 # scope What this module owns
 
-In: routing, authentication, body limits, SSE framing, the timeout and
+In: routing, body limits, CORS, SSE framing, the timeout and
 client-disconnect distinction, and turning errors into OpenAI-shaped bodies.
 
 Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest`,
@@ -18,17 +18,16 @@ Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest`,
 | method | path | auth | |
 | --- | --- | --- | --- |
 | GET | `/health` | none | liveness plus the configured model ids |
-| GET | `/v1/models`, `/models` | yes | OpenAI model list |
-| POST | `/v1/chat/completions`, `/chat/completions` | yes | one turn, continuing a session when the history extends one |
-| POST | `/v1/responses`, `/responses` | yes | one turn of a retained conversation |
-| GET | `/v1/responses/{id}` | yes | a stored response |
-| DELETE | `/v1/responses/{id}` | yes | forget it, closing the session if it was the last |
+| GET | `/v1/models`, `/models` | none | OpenAI model list |
+| POST | `/v1/chat/completions`, `/chat/completions` | none | one turn, continuing a session when the history extends one |
+| POST | `/v1/responses`, `/responses` | none | one turn of a retained conversation |
+| GET | `/v1/responses/{id}` | none | a stored response |
+| DELETE | `/v1/responses/{id}` | none | forget it, closing the session if it was the last |
 
-`/health` is deliberately unauthenticated: a probe that needs a secret is a probe
-that silently stops working when the secret rotates. It exposes model ids and
-nothing else.
+Every route is deliberately unauthenticated. Authorization belongs to the router in
+front; loopback binding is the bridge's default exposure boundary.
 
-# invariant Auth compares in constant time, on both header spellings {#auth}
+# decision Authentication belongs to the router {#auth}
 
 **There is no authentication.** It was removed deliberately: this bridge is
 reached through a router — litellm, a proxy — and that is where authorization can
@@ -48,14 +47,40 @@ behind the port is an agent that runs commands.
 2. `parseChatRequest` — refusals become 400 here, before any agent is touched.
 3. `params.report` — logs and, in `error` mode, rejects.
 4. Resolve the model to an agent, or 404 naming what exists.
-5. Arm the timeout and the disconnect watcher.
-6. Run the turn, streaming or not.
-7. Translate the outcome.
+5. Synchronously claim an existing conversation, or observe that it is busy.
+6. Enter `runTurnLifecycle`, which arms the timeout and disconnect watcher.
+7. Run or resume the turn, streaming or not.
+8. Translate the outcome and release ownership unless the turn is pending.
+
+# invariant Every HTTP surface uses the shared turn lifecycle {#turn_lifecycle}
+
+The lifecycle is **claim → arm timer/close watcher → run or resume → settle →
+release**. `handleCompletion` and `handleResponse` supply their shape-specific run,
+error and release functions to `runTurnLifecycle`; they do not create their own
+controllers, timers or close watchers. A new HTTP surface that starts an ACP turn
+must use this runner rather than copying the sequence.
+
+An existing conversation is claimed synchronously before entering the runner. A
+fresh conversation is claimed immediately after `session/new`, before its first
+`session/prompt`. Busy and pending matches are observations of another owner, not
+new claims: a 409 observer must not release that owner, while a request that adopts
+and finishes a pending turn releases only after `pending` is cleared. The runner's
+`finally` owns timer cleanup and invokes the handler's guarded release on every
+exit, including errors, streaming returns and tool-call handovers.
 
 ## invariant A session that never answered is discarded
 It has heard messages nobody can account for, so offering it to the next request
 would put the agent in a conversation that half-happened. See
 [sessions.js.hint#continuity](./sessions.js.hint).
+
+## invariant A dead session retires its conversation {#dead_session_retires}
+When the agent layer marks a session `dead` because its cancelled prompt missed the
+drain grace, the HTTP turn may still honestly finish with the limiter's 200 result,
+but the conversation is discarded before that response returns. It must not be
+remembered, recorded, or offered to a later request: the next keyed request starts a
+fresh session rather than paying one 502 to discover the retained handle is dead.
+Tool turns apply the same rule even when their HTTP request detached before the
+prompt finally settled.
 
 ## rule A turn nobody waited for does not cost a KEYED session {#abandon_keeps_keyed}
 The exception to the invariant above, and the whole of steering. When the caller
@@ -85,6 +110,11 @@ covers it.
 They need opposite answers: a timeout owes the caller 504, a vanished client owes it
 nothing. One flag for both produces a 504 written to a closed socket, or a silent
 200 for a request that timed out.
+
+These checks are part of settling **every** turn, including tool-serving turns and
+turns resumed by a later request. A new settle path that does not consume both
+`timedOut` and `clientGone` is wrong. The request handler owns its timer and clears
+it from `finally`; settle helpers neither receive nor clear the timer themselves.
 
 ## bad A conversation must always have a way OUT of a suspended turn {#suspended_turn_exits}
 Two wedges, both found in production on 2026-08-15 in acp2api 1.10.2, both fixed in
@@ -124,6 +154,13 @@ fresh prompt asks it to do two things at once — and starts fresh. A request th
 DOES carry tool messages and matches none still gets the 409; that caller believes
 it is answering something, and saying so is the useful reply.
 
+If the pending turn settles before its caller returns, it releases itself from
+`busy`/`pending`. A later request ending in tool results must not reuse that ACP
+session: the agent continued from a tool-timeout outcome the caller never saw, so
+its recorded prefix no longer describes its real state. Discard it and start fresh
+from the complete history the caller supplied; a permanent 409 and reuse of the
+stale session are both wrong.
+
 Both are pinned by regression tests that were each shown to fail with only their
 own fix reverted. Do not take a passing suite as evidence here — the bug's whole
 signature is a 200.
@@ -138,10 +175,44 @@ from a short answer.
 Once headers are out the status is spent: mid-stream truncation is reported as
 `finish_reason: "length"`, the closest honest value left.
 
+A failure after headers is never a bare close. It emits the standard error envelope
+as an SSE frame, then `[DONE]`; Responses additionally names every frame with
+`event: <payload.type>` and names failures `event: error`. Pre-stream failures keep
+their clean HTTP status because `start()` has not committed headers yet.
+
+# decision Coalesce a stalled stream; do not stall the turn {#sse_backpressure}
+
+When `res.write()` returns false, the accepted frame stays in Node's socket queue
+and later adjacent deltas of the same channel are held as raw text pieces. On
+`drain` they join once into one frame. Content never merges with reasoning; on the
+Responses surface only identical named delta event types merge. Responses events
+are renumbered as they reach the socket so coalescing cannot leave sequence gaps.
+
+A type boundary stays a boundary. Finish, usage, error and `[DONE]` are separate
+ordered entries behind held text, and `res.end()` waits for them to drain. Never
+pause the ACP producer and never disconnect a slow client: the turn accumulator
+already owns the full answer, so the honest bound is one turn's text rather than a
+second serialized frame per agent delta.
+
+Measured by the real-stdio `LONG_OUTPUT` fixture with a client that stopped reading
+a 2 MiB turn (2026-08-28): before coalescing the process retained 97,337,344 bytes
+of RSS and 38,380,744 bytes of live heap at the measurement point. After
+coalescing, direct delta emission and explicit collection, live heap plus
+ArrayBuffers retained 2,311,752 bytes (1.10x the payload). The regression ceiling
+is 3x: room for the turn accumulator, coalesced payload and both socket buffers,
+without pinning an allocator's reserved-but-unused RSS pages.
+
 # rule Every response carries an OpenAI-shaped error body {#error_shape}
 
 `{error: {message, type, code, param}}`. Clients branch on `error.code`, so a new
 failure mode needs a distinct code, not a new message under an existing one.
+
+# invariant CORS is opt-in and covers the whole HTTP response
+
+With `server.cors: false`, no cross-origin headers are emitted. An enabled origin
+is attached before routing, so success and error responses agree, and `OPTIONS`
+preflight ends with 204. `true` means the operator deliberately chose `*`; it is
+never the default because this unauthenticated server controls coding agents.
 
 # func handleResponse {#handle_response}
 
@@ -158,6 +229,21 @@ If the turn fails before producing a response, the conversation it opened is
 discarded. No response id would ever point at it, so it could never be closed
 otherwise — and it is a live login. The same applies to `store: false`.
 
+## invariant Responses tool turns keep the same escape hatches
+A `previous_response_id` naming a suspended tool turn resumes it only when the new
+input contains matching `function_call_output` items. While it remains pending,
+input with no tool outputs gets 409 `tool_result_expected`, explaining both valid
+options: send the matching output, or omit `previous_response_id` to start a new
+conversation. When the pending turn settles unattended, its watcher releases the
+conversation and later input can continue the same retained ACP session.
+
+This deliberately differs from chat. Chat resends the complete history, so a fresh
+session can reconstruct the conversation honestly. Responses sends only new input
+([responses.js.hint#no_replay](./responses.js.hint)); discarding here would silently
+lose all earlier context while echoing `previous_response_id` as if it continued.
+Served tools with `store: false` remain a 400 `store_required`, because a tool call
+necessarily crosses requests and needs a retained continuation for its result.
+
 # invariant Closing the server closes every agent
 Agents are child processes holding authenticated sessions. The `close` handler on
 the server reaps them — retained sessions first, so each CLI is *told* to end rather
@@ -172,7 +258,7 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - a quota failure is 429 **even on a streaming request** — the header-deferral test
 - an unrelated failure is 502; an unknown model is 404 naming what is available
 - `temperature` returns 200 and reports itself in `x_acp2api.ignored`
-- a tool-sending client is answered, and its `tools` reported as ignored
+- a tool-sending client is answered through its MCP bench; `tool_choice` remains ignored
 - `unsupportedParams: error` turns the ignorable ones into 400 as well
 - `max_tokens` finishes with `length`; `stop` cuts the text and finishes with `stop`
 - a growing history continues one session and sends only the new turn
@@ -181,4 +267,6 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - a failed turn leaves no session to be continued
 - a timeout is 504, not a truncated 200
 - malformed bodies are 400 with an OpenAI-shaped error; unknown routes are 404
+- post-header failures produce an error frame and `[DONE]`; Responses event names match payload types
+- CORS is absent by default; enabled CORS answers preflight and marks actual responses
 - closing the server closes every agent

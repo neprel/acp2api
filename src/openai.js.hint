@@ -38,9 +38,10 @@ followed by image and resource blocks in the order they appeared.
 
 ## rule Tool calls and results are conversation, and must read as such {#tool_history}
 
-Tool DEFINITIONS are dropped (see [params.js.hint#tools_ignored](./params.js.hint)),
-but calls and results that already happened are facts about the conversation and the
-agent needs them to understand where it is.
+Tool definitions are request configuration handled by the server's MCP policy (see
+[params.js.hint#tools_ignored](./params.js.hint)); this translator only sees message
+history. Calls and results that already happened are facts about the conversation
+and the agent needs them to understand where it is.
 
 Two renderings were wrong before 1.2.0 and are the reason this rule exists:
 
@@ -64,7 +65,9 @@ Builds the callback `Agent.prompt` consults after each chunk. Returns `null` whe
 the request asks for no limits, so the hot path stays free of a no-op call.
 
 ## result
-`null`, or `(text) => null | {stopReason, text}`.
+`null`, or `(text) => null | {stopReason, text}`. The returned function also has
+`visibleText(text)`, which removes any trailing prefix that a later chunk could
+complete into a configured stop sequence.
 
 ## invariant The limiter is pure and idempotent
 It is called after every chunk with the full accumulated text, so it must decide
@@ -74,6 +77,10 @@ from that text alone and never from call history. See
 ## rule A stop sequence is excluded from the answer
 OpenAI semantics: the text is cut **before** the match, and the reason is
 `end_turn` — the model stopped where it was told to, it did not run out.
+
+Streaming holds back the longest trailing prefix of every configured stop sequence.
+The agent flushes it only if the turn ends without completing a match; emitting it
+immediately would leak part of a stop sequence that spans ACP chunks.
 
 # data estimateTokens {#token_estimate}
 
@@ -101,6 +108,13 @@ and report zero.
 A counter that moved BACKWARDS is read as the counter itself, not as a negative
 delta: that means the agent re-based its own accounting, and no consumer can do
 anything with a negative token count.
+
+# invariant One canonical OpenAI usage mapping {#canonical_usage}
+
+Exported `toUsage` owns all arithmetic and the chat-completions field names,
+including cached-input addition and details. Responses may only rename those
+canonical fields to `input_tokens`, `output_tokens`, and their details. A second
+arithmetic mapping is a bug: it will drift on the next ACP counter distinction.
 
 # bad The two models disagree about what "input" means {#cached_is_a_subset}
 
@@ -133,6 +147,10 @@ passes while production is wrong again.
 sent as `""` or `[]`. An unknown future ACP stop reason maps to `"stop"`, never to
 an invalid `finish_reason` that a strict client would reject.
 
+`toolCallDeltas` emits complete accumulator entries. Every entry carries its
+zero-based `index` plus `id`, `type`, function name and arguments; without the index
+an OpenAI SDK cannot assemble more than one streamed call deterministically.
+
 # test openai
 
 - a single user turn passes through with no scaffolding
@@ -143,10 +161,11 @@ an invalid `finish_reason` that a strict client would reject.
 - `file_id` and remote `image_url` are refused rather than fetched
 - malformed requests (no messages, no role, system-only, no model) are rejected
 - an assistant turn with `tool_calls` renders the calls, and keeps its text if any
+- streamed tool-call entries are complete and indexed 0..n
 - a tool result is attributed to the tool, never to the user
 - `parseChatRequest` surfaces `stream`, `includeUsage`, `maxTokens`, `stop`, `ignored`
 - `max_completion_tokens` wins over `max_tokens`; both validated as positive integers
-- `makeLimiter` returns null when unconstrained; cuts before a stop sequence; truncates on budget
+- `makeLimiter` returns null when unconstrained; holds split stop prefixes, cuts before a stop sequence; truncates on budget
 - stop reasons map to `finish_reason`, and an unknown one maps to `"stop"`
 - `reasoning_content` and `x_acp2api` are absent, not empty, when there is nothing to report
-- usage maps ACP token names to OpenAI's, including reasoning tokens
+- the single exported usage mapper handles ACP counters, cache reads, and reasoning

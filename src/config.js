@@ -58,13 +58,16 @@ export const DEFAULT_LIMIT_PATTERNS = [
   "insufficient_quota",
 ];
 
-const DEFAULTS = {
+const SERVER_SCHEMA = {
   // Loopback by default, and deliberately so: this bridge has no authentication
   // of its own and spawns agents that run commands and write files. Binding it
   // somewhere the network can reach is the operator's call to make -- and is
   // announced at startup, because it is worth seeing once.
-  host: "127.0.0.1",
-  port: 10021,
+  host: { default: "127.0.0.1", type: "nonEmptyString" },
+  port: { default: 10021, type: "port" },
+  // Browser access is an exposure decision on a server with no authentication.
+  // False is off, true permits every origin, and a string permits that one origin.
+  cors: { default: false, type: "cors" },
   // Prometheus metrics, on an address of their own: "off", or "host:port".
   //
   // A SECOND listener rather than a route on the API port, for two reasons. The API
@@ -74,11 +77,19 @@ const DEFAULTS = {
   // turns that run for minutes.
   //
   // Off by default -- a bridge that opens a port nobody asked for is a surprise.
-  metricsAddr: "off",
-  cwd: ".",
-  requestTimeoutMs: 600_000,
-  permission: "allow",
-  fs: true,
+  metricsAddr: {
+    default: "off",
+    type: "metricsAddress",
+    error: (_at, _value, raw) => `server.metricsAddr must be "off", "host:port", or "[IPv6]:port" with a port from 1 to 65535, got ${raw}`,
+  },
+  cwd: { default: ".", type: "string" },
+  requestTimeoutMs: { default: 600_000, type: "positiveInt" },
+  // Bound the control-plane RPCs around a turn. The prompt itself may legitimately
+  // run for requestTimeoutMs; this covers initialize/session setup and the short
+  // drain after a cancelled prompt.
+  agentRpcTimeoutMs: { default: 30_000, type: "positiveInt" },
+  permission: { default: "allow", type: "enum", values: ["allow", "deny"] },
+  fs: { default: true, type: "boolean" },
   // Run the agent's commands HERE instead of inside it.
   //
   // Advertising ACP's `terminal` capability makes an agent route its shell work
@@ -89,23 +100,23 @@ const DEFAULTS = {
   // timeouts, output bounds and process reaping stop being the agent's problem and
   // become this one's -- see src/terminal.js. Off by default because an agent that
   // was sandboxing its own execution stops doing so the moment this is on.
-  terminal: false,
-  maxTerminals: 8,
-  terminalOutputBytes: 1_048_576,
+  terminal: { default: false, type: "boolean" },
+  maxTerminals: { default: 8, type: "positiveInt" },
+  terminalOutputBytes: { default: 1_048_576, type: "positiveInt" },
   // Wall clock for a single command. A command nobody kills and nobody waits for
   // outlives the turn, the session and the conversation; the agent decides when to
   // stop waiting, this decides when to stop running. 0 disables the bound.
-  terminalTimeoutMs: 1_800_000,
+  terminalTimeoutMs: { default: 1_800_000, type: "nonNegativeInt" },
   // What to do with OpenAI parameters ACP cannot carry. `warn` is the default and
   // the only sane one: every client library sends `temperature` unasked, so `error`
   // would reject almost every request in the wild. See src/params.js for why some
   // parameters are refused regardless of this setting.
-  unsupportedParams: "warn",
-  // Retained ACP sessions behind the Responses API. Each is a live child process
-  // holding a login, so both bounds matter: the cap stops an unbounded client from
-  // spawning CLIs forever, and the TTL reaps conversations nobody returns to.
-  maxSessions: 100,
-  sessionTtlMs: 3_600_000,
+  unsupportedParams: { default: "warn", type: "enum", values: ["ignore", "warn", "error"] },
+  // Retained ACP sessions behind the Responses API. Each is resident context in
+  // the agent process, so both bounds matter: the cap limits live sessions and the
+  // TTL gives back those nobody returns to.
+  maxSessions: { default: 100, type: "positiveInt" },
+  sessionTtlMs: { default: 3_600_000, type: "positiveInt" },
   // When a conversation stops being a conversation at all.
   //
   // `sessionTtlMs` no longer ends anything: past it a conversation is PARKED --
@@ -116,11 +127,11 @@ const DEFAULTS = {
   //
   // Clamped up to `sessionTtlMs`: forgetting sooner than parking would mean the
   // park never happens.
-  forgetTtlMs: 86_400_000,
+  forgetTtlMs: { default: 86_400_000, type: "positiveInt" },
   // What a request for a conversation whose turn is STILL RUNNING should do.
   //
-  //   fork   the default. It gets a session of its own, because two turns cannot
-  //          interleave inside one agent.
+  //   fork   the default. A named busy conversation is refused with 409; a
+  //          headerless prefix caller may open a session of its own.
   //   queue  it is steered INTO the running turn, and the agent takes it at its
   //          next step.
   //
@@ -148,7 +159,7 @@ const DEFAULTS = {
   // a replacement ("do exactly X") is a replacement, and the rest of the plan may
   // well be abandoned. Say "as well as what you are doing" when that is what is
   // meant.
-  busy: "fork",
+  busy: { default: "fork", type: "enum", values: ["fork", "queue"] },
   // The header that marks a request as an INJECTION and nothing else: join a turn
   // already running, or do nothing at all.
   //
@@ -162,7 +173,7 @@ const DEFAULTS = {
   // Marked requests that find nothing answer 409, which is what makes guessing
   // safe: the caller can try the next model until one reports that it landed.
   // Empty disables the marker entirely.
-  injectHeader: "x-acp2api-inject",
+  injectHeader: { default: "x-acp2api-inject", type: "string" },
   // What to do with the `tools` a caller declares in its request.
   //
   //   mcp  the default. They are offered to the agent as an MCP server, and a
@@ -180,17 +191,17 @@ const DEFAULTS = {
   // result arrives in the next request, the agent picks up exactly where it was
   // rather than re-planning from a summary. That is what an agent waiting on a
   // tool is supposed to look like.
-  tools: "mcp",
+  tools: { default: "mcp", type: "enum", values: ["mcp", "off"] },
   // How long a tool call may sit unanswered before the agent is told it failed.
   //
   // The caller has gone, or decided not to run it. Something has to end, because
   // on the other side of that call is an agent process holding a subscription
   // open with nothing to do.
-  toolTimeoutMs: 300_000,
+  toolTimeoutMs: { default: 300_000, type: "positiveInt" },
   // Reuse the session that already heard the start of an incoming history and send
   // only what is new. The OpenAI API asks every client to be stateless, so without
   // this the agent restarts on every message and re-reads a growing transcript.
-  continuity: true,
+  continuity: { default: true, type: "boolean" },
   // The request header that names a conversation outright, when the caller can
   // send one. Continuity by prefix works only for callers that resend a growing
   // history; a caller that keeps the transcript on its own side and sends one
@@ -200,7 +211,7 @@ const DEFAULTS = {
   // prompt, a trimmed history, a compacted transcript.
   //
   // Empty string disables it. Prefix matching stays as the fallback either way.
-  conversationHeader: "x-conversation-id",
+  conversationHeader: { default: "x-conversation-id", type: "string" },
   // Whether the agent's own activity -- its tool calls and its plan -- is narrated
   // back to the caller, and where.
   //
@@ -212,7 +223,7 @@ const DEFAULTS = {
   // into the answer BECOMES the answer -- "running bash" would end up in what the
   // caller quotes, stores and replies to. `off` by default so a caller that has been
   // rendering reasoning as prose does not silently start showing tool traffic.
-  progress: "off",
+  progress: { default: "off", type: "enum", values: ["off", "reasoning"] },
   // How many trailing lines of a command's own output to show in the trace, when
   // `progress` is on. 0 shows the command but never what it printed.
   //
@@ -220,7 +231,7 @@ const DEFAULTS = {
   // build prints a thousand lines of progress and one line of verdict. Small on
   // purpose -- this lands in a chat post, and an unbounded `npm test` buries the
   // whole turn.
-  progressOutputLines: 6,
+  progressOutputLines: { default: 6, type: "nonNegativeInt" },
   // What to do with the sentences an agent writes BETWEEN its tool calls.
   //
   //   answer  the default. They are part of the assistant's message, exactly as
@@ -243,7 +254,7 @@ const DEFAULTS = {
   // be pulled back out of the answer. `answer` by default for that reason, and
   // because moving text out of the assistant's message is a change to what the
   // caller receives rather than a display preference.
-  commentary: "answer",
+  commentary: { default: "answer", type: "enum", values: ["answer", "trace"] },
   // How full a session's context window may get before it stops being reused, as a
   // fraction. 0 disables the check.
   //
@@ -256,18 +267,92 @@ const DEFAULTS = {
   //
   // Read from `usage_update`, which not every agent sends. An agent that stays
   // silent leaves the check inactive rather than being guessed at.
-  maxContextFill: 0.85,
+  maxContextFill: { default: 0.85, type: "fraction" },
+  limitPatterns: { default: () => [...DEFAULT_LIMIT_PATTERNS], type: "stringList" },
 };
+
+const CONFIG_SCHEMA = {
+  server: { default: () => ({}), type: "mapping" },
+  agents: { type: "nonEmptyList", required: true, error: () => "config needs a non-empty `agents` list" },
+};
+
+const AGENT_SCHEMA = {
+  name: { type: "nonEmptyString", required: true, error: (at) => `${at}.name is required` },
+  type: { default: "general", type: "enum", values: Object.keys(PRESETS) },
+  command: { type: "string" },
+  args: { type: "list" },
+  env: { default: () => ({}), type: "mapping" },
+  cwd: { type: "string" },
+  model: { type: "any" },
+  reasoning: { type: "any" },
+  mode: { type: "string" },
+  warmup: { type: "mappingOrNull" },
+  options: { default: () => ({}), type: "mapping" },
+  mcpServers: { default: () => [], type: "list" },
+  description: { default: "", type: "string" },
+  labels: { default: () => ({}), type: "mapping" },
+};
+
+const WARMUP_SCHEMA = {
+  prompt: { type: "nonEmptyString", required: true, error: (at) => `${at}.prompt is required` },
+  ttlMs: { default: 3_600_000, type: "positiveInt" },
+};
+
+const MCP_SERVER_SCHEMA = {
+  name: { type: "nonEmptyString", required: true, error: (at) => `${at}.name is required` },
+  type: { type: "enum", values: ["http", "sse", "stdio"] },
+  url: { type: "string" },
+  headers: { type: "mappingOrList" },
+  command: { type: "string" },
+  args: { type: "list" },
+  env: { type: "mappingOrList" },
+};
+
+// These schemas are also the source for typo suggestions. Free-form mappings
+// (`env`, `options`, `labels`, MCP headers/env) deliberately stop validation at
+// their boundary; every structured mapping recurses through this same guard.
+
+const isMapping = (value) => value && typeof value === "object" && !Array.isArray(value);
+
+function editDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
+}
+
+function rejectUnknownKeys(value, schema, at) {
+  const known = Object.keys(schema);
+  for (const key of Object.keys(value)) {
+    if (known.includes(key)) continue;
+    const closest = known.reduce((best, candidate) =>
+      editDistance(key, candidate) < editDistance(key, best) ? candidate : best);
+    throw new ConfigError(`${at}.${key} is not recognized; did you mean \`${closest}\`?`);
+  }
+}
 
 /** Expands `${VAR}` and `${VAR:-fallback}` against `env`, recursively, in-place. */
 export function expandEnv(value, env) {
   if (typeof value === "string") {
-    return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (all, name, fallback) => {
+    const literals = [];
+    const protectedValue = value.replace(/\$\$\{([^}]*)\}/g, (_all, body) => {
+      literals.push(`\${${body}}`);
+      return `\0acp2api-env-${literals.length - 1}\0`;
+    });
+    const expanded = protectedValue.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (all, name, fallback) => {
       const found = env[name];
-      if (found !== undefined && found !== "") return found;
+      if (found !== undefined && (found !== "" || fallback === undefined)) return found;
       if (fallback !== undefined) return fallback;
       throw new ConfigError(`config references ${all} but ${name} is not set`);
     });
+    return expanded.replace(/\0acp2api-env-(\d+)\0/g, (_all, index) => literals[Number(index)]);
   }
   if (Array.isArray(value)) return value.map((v) => expandEnv(v, env));
   if (value && typeof value === "object") {
@@ -280,9 +365,75 @@ export class ConfigError extends Error {}
 
 /** Numeric strings only -- anything else is passed through to fail validation. */
 const asInt = (v) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v);
+const asFloat = (v) => (typeof v === "string" && /^\d+(?:\.\d+)?$/.test(v) ? Number(v) : v);
+const asBoolean = (v) => {
+  if (v === "true" || v === "1") return true;
+  if (v === "false" || v === "0") return false;
+  return v;
+};
+const asMetricsAddress = (v) => {
+  if (v === "off" || typeof v !== "string") return v;
+  const match = /^(?:([^\s:[\]]+)|\[([^\s\]]+)\]):(\d+)$/.exec(v);
+  if (!match) return v;
+  return { host: match[1] ?? match[2], port: asInt(match[3]) };
+};
 
 function req(cond, message) {
   if (!cond) throw new ConfigError(message);
+}
+
+const FIELD_TYPES = {
+  any: { valid: () => true },
+  enum: { valid: () => true },
+  string: { valid: (v) => typeof v === "string", expected: "a string" },
+  nonEmptyString: { valid: (v) => typeof v === "string" && v.length > 0, expected: "a non-empty string" },
+  mapping: { valid: isMapping, expected: "a mapping" },
+  mappingOrNull: { valid: (v) => v === null || isMapping(v), expected: "a mapping" },
+  list: { valid: Array.isArray, expected: "a list" },
+  nonEmptyList: { valid: (v) => Array.isArray(v) && v.length > 0, expected: "a non-empty list" },
+  mappingOrList: { valid: (v) => isMapping(v) || Array.isArray(v), expected: "a mapping or list" },
+  stringList: { valid: (v) => Array.isArray(v) && v.every((item) => typeof item === "string"), expected: "a list of strings" },
+  boolean: { coerce: asBoolean, valid: (v) => typeof v === "boolean", expected: "true or false" },
+  cors: {
+    coerce: asBoolean,
+    valid: (v) => typeof v === "boolean" || (typeof v === "string" && v.length > 0),
+    expected: "false, true, or a non-empty origin string",
+  },
+  positiveInt: { coerce: asInt, valid: (v) => Number.isInteger(v) && v > 0, expected: "a positive integer" },
+  nonNegativeInt: { coerce: asInt, valid: (v) => Number.isInteger(v) && v >= 0, expected: "a non-negative integer" },
+  fraction: { coerce: asFloat, valid: (v) => typeof v === "number" && v >= 0 && v <= 1, expected: "a fraction between 0 and 1" },
+  port: { coerce: asInt, valid: (v) => Number.isInteger(v) && v > 0 && v < 65_536, expected: "a port number" },
+  metricsAddress: {
+    coerce: asMetricsAddress,
+    valid: (v) => v === "off" || (isMapping(v) && typeof v.host === "string"
+      && Number.isInteger(v.port) && v.port > 0 && v.port < 65_536),
+    expected: '"off", "host:port", or "[IPv6]:port" with a port from 1 to 65535',
+  },
+};
+
+function normalizeSection(value, schema, at) {
+  req(isMapping(value), `${at} must be a mapping`);
+  rejectUnknownKeys(value, schema, at);
+  const out = {};
+  for (const [key, rule] of Object.entries(schema)) {
+    let field = value[key];
+    if (field === undefined && Object.hasOwn(rule, "default")) {
+      field = typeof rule.default === "function" ? rule.default() : rule.default;
+    }
+    if (field === undefined) {
+      if (rule.required) throw new ConfigError(rule.error(at));
+      continue;
+    }
+    const rawField = field;
+    const type = FIELD_TYPES[rule.type];
+    field = type.coerce?.(field) ?? field;
+    req(type.valid(field) && (!rule.values || rule.values.includes(field)),
+      rule.error?.(at, field, rawField) ?? (rule.values
+        ? `${at}.${key} must be one of ${rule.values.join(", ")}, got ${field}`
+        : `${at}.${key} must be ${type.expected}, got ${field}`));
+    out[key] = field;
+  }
+  return out;
 }
 
 /**
@@ -291,81 +442,25 @@ function req(cond, message) {
  * portable between a checkout and a container without absolute paths in it.
  */
 export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.env } = {}) {
-  req(raw && typeof raw === "object", "config must be a mapping");
-  const input = expandEnv(raw, env);
-  const s = { ...DEFAULTS, ...(input.server ?? {}) };
-  // ${VAR} expansion always yields a string, so a port or timeout sourced from the
-  // environment arrives as "10021" and would fail an Number.isInteger check.
-  s.port = asInt(s.port);
-  s.requestTimeoutMs = asInt(s.requestTimeoutMs);
-  s.maxSessions = asInt(s.maxSessions);
-  s.sessionTtlMs = asInt(s.sessionTtlMs);
-  for (const k of ["fs", "continuity"]) {
-    if (typeof s[k] === "string") s[k] = s[k] !== "false" && s[k] !== "0";
-  }
-
-  req(Number.isInteger(s.port) && s.port > 0 && s.port < 65536, `server.port must be a port number, got ${s.port}`);
-  req(typeof s.host === "string" && s.host.length > 0, "server.host must be a non-empty string");
-  req(
-    typeof s.metricsAddr === "string" && (s.metricsAddr === "off" || /^\S+:\d+$/.test(s.metricsAddr)),
-    `server.metricsAddr must be "off" or "host:port", got ${s.metricsAddr}`,
-  );
-  req(["allow", "deny"].includes(s.permission), `server.permission must be "allow" or "deny", got ${s.permission}`);
-  req(
-    ["ignore", "warn", "error"].includes(s.unsupportedParams),
-    `server.unsupportedParams must be ignore, warn or error, got ${s.unsupportedParams}`,
-  );
-  req(Number.isInteger(s.requestTimeoutMs) && s.requestTimeoutMs > 0, "server.requestTimeoutMs must be a positive integer");
-  req(Number.isInteger(s.maxSessions) && s.maxSessions > 0, "server.maxSessions must be a positive integer");
-  req(typeof s.continuity === "boolean", "server.continuity must be true or false");
-  req(["off", "reasoning"].includes(s.progress), `server.progress must be "off" or "reasoning", got ${s.progress}`);
-  req(
-    ["answer", "trace"].includes(s.commentary),
-    `server.commentary must be "answer" or "trace", got ${s.commentary}`,
-  );
-  req(["fork", "queue"].includes(s.busy), `server.busy must be "fork" or "queue", got ${s.busy}`);
-  req(["mcp", "off"].includes(s.tools), `server.tools must be "mcp" or "off", got ${s.tools}`);
-  s.toolTimeoutMs = asInt(s.toolTimeoutMs);
-  req(
-    Number.isInteger(s.toolTimeoutMs) && s.toolTimeoutMs > 0,
-    "server.toolTimeoutMs must be a positive integer",
-  );
-  req(
-    Number.isInteger(s.progressOutputLines) && s.progressOutputLines >= 0,
-    "server.progressOutputLines must be a non-negative integer",
-  );
-  req(typeof s.terminal === "boolean", "server.terminal must be true or false");
-  req(Number.isInteger(s.maxTerminals) && s.maxTerminals > 0, "server.maxTerminals must be a positive integer");
-  req(
-    Number.isInteger(s.terminalOutputBytes) && s.terminalOutputBytes > 0,
-    "server.terminalOutputBytes must be a positive integer",
-  );
-  req(
-    Number.isInteger(s.terminalTimeoutMs) && s.terminalTimeoutMs >= 0,
-    "server.terminalTimeoutMs must be a non-negative integer",
-  );
-  req(
-    typeof s.maxContextFill === "number" && s.maxContextFill >= 0 && s.maxContextFill <= 1,
-    `server.maxContextFill must be a fraction between 0 and 1, got ${s.maxContextFill}`,
-  );
-  req(typeof s.conversationHeader === "string", "server.conversationHeader must be a string");
+  req(isMapping(raw), "config must be a mapping");
+  const input = normalizeSection(expandEnv(raw, env), CONFIG_SCHEMA, "config");
+  const s = normalizeSection(input.server, SERVER_SCHEMA, "server");
   // Header names are compared against Node's lower-cased `req.headers`.
   s.conversationHeader = s.conversationHeader.toLowerCase();
-  req(typeof s.injectHeader === "string", "server.injectHeader must be a string");
   s.injectHeader = s.injectHeader.toLowerCase();
-  req(Number.isInteger(s.sessionTtlMs) && s.sessionTtlMs > 0, "server.sessionTtlMs must be a positive integer");
-  req(Number.isInteger(s.forgetTtlMs) && s.forgetTtlMs > 0, "server.forgetTtlMs must be a positive integer");
-
-  const patterns = s.limitPatterns ?? DEFAULT_LIMIT_PATTERNS;
-  req(Array.isArray(patterns), "server.limitPatterns must be a list of regex strings");
 
   const server = {
     ...s,
     cwd: isAbsolute(s.cwd) ? s.cwd : resolve(baseDir, s.cwd),
-    limitPatterns: patterns.map((p) => new RegExp(p, "i")),
+    limitPatterns: s.limitPatterns.map((pattern) => {
+      try {
+        return new RegExp(pattern, "i");
+      } catch (error) {
+        throw new ConfigError(`server.limitPatterns contains invalid regex "${pattern}": ${error.message}`);
+      }
+    }),
   };
 
-  req(Array.isArray(input.agents) && input.agents.length > 0, "config needs a non-empty `agents` list");
   const seen = new Set();
   const agents = input.agents.map((a, i) => normalizeAgent(a, i, server, seen));
 
@@ -374,35 +469,24 @@ export function normalizeConfig(raw, { baseDir = process.cwd(), env = process.en
 
 function normalizeAgent(a, i, server, seen) {
   const at = `agents[${i}]`;
-  req(a && typeof a === "object", `${at} must be a mapping`);
-  req(typeof a.name === "string" && a.name.length > 0, `${at}.name is required`);
+  a = normalizeSection(a, AGENT_SCHEMA, at);
+  req(a.name, `${at}.name is required`);
   req(!seen.has(a.name), `${at}.name "${a.name}" is used more than once -- names are the OpenAI model ids and must be unique`);
   seen.add(a.name);
 
-  const type = a.type ?? "general";
-  req(type in PRESETS, `${at}.type must be one of ${Object.keys(PRESETS).join(", ")}, got ${type}`);
+  const type = a.type;
   // An explicit command wins over the preset and skips resolution entirely, so a
   // custom build of an adapter can be pointed at without touching this package.
   const spawnable = a.command ? null : PRESETS[type] && resolvePreset(PRESETS[type]);
   const command = a.command ?? spawnable?.command;
   req(command, `${at}.command is required for type "${type}"`);
 
-  req(a.args === undefined || Array.isArray(a.args), `${at}.args must be a list`);
-  req(a.env === undefined || (a.env && typeof a.env === "object"), `${at}.env must be a mapping`);
-  req(a.mcpServers === undefined || Array.isArray(a.mcpServers), `${at}.mcpServers must be a list`);
-  req(a.options === undefined || (a.options && typeof a.options === "object"), `${at}.options must be a mapping of configOption id to value`);
-  // Not validated against a list of names: the values are the AGENT's vocabulary,
-  // and an id we do not recognise today is one it may add tomorrow. A wrong one
-  // fails at session setup with the agent's own wording, which is more useful than
-  // a guess made here.
-  req(a.mode === undefined || typeof a.mode === "string", `${at}.mode must be a string`);
-
   return {
     name: a.name,
     type,
     command,
     args: a.args ?? spawnable?.args ?? [],
-    env: a.env ?? {},
+    env: a.env,
     // Resolved through the same rules as server.cwd so an agent can be pinned to
     // its own workspace (e.g. one repo per agent) without absolute paths.
     cwd: a.cwd ? (isAbsolute(a.cwd) ? a.cwd : resolve(server.cwd, a.cwd)) : server.cwd,
@@ -421,9 +505,9 @@ function normalizeAgent(a, i, server, seen) {
     // while a shared channel can pin it to `plan` and read what it proposes.
     mode: a.mode ?? null,
     warmup: normalizeWarmup(a.warmup, `${at}.warmup`),
-    options: a.options ?? {},
-    mcpServers: (a.mcpServers ?? []).map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
-    description: a.description ?? "",
+    options: a.options,
+    mcpServers: a.mcpServers.map((m, j) => normalizeMcpServer(m, `${at}.mcpServers[${j}]`)),
+    description: a.description,
     // Operator labels, attached to every metric this agent produces.
     //
     // The reason this is free-form rather than a set of named fields is `account`.
@@ -465,11 +549,9 @@ function normalizeLabels(labels, at) {
  */
 function normalizeWarmup(warmup, at) {
   if (warmup === undefined || warmup === null) return null;
-  req(warmup && typeof warmup === "object", `${at} must be a mapping`);
-  req(typeof warmup.prompt === "string" && warmup.prompt.trim().length > 0, `${at}.prompt is required`);
-  const ttlMs = warmup.ttlMs ?? 3_600_000;
-  req(Number.isInteger(ttlMs) && ttlMs > 0, `${at}.ttlMs must be a positive integer`);
-  return { prompt: warmup.prompt, ttlMs };
+  const out = normalizeSection(warmup, WARMUP_SCHEMA, at);
+  req(out.prompt?.trim(), `${at}.prompt is required`);
+  return out;
 }
 
 /**
@@ -484,8 +566,8 @@ function normalizeWarmup(warmup, at) {
  * there is nothing to pass per request. Tools are a property of the agent.
  */
 function normalizeMcpServer(m, at) {
-  req(m && typeof m === "object", `${at} must be a mapping`);
-  req(typeof m.name === "string" && m.name, `${at}.name is required`);
+  m = normalizeSection(m, MCP_SERVER_SCHEMA, at);
+  req(m.name, `${at}.name is required`);
   const pairs = (v, what) => {
     if (v === undefined) return [];
     if (Array.isArray(v)) return v;

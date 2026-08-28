@@ -9,10 +9,20 @@
  *
  * Pure translation, like openai.js: no I/O, no clock beyond what callers pass in.
  */
-import { RequestError, toPromptBlocks } from "./openai.js";
+import { RequestError, toPromptBlocks, toUsage } from "./openai.js";
 
 /** Parameters that arrive under different names here than in chat completions. */
-const NATIVE = new Set(["model", "input", "instructions", "previous_response_id", "store", "stream", "reasoning", "max_output_tokens"]);
+const NATIVE = new Set([
+  "model",
+  "input",
+  "instructions",
+  "previous_response_id",
+  "store",
+  "stream",
+  "reasoning",
+  "max_output_tokens",
+  "tools",
+]);
 
 const REFUSED = {
   text: "structured output is not implemented yet; it can only be emulated by prompting and validating",
@@ -170,15 +180,21 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
     store,
     incomplete_details: incomplete ? { reason: incomplete } : null,
     error: null,
-    usage: usage
-      ? {
-          input_tokens: usage.inputTokens ?? 0,
-          output_tokens: usage.outputTokens ?? 0,
-          total_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-          ...(usage.thoughtTokens != null ? { output_tokens_details: { reasoning_tokens: usage.thoughtTokens } } : {}),
-        }
-      : null,
+    usage: renameUsage(usage),
     ...(ignored?.length ? { x_acp2api: { ignored } } : {}),
+  };
+}
+
+/** Responses uses different field names; all arithmetic stays in `toUsage`. */
+function renameUsage(usage) {
+  const canonical = toUsage(usage);
+  if (!canonical) return null;
+  return {
+    input_tokens: canonical.prompt_tokens,
+    output_tokens: canonical.completion_tokens,
+    total_tokens: canonical.total_tokens,
+    ...(canonical.prompt_tokens_details ? { input_tokens_details: canonical.prompt_tokens_details } : {}),
+    ...(canonical.completion_tokens_details ? { output_tokens_details: canonical.completion_tokens_details } : {}),
   };
 }
 

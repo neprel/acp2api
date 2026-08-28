@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Agent, AgentError, selectValues } from "../src/agent.js";
@@ -18,7 +20,13 @@ function makeAgent(overrides = {}) {
     },
     { baseDir: here, env: {} },
   );
-  return new Agent(config.agents[0], config.server);
+  return new Agent(config.agents[0], config.server, overrides.log);
+}
+
+async function temporary(t) {
+  const dir = await mkdtemp(join(tmpdir(), "acp2api-agent-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 test("selectValues handles both flat and grouped option lists", () => {
@@ -86,10 +94,30 @@ test("an unavailable model is a 400, not a silent fallback", async (t) => {
   });
 });
 
+test("an unavailable selector value names every offered value", async (t) => {
+  const agent = makeAgent({ agent: { model: "opus" } });
+  t.after(() => agent.close());
+  await assert.rejects(
+    agent.prompt([{ type: "text", text: "hi" }]),
+    /"model" has no value "opus"; offered: fast, smart, lite/,
+  );
+});
+
 test("an unknown config option id is rejected", async (t) => {
   const agent = makeAgent({ agent: { options: { nonesuch: "x" } } });
   t.after(() => agent.close());
   await assert.rejects(agent.prompt([{ type: "text", text: "hi" }]), /offers no config option "nonesuch"/);
+});
+
+test("a configured model is rejected when the agent advertises no config options", async (t) => {
+  const agent = makeAgent({ agent: { model: "smart", env: { NO_CONFIG_OPTIONS: "1" } } });
+  t.after(() => agent.close());
+  await assert.rejects(agent.prompt([{ type: "text", text: "hi" }]), (error) => {
+    assert.equal(error.status, 400);
+    assert.equal(error.code, "unsupported_option");
+    assert.match(error.message, /offers no model selector/);
+    return true;
+  });
 });
 
 test("the option set is re-read after each set, because picking a model changes it", async (t) => {
@@ -157,6 +185,48 @@ test("aborting the request cancels the turn in the agent", async (t) => {
   assert.equal((await pending).stopReason, "cancelled");
 });
 
+test("a child that ignores cancel is bounded and its session is dead", async (t) => {
+  const agent = makeAgent({ server: { agentRpcTimeoutMs: 500 } });
+  t.after(() => agent.close());
+  const session = await agent.openSession();
+  const started = Date.now();
+  const turn = await agent.turn(session, [{ type: "text", text: "IGNORE_CANCEL" }], {
+    limit: makeLimiter({ maxTokens: 1, stop: [] }),
+  });
+
+  assert.equal(turn.stopReason, "max_tokens");
+  assert.ok(Date.now() - started < 1_500, "the post-cancel drain must use its grace deadline");
+  await assert.rejects(
+    agent.turn(session, [{ type: "text", text: "must not run" }]),
+    (error) => error.status === 502 && /no longer usable/.test(error.message),
+  );
+});
+
+test("a hung session/close is bounded and swallowed", async (t) => {
+  const agent = makeAgent({ server: { agentRpcTimeoutMs: 500 } });
+  t.after(() => agent.close());
+  const started = Date.now();
+  const turn = await agent.prompt([{ type: "text", text: "HANG_CLOSE" }]);
+
+  assert.equal(turn.text, "[fast] HANG_CLOSE");
+  assert.ok(Date.now() - started < 1_500, "best-effort session close must not block the caller");
+});
+
+test("shutdown escalates past trapped SIGTERM and leaves no child", async (t) => {
+  const dir = await temporary(t);
+  const pidFile = join(dir, "pid");
+  const agent = makeAgent({ agent: { env: { PID_FILE: pidFile, TRAP_SIGTERM: "1" } } });
+  const session = await agent.openSession();
+  assert.equal(session.id, "s1");
+  const pid = Number(await readFile(pidFile, "utf8"));
+  const started = Date.now();
+
+  await agent.close();
+
+  assert.ok(Date.now() - started < 2_000, "shutdown must escalate within the SIGKILL grace");
+  assert.throws(() => process.kill(pid, 0), (error) => error.code === "ESRCH");
+});
+
 test("the child process is reused across turns and shut down on close", async () => {
   const agent = makeAgent();
   const first = await agent.prompt([{ type: "text", text: "one" }]);
@@ -171,6 +241,14 @@ test("the child process is reused across turns and shut down on close", async ()
     assert.match(e.message, /shut down/);
     return true;
   });
+});
+
+test("garbage stdout interleaved with ACP frames does not break a turn", async (t) => {
+  const agent = makeAgent({ agent: { env: { GARBAGE_STDOUT: "1" } } });
+  t.after(() => agent.close());
+  const turn = await agent.prompt([{ type: "text", text: "hello" }]);
+  assert.equal(turn.text, "[fast] hello");
+  assert.equal(turn.stopReason, "end_turn");
 });
 
 test("mcpServers from config reach session/new in ACP's own shape", async (t) => {
@@ -191,6 +269,49 @@ test("mcpServers from config reach session/new in ACP's own shape", async (t) =>
     { type: "http", name: "http-one", url: "http://127.0.0.1:9/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
     { name: "stdio-one", command: "/bin/true", args: [], env: [{ name: "K", value: "v" }] },
   ]);
+});
+
+test("a warm fork carries the same configured MCP declaration as a cold session", async (t) => {
+  const mcpServers = [
+    { name: "http-one", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } },
+    { name: "stdio-one", command: "/bin/true", env: { K: "v" } },
+  ];
+  const cold = makeAgent({ agent: { mcpServers } });
+  const warm = makeAgent({ agent: { mcpServers, warmup: { prompt: "read the repository" } } });
+  t.after(() => Promise.all([cold.close(), warm.close()]));
+
+  const coldMcp = JSON.parse((await cold.prompt([{ type: "text", text: "ECHOMCP" }])).text);
+  const forkMcp = JSON.parse((await warm.prompt([{ type: "text", text: "ECHOMCP" }])).text);
+  assert.deepEqual(forkMcp, coldMcp);
+  assert.equal(forkMcp.length, 2);
+});
+
+test("the first conversation after a child crash rebuilds and forks a warm base", async (t) => {
+  const dir = await temporary(t);
+  const pidFile = join(dir, "pid");
+  const captureFile = join(dir, "warm-capture");
+  let childExited;
+  const exited = new Promise((resolve) => { childExited = resolve; });
+  const agent = makeAgent({
+    agent: {
+      env: { PID_FILE: pidFile, WARM_CAPTURE_FILE: captureFile },
+      warmup: { prompt: "WARMCOUNT read the repository" },
+    },
+    log: (_level, line) => {
+      if (/agent exited/.test(line)) childExited();
+    },
+  });
+  t.after(() => agent.close());
+
+  assert.equal((await agent.prompt([{ type: "text", text: "ECHOSESSION" }])).text, "s2");
+  const firstPid = Number(await readFile(pidFile, "utf8"));
+  process.kill(firstPid, "SIGKILL");
+  await exited;
+
+  assert.equal((await agent.prompt([{ type: "text", text: "ECHOSESSION" }])).text, "s2");
+  const secondPid = Number(await readFile(pidFile, "utf8"));
+  assert.notEqual(secondPid, firstPid);
+  assert.deepEqual((await readFile(captureFile, "utf8")).trim().split("\n"), ["warm", "fork", "warm", "fork"]);
 });
 
 test("max_tokens cuts the turn short and reports it", async (t) => {

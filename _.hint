@@ -28,7 +28,7 @@ whatever `claude`/`codex` happens to be on PATH. `claude-agent-acp` bundles
 `@anthropic-ai/claude-agent-sdk` and reads the login in `~/.claude` — that directory
 must exist (and be mounted, in a container) for it to work at all.
 
-Do not add an HTTP framework. `node:http` covers the three routes, and every
+Do not add an HTTP framework. `node:http` covers the HTTP surface, and every
 dependency here is one more thing that can break an unattended server.
 
 # bad Never spawn a preset by its bare bin name {#global_install}
@@ -44,12 +44,13 @@ back to the bare name when the adapter is absent, because it is optional.
 
 # build make
 
-`make test` (offline, no subscription spent), `make check` (validates the shipped example
-config), `make verify` (`npm ci` + test + check + pack — the pre-publish gate).
+`make test` (offline, no subscription spent), `make check` (validates the shipped
+example config), `make spec` (verifies companion HINT contracts), `make verify`
+(`npm ci` + test + check + spec + pack — the pre-publish gate).
 
-The npm account has 2FA, so publishing needs a one-time password that expires in
-seconds: `make publish OTP=123456`. There is no way to script that away, and the
-target refuses rather than pretending.
+Local publishing requires the operator's `.npmrc` and interactive web approval;
+`OTP=123456` remains available for an account using TOTP. The release workflow uses
+npm trusted publishing through OIDC instead of a stored registry token.
 
 `verify` uses `npm ci`, not `npm install`: a suite that passes only against a drifted
 tree proves nothing about what a consumer installs.
@@ -74,9 +75,12 @@ differ enough to need different handling:
   back. **400, always**, even under `unsupportedParams: ignore` — "succeed at the
   wrong thing" is not a mode.
 
-`tools` was in the second group until 1.2.0 and deliberately moved to the first; the
-reasoning is recorded in [src/params.js.hint#tools_ignored](src/params.js.hint) and
-is not a lapse.
+`tools` is handled separately from both groups. The default `server.tools: mcp`
+serves caller functions through a per-conversation MCP bench and can return
+`tool_calls`; `server.tools: off` drops and reports them as ignored. `tool_choice`
+remains ignored because ACP cannot force the agent's selection. The classifier /
+serving boundary is recorded in
+[src/params.js.hint#tools_ignored](src/params.js.hint).
 
 Unknown fields count as style: OpenAI adds parameters faster than any bridge tracks
 them, and failing on an unrecognised name would age badly.
@@ -95,14 +99,19 @@ Cancelling an ACP turn is not instant — the agent keeps sending for a moment. 
 first version appended those chunks before re-checking `cut`, so a truncated answer
 quietly grew back to full length. Once cut, skip every update until the stop message.
 
-# rule Tools belong to the agent, not the request {#mcp_tools}
+# rule MCP carries two distinct tool surfaces {#mcp_tools}
 
-The agent runs its own tool loop and calls back into the client; it never returns
-tool calls for someone else to execute. So tools arrive as `mcpServers` on
-`session/new` and are fixed for the session's life. There is no per-request path,
-which is why OpenAI's `tools` cannot be honoured and is dropped — the caller's own
-tool servers reach the agent through `mcpServers` instead, so it acts rather than
-asks. See [src/params.js.hint#tools_ignored](src/params.js.hint).
+An agent's configured `mcpServers` are fixed, agent-owned capabilities declared on
+every session creation path. The agent uses them inside its own loop and never
+returns those calls for the OpenAI caller to execute.
+
+OpenAI request `tools` are caller-owned and per conversation. With
+`server.tools: mcp`, acp2api becomes their MCP server, adds that server when the
+session opens, and parks the ACP turn while returning `tool_calls` to the caller;
+the next request's tool results resume the same turn. These surfaces both use
+`mcpServers` on the ACP wire but must never be described as interchangeable. See
+[src/mcp.js.hint](src/mcp.js.hint) and
+[src/params.js.hint#tools_ignored](src/params.js.hint).
 
 ACP wants `env` and `headers` as `[{name, value}]` arrays; the config accepts a
 mapping and converts. The stdio variant has **no `type` discriminator** and requires
@@ -128,7 +137,9 @@ hatch that addresses a raw id.
 
 Verified on 2026-08-09 against `claude-agent-acp` 0.66.0 and `codex-acp` 1.1.14 by
 running `initialize` + `session/new` and printing the response. Do that again rather
-than trusting this table: the model lists move every few weeks.
+than trusting this table: the model lists move every few weeks. The sanctioned
+re-probe is `acp2api --config <file> --probe <agent-name>`; it uses the production
+ACP setup path and sends no prompt.
 
 The wider survey in [#agent_survey](#agent_survey) shows how far this table travels:
 the category names are consistent across vendors, but WHICH categories an agent
@@ -156,12 +167,10 @@ be described as one rather than as a general capability.
 http server given to a stdio-only agent is a failure that could be caught at config
 time and is currently discovered at session time.
 
-**Authentication failures reach the caller as 500, and they are not server faults.**
+**Authentication failures are unstructured agent errors, but not server faults.**
 An agent that refuses `session/new` until its account is signed in is in a permanent
-state, not a transient one: a router reading 500 keeps that model in its failover
-chain and keeps paying the timeout. [#limit_detection](#limit_detection) already
-argues that status codes are the contract; this is the same argument for `-32000`
-auth errors, which want 401 or 403.
+state, not a transient one. The bridge recognizes the ACP `-32000` authentication
+shape and maps it to 401 so a router does not keep retrying a broken login.
 
 **Two shapes of "not configured" look alike and are not.** `Failed to resolve
 provider: GOOSE_PROVIDER` is one config file away from working; `Authentication
@@ -217,17 +226,15 @@ and kept.
 The session was originally per REQUEST, because an OpenAI chat completion is
 stateless and carries its whole history in `messages` — reusing one would replay
 that history on top of the agent's own. `continuity` (1.2.0) and the caller-supplied
-key (1.4.0) changed that: a session now spans a conversation, and is held live in
-[src/sessions.js.hint](src/sessions.js.hint) for as long as its TTL allows.
-
-**Holding it live is a choice, and not the only one** — see
-[#unused_surface](#unused_surface). A stored session id plus `session/resume` keeps
-a conversation continuous across a restart and costs no resident process.
+key (1.4.0) changed that: a session now spans a conversation. It stays resident
+until its TTL or the resident cap parks it, then its id is retained and
+`session/resume` revives it without replay. See
+[src/sessions.js.hint#parking](src/sessions.js.hint).
 
 `close()` is terminal. Without that, a request arriving during shutdown respawns a
 CLI that nothing is left to reap, and the process never exits.
 
-# rule The protocol surface this bridge does not use {#unused_surface}
+# rule The protocol surface this bridge uses and leaves unused {#unused_surface}
 
 Taken on 2026-08-11 by loading the SDK and both adapters and printing what they
 advertise. Recorded because reading the docs understates it and reading this
@@ -238,7 +245,10 @@ source overstates how much of ACP is in play.
 (`codex-acp` minus `fork`). `session/load` replays the whole transcript back as
 `session/update` notifications; `session/resume` restores the session and its MCP
 connections and replays nothing — **`resume` is the one a rendering bridge wants**,
-or every reconnect re-emits the history as fresh output.
+or every reconnect re-emits the history as fresh output. The bridge now uses
+`resume` for parked conversations, `fork` for supported warm bases, and `close` for
+cleanup. It still leaves `load`, `list`, `delete`, and additional directories
+unused.
 
 `claude-agent-acp` fingerprints `cwd` + `mcpServers` and compares on load/resume,
 so a stored id is only valid while an agent's config is unchanged. Any persistence
@@ -256,15 +266,15 @@ Hence `Agent#sinks`: one `session/update` handler on the client app, fanning out
 [src/agent.js.hint#own_routing](src/agent.js.hint). Do not "simplify" this back to
 `builder.start()`; it would take resume with it.
 
-**`session/update` has thirteen kinds; this bridge reads five.** Read:
+**`session/update` has thirteen kinds; this bridge reads seven names.** Read:
 `agent_message_chunk`, `agent_thought_chunk`, `tool_call` / `tool_call_update` and
 `plan` / `plan_update` — the last four rendered as progress notes by
 [src/progress.js.hint](src/progress.js.hint) when `server.progress` is on, and
-still never allowed into the answer.
+still never allowed into the answer — plus `usage_update`, which feeds per-turn
+usage, cost, context-fill metrics, and session retirement.
 
-Unread: `plan_removed`, `usage_update` (context fill and cost DURING the turn — the
-signal a retirement rule wants), `session_info_update` (the title the agent writes
-itself), `available_commands_update`, `current_mode_update`, `config_option_update`,
+Unread: `plan_removed`, `session_info_update` (the title the agent writes itself),
+`available_commands_update`, `current_mode_update`, `config_option_update`, and
 `user_message_chunk` (echo of what the agent actually heard, behind
 `--replay-user-messages`).
 
@@ -279,12 +289,11 @@ in_progress | completed | failed`, and `content[]` entries are `content`,
 `diff { path, oldText, newText }` or `terminal { terminalId }`. Anything rendering
 progress should read those rather than parse tool names.
 
-**`terminal/*` is a client capability this bridge does not advertise.** It declares
-`fs` only. Advertising `terminal: true` moves command execution into the bridge:
-live output, and `terminal/kill` stops one command instead of the turn. It also
-moves sandboxing, timeouts and process reaping here — the `server.cwd` containment
-that guards the `fs` handlers has no equivalent for exec and would have to be
-written.
+**`terminal/*` is opt-in.** With `server.terminal: true` the bridge advertises it
+and owns command execution: live output, per-command kill, cwd containment,
+timeouts, output bounds, and process-group reaping. It defaults off because this
+transfers sandboxing and cleanup responsibility from the agent to the bridge. See
+[src/terminal.js.hint#ownership](src/terminal.js.hint).
 
 `elicitation/create` (a typed agent-initiated question, the one pause that can
 carry free text), `session/set_mode`, and `_meta` on nearly every message are all
@@ -307,8 +316,10 @@ it was written to call; this covers the wire format, the `session/set_config_opt
 round trip, streaming, cancellation and the 429/502 split — offline, and without
 spending a subscription.
 
-Its prompt text selects the failure to exercise (`QUOTA`, `BOOM`, `HANG`, `REFUSE`).
-Add behaviour there rather than reaching for a mocking library.
+Its prompt text selects the failure to exercise; the binding keyword and
+pre-session environment tables live in
+[test/fixtures/fake-agent.js.hint](test/fixtures/fake-agent.js.hint). Add behaviour
+there rather than reaching for a mocking library.
 
 # bad Never publish a version in order to test it {#verify_before_publish}
 
@@ -345,7 +356,7 @@ Verified 2026-08-09 on the Mac, against the real logged-in Claude subscription:
   thinking separated into `reasoning_content` and usage populated.
 - The same request with `stream: true` on `claude-sonnet-high` produced well-formed
   SSE deltas ending in `finish_reason: "stop"` and `[DONE]`.
-- 48 tests pass offline against the fixture.
+- The offline suite passes against the fixture.
 
 The live run is what caught [#option_reapply](#option_reapply); the suite did not,
 because the fixture had a stable option set until that finding was folded back in.

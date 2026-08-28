@@ -25,7 +25,9 @@ session alive across requests; see
 [responses.js.hint#no_replay](./responses.js.hint).
 
 ## result
-`{id, active, options, agent}`. `options` is tracked on the session rather than
+`{id, options, agent}` plus internal metadata: `mcp` records caller-added servers
+on cold/resumed paths, while `running`, `closed`, and `dead` describe lifecycle.
+`options` is tracked on the session rather than
 re-read from `session/new`, whose snapshot goes stale the moment an option is set —
 a later turn reconfigures against the live set.
 
@@ -40,8 +42,9 @@ many, so a leaked listener cancels somebody else's turn.
 
 # func prompt {#prompt}
 
-One prompt turn on a fresh session: `openSession` + `turn` + `closeSession`. The
-stateless path, and what chat completions uses.
+One prompt turn on a fresh session: `openSession` + `turn` + `closeSession`. It is
+the stateless convenience path used by the agent-level tests; HTTP surfaces own
+their conversation lifecycle through `openSession` and `turn` directly.
 
 ## arg blocks
 ACP `ContentBlock[]`, already translated.
@@ -74,6 +77,31 @@ The only error type leaving this module. Always carries `status` and `code`:
 4. Prompt; consume updates, consulting `limit` after each text chunk.
 5. On cut: cancel, then drain to the stop message without accumulating.
 6. Always: remove the abort listener, dispose, and `session/close` when supported.
+
+With no limiter, an `agent_message_chunk` is already exactly the unheard text
+delta: append it to the turn accumulator and emit that same chunk. Do not recover
+the delta by slicing the growing accumulator on every update, and do not also copy
+ordinary text into the commentary-only accumulator. Either turns a long stream
+into quadratic allocation before HTTP backpressure is even considered. A limiter
+still needs the accumulated text because its decision spans chunk boundaries.
+
+# invariant Streaming never outruns stop-sequence detection
+
+`limit.visibleText` may hold a suffix that is a prefix of a configured stop
+sequence. `turn` emits only the safe prefix, carries the hold across ACP chunks,
+and flushes it when an uncut turn ends. This belongs at the single `onEvent` source,
+not separately in chat, Responses, and their tool-resume paths.
+
+# func probe {#probe}
+
+Opens one unconfigured cold session through the same memoized connection,
+`#bounded` deadlines and session builder as an ordinary request. Returns the live
+config option ids/categories/types/named values and the initialize response's
+steering, session and MCP capability highlights, then closes the session.
+
+It must never apply configured options, fork/warm a base, or call
+`session/prompt`. A probe diagnoses the agent vocabulary without changing it or
+spending a subscription turn.
 
 # invariant tool_call updates are progress, never content {#tool_calls_are_progress}
 
@@ -248,6 +276,10 @@ Four things hold this together, and each of them is load-bearing:
 - **Options are re-applied to the fork.** The protocol does not promise a fork
   carries the parent's selections, and two cheap local RPCs beat a thread silently
   running on the wrong model.
+- **Caller-tool benches do not combine with warmup today.** `openSession` sees an
+  extra MCP server and deliberately opens cold: one shared base cannot carry one
+  caller's tools. Warm forks therefore carry the agent's configured MCP declaration
+  only; benched sessions use `#newSession` with configured plus caller servers.
 
 **It costs a real turn of a real subscription**, once per `ttlMs`, plus one
 resident session for as long as the agent lives. It is worth having when
@@ -257,11 +289,45 @@ default.
 `ttlMs` is a bet the operator makes. A base that read the repository is stale the
 moment the repository moves, and nothing here can know when that happened.
 
+# invariant Fork is another session-creation path {#fork_declaration}
+
+A fork carries the same per-session declaration shape as `#newSession`: cwd, the
+full configured MCP list through `#mcpFor`, and configured options. Any new state
+added to session creation must be considered and, when applicable, added to fork
+in the same change. Building a fork request from a fresh default builder silently
+diverges because its defaults look valid on the wire.
+
 # invariant A dead child never takes the server down {#respawn}
 
 The `exit` handler drops the memoized connection so the next request respawns rather
 than writing into a dead pipe. `close()` is terminal in the other direction: after
 it, `prompt` throws 503 instead of spawning a CLI nothing is left to reap.
+
+# invariant Every request to the child uses the single deadline wrapper {#rpc_deadline}
+
+Every `connection.agent.request(...)` / `ctx.request(...)` is passed through
+`#bounded`. An await against the child added without that wrapper is a bug: the
+child can remain alive while never answering, so stream-close rejection cannot
+bound it. Do not add a second `Promise.race` or a site-specific timer.
+
+The mapping is part of the caller contract:
+
+| request | deadline outcome |
+| --- | --- |
+| `initialize` | kill the child, clear the connection memo, 503; the next request may respawn |
+| `session/new`, `session/set_config_option`, `session/fork`, `session/resume`, steering | 502; the child is alive but its RPC is broken |
+| `session/close` | `min(agentRpcTimeoutMs, 1000)` grace, log and swallow; cleanup and pruning must continue |
+| `session/prompt` after cancellation | `min(agentRpcTimeoutMs, 5000)` grace, then mark the session dead so it is closed and never reused |
+
+The post-cancel deadline extends [_.hint#cut_drain](../_.hint), rather than replacing
+it. The limiter's cut stops accumulation immediately and sends `session/cancel`;
+only then does `#bounded` arm the drain grace while awaiting the original prompt
+response. Drain gets longer than cleanup because losing a retained session destroys
+its conversation context, while waiting costs time only on an already-cut request.
+If grace expires after a limiter cut, the turn still settles with the limiter's
+verdict and null usage, but its session is dead. If the HTTP request timer
+caused cancellation, the HTTP lifecycle still owns the public 504; the child RPC
+deadline only guarantees its drain cannot leave the conversation busy forever.
 
 # bad Never widen the 429 net to catch an unfamiliar error
 
@@ -283,7 +349,8 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 - a turn streams reasoning, tool calls and text in order, and reports usage
 - model and reasoning are selected by category, not by option id
 - raw `options` address an id directly, including booleans
-- an unavailable model value, and an unknown option id, are 400 — never a fallback
+- an unavailable model value names every offered value; an unknown option id and a
+  configured selection against no options are 400 — never a fallback
 - selecting a model that removes the reasoning selector reports *that*, not a stale id
 - a model with no reasoning selector works when none is requested
 - quota phrasing is 429; an unrelated failure is 502; `limitPatterns` are configurable
@@ -292,3 +359,4 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 - `mcpServers` reach `session/new` in ACP's array shape
 - the child is reused across turns; after `close()` a further prompt is 503
 - an unspawnable command is 503, not a crash
+- a probe reports live options/capabilities and sends neither configuration nor a prompt

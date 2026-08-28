@@ -63,6 +63,7 @@ jobs:
           echo "releasing $version"
 
       - run: npm test
+      - run: make check
 
       # Two ways to be allowed to publish, and the job takes whichever is set up.
       #

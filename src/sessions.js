@@ -11,9 +11,8 @@
  * shares one ACP session, and every response id in the chain resolves to it. That is
  * why `previous_response_id` may point anywhere in the chain, not just at its tip.
  *
- * Every retained session is a live child process holding an authenticated login, so
- * nothing here may leak: eviction and expiry both close the ACP session, and so does
- * shutdown.
+ * Every retained session is resident context in an agent process, so nothing here
+ * may leak: parking and forgetting both close the ACP session, and so does shutdown.
  */
 
 import { createHash } from "node:crypto";
@@ -27,8 +26,14 @@ import { createHash } from "node:crypto";
  */
 const digest = (parts) => createHash("sha256").update(JSON.stringify(parts)).digest("base64url").slice(0, 22);
 
-export const fingerprint = (m) =>
-  digest([m?.role ?? null, m?.content ?? null, m?.tool_calls ?? null, m?.tool_call_id ?? null, m?.name ?? null]);
+export const fingerprint = (m) => {
+  // `index` exists only on streamed tool-call deltas so SDKs can accumulate them;
+  // it does not change which call was made. A client may resend either its final
+  // accumulated message or the deltas it assembled itself, and both are the same
+  // conversation prefix.
+  const toolCalls = m?.tool_calls?.map(({ index: _index, ...call }) => call) ?? null;
+  return digest([m?.role ?? null, m?.content ?? null, toolCalls, m?.tool_call_id ?? null, m?.name ?? null]);
+};
 
 /**
  * Splits messages into the standing preamble and the conversation.
@@ -121,6 +126,24 @@ export class SessionStore {
     return this.maxContextFill > 0 && conv.fill != null && conv.fill >= this.maxContextFill;
   }
 
+  #releaseSettledPending(convId, pending) {
+    const conv = this.#conversations.get(convId);
+    if (!conv || conv.pending !== pending || !pending.settled || pending.attached) return;
+    conv.pending = null;
+    conv.busy = false;
+    conv.lastUsed = this.now();
+    this.log("info", `session ${convId} (${conv.agentName}) released: suspended turn settled unattended`);
+  }
+
+  #reportLive(agentName) {
+    if (!this.metrics) return;
+    let live = 0;
+    for (const conv of this.#conversations.values()) {
+      if (conv.agentName === agentName && conv.session) live += 1;
+    }
+    this.metrics.sessions(agentName, live);
+  }
+
   get size() {
     return this.#conversations.size;
   }
@@ -157,11 +180,11 @@ export class SessionStore {
       // request carrying results picks the same turn up rather than starting one.
       pending: null,
     });
-    // Last writer wins. A caller reusing a key whose session is busy gets a new
-    // one (see matchKey), and the key must then follow the session the caller is
-    // actually talking to -- otherwise every later turn would keep finding the
-    // abandoned one.
+    // A key is installed only for a new conversation. Once installed, a request
+    // that finds it busy is refused or steered; it never opens another conversation
+    // and rebinds the key away from the turn that already owns that identity.
     if (key) this.#keys.set(`${agentName} ${key}`, convId);
+    this.#reportLive(agentName);
     return convId;
   }
 
@@ -181,19 +204,27 @@ export class SessionStore {
    * preamble mid-conversation means it.
    */
   matchKey(agentName, key, { whenBusy = "fork" } = {}) {
+    return this.#matchKey(agentName, key, whenBusy, true);
+  }
+
+  /** Reads a named conversation without claiming it. Used by inject-only probes. */
+  peekKey(agentName, key, { whenBusy = "fork" } = {}) {
+    return this.#matchKey(agentName, key, whenBusy, false);
+  }
+
+  #matchKey(agentName, key, whenBusy, claim) {
     const convId = this.#keys.get(`${agentName} ${key}`);
     if (!convId) return null;
     const conv = this.#conversations.get(convId);
     // Stale key: the conversation it named has expired, been evicted or closed.
     if (!conv) {
-      this.#keys.delete(`${agentName} ${key}`);
+      if (claim) this.#keys.delete(`${agentName} ${key}`);
       return null;
     }
     // Mid-turn, and there are two defensible answers.
     //
-    // `fork` -- two turns cannot interleave inside one agent, so this request gets
-    // a session of its own. The same answer prefix matching gives, and the same
-    // tradeoff: the caller sent a second turn before the first replied.
+    // `fork` -- despite the historical name, a named conversation now reports 409:
+    // silently forking loses the direct identity the caller asserted with its key.
     //
     // `queue` -- the caller named a conversation that is mid-turn, and on a coding
     // agent that is rarely a race. It is someone adding to work already under way,
@@ -205,18 +236,28 @@ export class SessionStore {
       // carries the answer must reach it -- whatever `busy` is set to, since it is
       // a continuation of that turn rather than a second one.
       if (conv.pending) {
-        conv.lastUsed = this.now();
+        if (claim) conv.lastUsed = this.now();
         return { convId, session: conv.session, sessionId: conv.sessionId, bench: conv.bench, pending: conv.pending, prefix: conv.prefix, matched: conv.prefix.length };
       }
-      if (whenBusy !== "queue" || !conv.session) return null;
-      conv.lastUsed = this.now();
-      return { convId, session: conv.session, sessionId: conv.sessionId, busy: true, matched: conv.prefix.length, prefix: conv.prefix };
+      if (claim) conv.lastUsed = this.now();
+      return {
+        convId,
+        session: conv.session,
+        sessionId: conv.sessionId,
+        busy: true,
+        queue: whenBusy === "queue" && Boolean(conv.session),
+        matched: conv.prefix.length,
+        prefix: conv.prefix,
+      };
     }
     // Out of room. The key still names this conversation, and the next `prune`
     // will close it; what the caller gets is a fresh session under the same key,
     // which is the only thing a full context can be answered with.
     if (this.#full(conv)) return null;
-    conv.lastUsed = this.now();
+    if (claim) {
+      conv.busy = true;
+      conv.lastUsed = this.now();
+    }
     // `session` is null when the conversation is parked. The caller revives it from
     // `sessionId` before using it -- see `revive`.
     return {
@@ -251,6 +292,18 @@ export class SessionStore {
     if (!conv) return;
     conv.pending = pending;
     conv.lastUsed = this.now();
+    if (!pending) return;
+    if (!pending.releaseWatched) {
+      pending.releaseWatched = true;
+      const settled = () => {
+        pending.settled = true;
+        this.#releaseSettledPending(convId, pending);
+      };
+      pending.turn.then(settled, settled);
+    }
+    // Covers the race where the turn settled while a request was attached, then
+    // that request disconnected and put the same pending object back.
+    this.#releaseSettledPending(convId, pending);
   }
 
   /**
@@ -267,11 +320,22 @@ export class SessionStore {
    * and gets a fresh session, which is the correct answer rather than a fallback.
    */
   matchPrefix(agentName, systemId, prefix) {
+    return this.#matchPrefix(agentName, systemId, prefix, true);
+  }
+
+  /** Reads a prefix match without claiming it. Used by inject-only probes. */
+  peekPrefix(agentName, systemId, prefix) {
+    return this.#matchPrefix(agentName, systemId, prefix, false);
+  }
+
+  #matchPrefix(agentName, systemId, prefix, claim) {
     let best = null;
     for (const [convId, conv] of this.#conversations) {
       // A session serves one turn at a time; handing a second turn to a busy one
-      // would interleave two conversations inside the agent.
-      if (conv.busy || conv.agentName !== agentName || conv.systemId !== systemId) continue;
+      // would interleave two conversations inside the agent. A PENDING turn is
+      // different: the matching history is how a headerless caller finds the
+      // exact turn whose tool result it is carrying.
+      if ((conv.busy && !conv.pending) || conv.agentName !== agentName || conv.systemId !== systemId) continue;
       if (this.#full(conv)) continue;
       // The standing preamble is part of identity: a changed system prompt is a
       // different brief, and continuing under the old one would be a lie.
@@ -280,12 +344,19 @@ export class SessionStore {
       if (!best || conv.prefix.length > best.matched) best = { convId, conv, matched: conv.prefix.length };
     }
     if (!best) return null;
-    best.conv.lastUsed = this.now();
+    if (claim) {
+      if (!best.conv.pending) best.conv.busy = true;
+      best.conv.lastUsed = this.now();
+    }
     return {
       convId: best.convId,
       session: best.conv.session,
       sessionId: best.conv.sessionId,
+      bench: best.conv.bench,
       matched: best.matched,
+      ...(best.conv.pending
+        ? { pending: best.conv.pending, prefix: best.conv.prefix }
+        : {}),
     };
   }
 
@@ -353,6 +424,15 @@ export class SessionStore {
   }
 
   /** Marks a conversation as serving a turn, so no other request joins it. */
+  claim(convId) {
+    const conv = this.#conversations.get(convId);
+    if (!conv || conv.busy) return false;
+    conv.busy = true;
+    conv.lastUsed = this.now();
+    return true;
+  }
+
+  /** Releases or restores busy state after ownership has already been decided. */
   setBusy(convId, busy) {
     const conv = this.#conversations.get(convId);
     if (conv) conv.busy = busy;
@@ -366,6 +446,20 @@ export class SessionStore {
     if (!conv) return null;
     conv.lastUsed = this.now();
     return { convId: entry.convId, ...conv };
+  }
+
+  /** Resolves and synchronously claims a response's free conversation. */
+  claimResponse(responseId) {
+    const entry = this.#responses.get(responseId);
+    if (!entry) return null;
+    const conv = this.#conversations.get(entry.convId);
+    if (!conv) return null;
+    conv.lastUsed = this.now();
+    if (conv.busy) return { convId: entry.convId, ...conv, busy: true };
+    conv.busy = true;
+    // Report the state that was claimed, not the store's new internal state: the
+    // caller uses `busy` to distinguish ownership from observing another owner.
+    return { convId: entry.convId, ...conv, busy: false };
   }
 
   /** The stored response body, for `GET /v1/responses/{id}`. */
@@ -468,6 +562,7 @@ export class SessionStore {
     const session = conv.session;
     conv.session = null;
     conv.parkedAt = this.now();
+    this.#reportLive(conv.agentName);
     this.log("info", `session ${convId} (${conv.agentName}) parked: ${conv.sessionId}`);
     await agents?.get(conv.agentName)?.closeSession(session);
   }
@@ -485,6 +580,7 @@ export class SessionStore {
     conv.sessionId = session.id;
     conv.parkedAt = null;
     conv.lastUsed = this.now();
+    this.#reportLive(conv.agentName);
   }
 
   /** Ends every conversation. Shutdown depends on this reaping the child processes. */
@@ -501,6 +597,7 @@ export class SessionStore {
     // must not be dropped when the one it used to name is reaped.
     const keyed = conv.key ? `${conv.agentName} ${conv.key}` : null;
     if (keyed && this.#keys.get(keyed) === convId) this.#keys.delete(keyed);
+    this.#reportLive(conv.agentName);
     this.log("info", `session ${convId} (${conv.agentName}) closed: ${why}`);
     // Before the session goes: anything else attached to this conversation has to
     // go too, or a tool call held open outlives everything that could answer it.

@@ -13,7 +13,7 @@ MCP server, in-process, on the bridge's own HTTP port, whose tool list is whatev
 the current request declared. The agent connects to it like any other MCP server
 and never learns the tools belong to whoever is on the other end of the completion.
 
-# architectural_decision A tool call is PARKED, not answered {#park}
+# decision A tool call is PARKED, not answered {#park}
 
 An MCP tool call has to be answered, and only the caller can answer it — over HTTP,
 in a later request, in OpenAI's shape. So the JSON-RPC response is held open, the
@@ -39,17 +39,18 @@ What it costs, and what pays for it:
   leave an agent process waiting forever on a subscription that is still being
   paid for.
 
-# invariant The MCP route sits ABOVE the api-key gate {#no_key}
+# invariant The path token is the MCP credential {#no_key}
 
-The agent is a child of this process, reached over loopback, and is **never given
-the server's api key**. The token in the path is the credential, and it names one
-conversation's tools.
+The agent is a child of this process, reached over loopback. There is no API key on
+the bridge; the unguessable token in the path is the credential, and it names one
+conversation's tools. The MCP route is resolved before ordinary API routing so the
+agent needs nothing from the OpenAI caller's request headers.
 
-Put the route under the key check and every agent connection is answered 401. It
-fails **silently**: the caller's tools simply never appear, the agent reports "no
-such tool is available", and nothing in the log says why. That happened, cost two
-live turns of a real subscription to find, and was visible the whole time in a
-one-line probe that was run and misread. A test now pins the order.
+Historically, putting the route under the now-removed API-key check answered every
+agent connection 401. It failed **silently**: caller tools never appeared, the
+agent reported "no such tool is available", and nothing in the log said why. That
+incident cost two live subscription turns to find, and is why a test pins
+token-only reachability and route order.
 
 `log()` on every MCP request exists for the same reason: whether the agent ARRIVES
 is the first question worth asking when tools do not show up, and reasoning about
@@ -86,7 +87,7 @@ answer could not have come from anywhere but the caller's result.
 - the result the caller sends back reaches the same turn, which then finishes
 - a tool result for a call nobody is waiting on is refused, not run as a new turn
 - server.tools off keeps the old behaviour: no MCP server is attached
-- the MCP endpoint is reachable without the api key, because the agent has none
+- the MCP endpoint is reachable with only its path token
 
 The fixture acts as a real MCP client over HTTP for these — `USETOOL` in
 test/fixtures/fake-agent.js.

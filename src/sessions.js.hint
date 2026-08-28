@@ -26,6 +26,12 @@ The one that is easy to miss: a turn that **fails before producing a response**
 leaves a conversation no id points at. `discard` exists for exactly that, and
 `server.js` calls it on the error path.
 
+The store also owns the `sessions_live` gauge. Open and revive add resident
+sessions; park and close remove them. These are the same transitions that mutate
+`conv.session`, so recording elsewhere would permit the resource and its gauge to
+drift apart. The metric removes an agent's series at zero rather than emitting a
+zero-only series.
+
 # rule Continuity turns a stateless caller into a conversation {#continuity}
 
 The OpenAI API asks every client to be stateless: resend the whole history, every
@@ -43,9 +49,24 @@ only the unheard tail is sent. Three properties make this safe rather than cleve
 - **The preamble is identity, not a turn.** System and developer messages are sent
   once, when the session opens, and a changed preamble prevents a match: continuing
   under a brief the caller has withdrawn would be a lie.
-- **A busy session is never joined.** One session serves one turn; a second request
-  would interleave two conversations inside the agent, and eviction must not close
-  work already paid for.
+- **A busy session never starts a second prompt.** It may be observed for a 409,
+  steered under `busy: queue`, or adopted by the matching result for a suspended
+  tool turn; none of those starts an overlapping `session/prompt`. Eviction also
+  must not close work already paid for.
+
+A suspended tool turn is the deliberate result-bearing path through busy matching. Its
+stored prefix is the pre-suspension conversation followed by the exact assistant
+message emitted to the caller: `{role: "assistant", content, tool_calls}`. A
+headerless caller resends that prefix and appends trailing `role: "tool"` results;
+`matchPrefix` must return the pending turn so those results resume it rather than
+opening a second session. Once accepted, the result-bearing request becomes the
+pending turn's prefix, and the final assistant message is appended normally.
+
+Streaming `tool_calls` entries carry `index` for an SDK accumulator; non-streaming
+messages do not. That field is transport assembly metadata, not conversation
+identity, so `fingerprint` discards it. A headerless client may resend either the
+SDK's accumulated message or a message assembled directly from deltas and both must
+reach the same suspended turn.
 
 The recorded prefix includes the answer we produced, because it comes back as an
 `assistant` message next time. If the caller alters that text — redaction,
@@ -56,6 +77,58 @@ for longest-prefix matching rather than exact bookkeeping.
 Reuse is logged. Silence would be the failure mode otherwise: a caller whose
 preamble carries a timestamp would never match, continuity would quietly never
 happen, and nothing would say so.
+
+# invariant Suspended turns are reachable and self-releasing {#suspended_lifecycle}
+
+The lifecycle is **find → resume → settle → release**. While a turn is inside a
+caller tool, its conversation stays busy but remains findable by the caller's
+explicit key or by the recorded prefix described above. Accepting the trailing
+tool results advances that same turn; it never starts a second ACP prompt.
+
+Caller cooperation is not required for release. `setPending` watches the turn
+itself. If it settles after its HTTP request detached — tool deadline, ordinary
+finish or error — the store clears both `pending` and `busy`, refreshes `lastUsed`,
+and normal parking/forgetting rules apply. It must not release while a request is
+attached and shaping that settled outcome, because a new prompt could otherwise
+race the response still being finished.
+
+Every suspended conversation must therefore satisfy both halves: at least one of
+key or prefix can reach it, and the turn promise will eventually make it eligible
+for pruning even if no caller returns.
+
+# invariant Matching and claiming are one synchronous operation {#atomic_claim}
+
+`matchKey`, `matchPrefix` and `claimResponse` set `busy` before returning a FREE
+conversation. There is no awaitable gap between deciding a session is available
+and owning its next turn, including when the session is parked and must later be
+resumed. The owner releases in `finally`, except while `pending` still represents
+the same suspended turn.
+
+A BUSY result is observation, not another claim. Keyed queue/409 handling and the
+pending-result path must see the existing owner without changing it. `peekKey`,
+`peekPrefix` and `find` are explicitly non-claiming; use them only when no new ACP
+turn can follow, such as an inject-only probe or response-store inspection. A new
+lookup API that is neither claiming nor explicitly read-only is wrong.
+
+# decision A keyed busy conversation refuses instead of forking {#keyed_busy_refusal}
+
+Under `server.busy: fork`, `matchKey` returns the BUSY observation and the server
+answers 409 `conversation_busy`. The caller supplied a key to assert that both
+requests are the same conversation; starting a second session would contradict
+that identity, and two turns cannot share the claimed session. The old behavior
+also rebound the key to the new session, orphaning the still-running conversation
+so its next continuation could no longer reach it.
+
+Headerless prefix matching is different: it makes no explicit identity claim and
+continues to skip busy conversations, so that request may open a session of its
+own. `server.busy: queue` is unchanged and may steer into the named running turn
+when the agent advertises support.
+
+# openquestion Rename `server.busy: fork`
+
+The value name no longer describes its behavior for a keyed busy conversation;
+`refuse` would be clearer. Renaming or adding a value is a configuration-
+compatibility decision and is deliberately not part of this change.
 
 # rule Going quiet costs a session, never a conversation {#parking}
 
@@ -139,3 +212,5 @@ held, because this module must not depend on the agent layer.
 - a growing history continues one session; only the unheard tail is sent
 - a diverging history, and a changed system preamble, each start a fresh session
 - a busy conversation is neither matched nor evicted
+- a pending conversation is matched by its emitted tool-call prefix
+- an unattended pending turn clears busy when it settles and can then be pruned
