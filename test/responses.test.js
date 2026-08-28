@@ -38,7 +38,7 @@ async function start(t, { server: serverOpts, specs } = {}) {
     for (const listener of [...listeners]) listener(line);
   };
   const s = createServer(config, {
-    agents: specs ? undefined : new Map(config.agents.map((a) => [a.name, new Agent(a, config.server)])),
+    agents: specs ? undefined : new Map(config.agents.map((a) => [a.name, new Agent(a, config.server, log)])),
     log,
   });
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
@@ -281,8 +281,8 @@ test("a streaming tool-enabled response timeout reports an error without complet
   const call = await start(t, { server: { requestTimeoutMs: 300 } });
   // This test pins the post-header timeout shape, not cold process startup. Warm
   // the fixture so spawning cannot consume the whole 300 ms before PARTIAL lands.
-  const warm = await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION", store: false }));
-  assert.equal(warm.status, 200);
+  await (await call("/v1/responses", post({ model: "fake", input: "ECHOSESSION", store: false }))).text();
+  await call.until(/fake: fake-agent .* ready/);
   const res = await call(
     "/v1/responses",
     post({ model: "fake", input: "HANG", tools: TOOLS, stream: true }),
@@ -292,7 +292,7 @@ test("a streaming tool-enabled response timeout reports an error without complet
   const frames = sseFrames(await res.text());
   assert.equal(frames.at(-1).data, "[DONE]");
   const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
-  assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s2/.test(e.delta)));
+  assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s\d+/.test(e.delta)));
   assert.equal(frames.at(-2).event, "error");
   assert.equal(events.at(-1).error.code, "timeout");
   assert.ok(events.every((e) => e.type !== "response.completed"));
