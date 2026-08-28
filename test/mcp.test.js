@@ -25,6 +25,16 @@ function storeFor(bridge) {
   });
 }
 
+async function withLiveLoop(promise, ms = 1_000) {
+  // The park deadline is deliberately unref'd; the test must hold the loop open itself.
+  const keepAlive = setTimeout(() => {}, ms);
+  try {
+    return await promise;
+  } finally {
+    clearTimeout(keepAlive);
+  }
+}
+
 test("a handed-over call id exists only until resume consumes it", async () => {
   const bridge = new ToolBridge();
   const token = bridge.open(TOOLS);
@@ -40,7 +50,7 @@ test("an unanswered call id disappears at its own deadline", async () => {
   const token = bridge.open(TOOLS);
   const { call, response } = await parked(bridge, token, "conv-timeout");
   assert.equal(bridge.conversation(call.id), "conv-timeout");
-  await response;
+  await withLiveLoop(response);
   assert.equal(bridge.conversation(call.id), null);
 });
 
