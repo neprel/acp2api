@@ -414,14 +414,22 @@ export function usageChunk({ id, model, created, usage }) {
   return { id, object: "chat.completion.chunk", created, model, choices: [], usage: toUsage(usage) };
 }
 
-export function chunk({ id, model, created, delta, finishReason = null, suspectedTextToolCall = null, context, cost, session }) {
+export function chunk({ id, model, created, delta, finishReason = null, ignored, suspectedTextToolCall = null, context, cost, session }) {
+  const annotation = acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session });
+  const extension = annotation.x_acp2api;
   return {
     id,
     object: "chat.completion.chunk",
     created,
     model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
-    ...acp2apiAnnotation({ suspectedTextToolCall, context, cost, session }),
+    choices: [{
+      index: 0,
+      delta: extension
+        ? { ...delta, provider_specific_fields: { x_acp2api: extension } }
+        : delta,
+      finish_reason: finishReason,
+    }],
+    ...annotation,
   };
 }
 

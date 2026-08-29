@@ -319,9 +319,9 @@ to drop the reporting or `error` to refuse those too.
 
 ## Response facts in `x_acp2api`
 
-`x_acp2api` is the bridge's append-only annotation channel. Its fields appear only
-when the bridge has the corresponding fact; missing telemetry is absent, never
-invented as zero:
+`x_acp2api` is the bridge's append-only annotation channel. Its fields and documented
+placements are never removed or renamed. They appear only when the bridge has the
+corresponding fact; missing telemetry is absent, never invented as zero:
 
 ```jsonc
 "x_acp2api": {
@@ -354,9 +354,31 @@ The annotation is consumed once. A genuinely new Chat conversation has no
 `previous_response_id`; after retirement that id returns 404 instead of silently
 replaying, so Responses never receives this tombstone annotation.
 
-On a Chat stream these facts ride the existing terminal completion chunk. On a
-Responses stream they live in the response object carried by the terminal
-`response.completed` event. No extra SSE event is introduced.
+Non-streaming Chat and direct Chat SSE consumers read the top-level `x_acp2api`.
+LiteLLM 1.96.0 strips unknown top-level fields while rebuilding choice-bearing SSE
+chunks, but preserves its first-class provider extension channel byte-for-byte. A
+Chat terminal chunk therefore mirrors the complete extension in both places:
+
+```jsonc
+{
+  "choices": [{
+    "delta": {
+      "provider_specific_fields": {"x_acp2api": { /* same complete value */ }}
+    }
+  }],
+  "x_acp2api": { /* same complete value */ }
+}
+```
+
+The two placements are one value built once, not independently selected fields:
+`context`, `cost`, `session`, `ignored`, `suspected_text_tool_call`, and future
+additions appear in both automatically. When there is no annotation, both are
+absent. The top-level placement remains for direct SSE consumers; proxied SSE
+consumers read `choices[0].delta.provider_specific_fields.x_acp2api`.
+
+Responses streams are unchanged: their extension lives in the response object
+carried by the terminal `response.completed` event. No API introduces an extra SSE
+event for annotations.
 
 The ACP-native way to vary what a request cannot carry is **another agent entry**:
 names are model ids, so "codex at low effort" is simply another model id.

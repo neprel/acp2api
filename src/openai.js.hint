@@ -157,7 +157,15 @@ Any unavailable fact is absent, not zero or an empty object.
 
 For Chat streaming, annotations ride the terminal completion chunk, the same place
 as `ignored`; a tool-call handover likewise puts them on its terminal `tool_calls`
-chunk. No annotation creates a separate frame.
+chunk. `chunk` calls `acp2apiAnnotation` once and attaches that one complete value
+both top-level and under
+`choices[0].delta.provider_specific_fields.x_acp2api`. The first placement is the
+1.15.0 direct-SSE contract; the second survives LiteLLM 1.96.0's choice serializer.
+
+The mirror is whole and automatic. Never copy a list of known fields into the
+provider-specific placement: a future addition to `x_acp2api` must appear in both
+places by construction, and both placements must be absent together when the
+annotation is empty. No annotation creates a separate frame.
 
 `toolCallDeltas` emits complete accumulator entries. Every entry carries its
 zero-based `index` plus `id`, `type`, function name and arguments; without the index
@@ -181,4 +189,5 @@ an OpenAI SDK cannot assemble more than one streamed call deterministically.
 - stop reasons map to `finish_reason`, and an unknown one maps to `"stop"`
 - `reasoning_content` and `x_acp2api` are absent, not empty, when there is nothing to report
 - context and cost retain their raw values and appear on non-streaming and terminal streaming shapes only when reported
+- a Chat terminal chunk mirrors one complete annotation into `delta.provider_specific_fields`, with both placements absent together
 - the single exported usage mapper handles ACP counters, cache reads, and reasoning

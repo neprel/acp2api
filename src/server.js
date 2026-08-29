@@ -928,6 +928,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       ...meta,
       delta: {},
       finishReason: requestTurn.timedOut() ? "length" : finishOf(turn.stopReason),
+      ignored: reported,
       context: settled.context,
       cost: settled.cost,
       session: replay,
@@ -1273,7 +1274,13 @@ async function settleToolTurn(o) {
     // itself and the terminal frame are left.
     start();
     write(res, chunk({ ...meta, delta: { tool_calls: toolCallDeltas(outcome.calls) } }));
-    write(res, chunk({ ...meta, delta: {}, finishReason: "tool_calls", session: o.replay }));
+    write(res, chunk({
+      ...meta,
+      delta: {},
+      finishReason: "tool_calls",
+      ignored: o.ignored,
+      session: o.replay,
+    }));
     writeDone(res);
     return endSse(res);
   }
@@ -1302,6 +1309,7 @@ async function settleToolTurn(o) {
     ...meta,
     delta: {},
     finishReason: finishOf(turn.stopReason),
+    ignored: o.ignored,
     suspectedTextToolCall: suspected,
     context: settled.context,
     cost: settled.cost,

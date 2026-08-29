@@ -180,6 +180,47 @@ test("context and cost annotations are present only when reported, including str
   }
 });
 
+test("a Chat SSE terminal mirrors the whole annotation once and stays silent without one", async (t) => {
+  const call = await start(t, { server: { maxContextFill: 0.8 } });
+  const headers = { "x-conversation-id": "mirror-thread" };
+  const request = (content, extra = {}) => call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content }], stream: true, ...extra }),
+    headers,
+  });
+  const chunks = async (res) => {
+    assert.equal(res.status, 200);
+    const frames = (await res.text()).split("\n\n").filter(Boolean).map((frame) => frame.replace(/^data: /, ""));
+    assert.equal(frames.at(-1), "[DONE]");
+    return frames.slice(0, -1).map((frame) => JSON.parse(frame));
+  };
+
+  await (await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "FILL" }] }),
+    headers,
+  })).json();
+
+  const annotated = await chunks(await request("TELEMETRY", { temperature: 0 }));
+  const deliveries = annotated.filter((part) => part.x_acp2api);
+  assert.equal(deliveries.length, 1, "session attribution is delivered by one terminal chunk");
+  const terminal = deliveries[0];
+  assert.equal(terminal.choices[0].finish_reason, "stop");
+  assert.deepEqual(terminal.x_acp2api, {
+    ignored: ["temperature"],
+    context: { used: 1, size: 3, ratio: 0.3333 },
+    cost: { amount: 1.25, currency: "USD" },
+    session: { replayed: true, reason: "context_fill" },
+  });
+  assert.deepEqual(
+    terminal.choices[0].delta.provider_specific_fields.x_acp2api,
+    terminal.x_acp2api,
+    "the proxy-safe placement mirrors the complete top-level extension",
+  );
+
+  const silent = await chunks(await request("silent"));
+  assert.ok(silent.every((part) => part.x_acp2api === undefined));
+  assert.ok(silent.every((part) => part.choices[0].delta.provider_specific_fields === undefined));
+});
+
 test("a streaming completion emits SSE deltas and terminates with [DONE]", async (t) => {
   const call = await start(t);
   const res = await call(
@@ -220,7 +261,7 @@ test("a slow streaming reader retains only a turn-sized response", async (t) => 
   collectGarbage();
   const before = process.memoryUsage();
   const res = await call("/v1/chat/completions", {
-    ...chat({ model: "fake", messages: [{ role: "user", content: "LONG_OUTPUT" }], stream: true }),
+    ...chat({ model: "fake", messages: [{ role: "user", content: "TELEMETRY LONG_OUTPUT" }], stream: true }),
     headers,
   });
 
@@ -258,12 +299,18 @@ test("a slow streaming reader retains only a turn-sized response", async (t) => 
   const slowChunks = slowFrames.slice(0, -1).map((frame) => JSON.parse(frame));
   const slowText = slowChunks.map((part) => part.choices[0]?.delta?.content ?? "").join("");
   assert.equal(slowText, "x".repeat(2 * 1_048_576));
-  assert.equal(slowChunks.at(-1).choices[0].finish_reason, "stop", "the terminal frame stays after held text");
+  const slowTerminal = slowChunks.at(-1);
+  assert.equal(slowTerminal.choices[0].finish_reason, "stop", "the terminal frame stays after held text");
+  assert.deepEqual(
+    slowTerminal.choices[0].delta.provider_specific_fields.x_acp2api,
+    slowTerminal.x_acp2api,
+    "coalescing preserves the mirrored annotation on the ordered terminal frame",
+  );
 
   // Coalescing changes frame boundaries only. A client that never stalls must
   // reconstruct the exact same answer in the exact same terminal order.
   const fast = await call("/v1/chat/completions", {
-    ...chat({ model: "fake", messages: [{ role: "user", content: "LONG_OUTPUT" }], stream: true }),
+    ...chat({ model: "fake", messages: [{ role: "user", content: "TELEMETRY LONG_OUTPUT" }], stream: true }),
     headers,
   });
   const fastFrames = parse(await fast.text());
@@ -2148,6 +2195,7 @@ test("a streaming completion that stops for a tool emits the call and finishes c
       model: "fake",
       messages: [{ role: "user", content: 'USETOOL read_file {"path":"x"}' }],
       tools: TOOLS,
+      tool_choice: "required",
       stream: true,
     }),
     headers: { "x-conversation-id": "tools-stream" },
@@ -2165,7 +2213,14 @@ test("a streaming completion that stops for a tool emits the call and finishes c
     type: "function",
     function: { name: "read_file", arguments: '{"path":"x"}' },
   }]);
-  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
+  const terminal = chunks.at(-1);
+  assert.equal(terminal.choices[0].finish_reason, "tool_calls");
+  assert.deepEqual(terminal.x_acp2api, { ignored: ["tool_choice"] });
+  assert.deepEqual(
+    terminal.choices[0].delta.provider_specific_fields.x_acp2api,
+    terminal.x_acp2api,
+    "the tool-call handover uses the same annotation mirror as an ordinary finish",
+  );
 });
 
 test("a streaming turn resumed from a tool result finishes as a normal stream", async (t) => {

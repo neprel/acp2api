@@ -255,9 +255,19 @@ exact shapes and four-decimal context ratio are owned by
 [openai.js.hint#response_shape](./openai.js.hint).
 
 Non-streaming responses carry the extension on their response object. Chat streams
-put it on the existing terminal completion chunk (including a terminal tool-call
-chunk); Responses streams put it inside the response object on the existing
-`response.completed` event. No annotation creates a new SSE frame type.
+put the same complete value both top-level on the existing terminal completion
+chunk and at `choices[0].delta.provider_specific_fields.x_acp2api`; terminal
+tool-call handovers follow the same rule. The top level remains for direct clients,
+while the mirror is the LiteLLM-safe path. Both placements are built by `chunk`
+from one `acp2apiAnnotation` result, so selected-field copying is forbidden: a
+future field appearing in only one placement is wrong.
+
+Responses streams remain different: the extension stays inside the response object
+on the existing `response.completed` event. Chat error envelopes are not
+choice-bearing and carry no annotation today, so they gain no provider-specific
+field. No annotation creates a new SSE frame type. The terminal chunk is a
+structural boundary in the coalescing queue and must retain both placements after a
+stalled socket drains.
 
 # invariant CORS is opt-in and covers the whole HTTP response
 
@@ -306,6 +316,8 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - `/health` lists the configured models
 - a non-streaming turn returns content, `reasoning_content` and usage
 - a streaming turn emits role, deltas and a terminal `finish_reason`, then `[DONE]`
+- an annotated Chat terminal chunk carries deep-equal top-level and provider-specific values; both are absent when unreported
+- a stalled Chat reader receives the intact annotation mirror after coalesced text and before `[DONE]`
 - `stream_options.include_usage` adds a usage-only chunk before `[DONE]`
 - a quota failure is 429 **even on a streaming request** — the header-deferral test
 - an unrelated failure is 502; an unknown model is 404 naming what is available

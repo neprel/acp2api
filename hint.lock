@@ -93,8 +93,8 @@ files:
       rule Counters are process-lifetime and in memory: 547c60a63efa014a1c74d5099aa53a84e549d9e3e57a9e75e8f1ab126a963c48
       done Acceptance: 6d3badbe04a1edbfab8b87b067921a0f67e15f20c8e2add58e28618c048ba492
   src/openai.js:
-    hash: 4f81d021dfb33582176da6f14b699b8c3b31148dbc3b626342df43cdba276930
-    target: 3459bdf16e0ceb831c1e5b7bd84b2c1065cea8a949cda5fd8afa8f2136816f06
+    hash: 53d8ca8e8b768a8211e7dbc49418e8a5e78e8550a54b3476eb023a4f0007b366
+    target: 382892a568d29969ae35c2ae69056e4deaf7b27f4ae04bedaeb980c4864261b3
     blocks:
       goal Translate between two shapes, and nothing else: 955663737f6dda9934717a4edb927f8f278384584f7e57a242a4d640466ffa89
       invariant No I/O, ever: f12859433f466c77767b17812765fe9c13dee23832810b6d45f7635201cfd215
@@ -112,8 +112,8 @@ files:
       rule ACP usage is per SESSION; a response reports per TURN: 523c234d5b0b9dde112d2ee76fbac4f7e84001e0110e6437dd5fdebd98bdcb71
       invariant One canonical OpenAI usage mapping: 87e000b917c66301a124110cad5246be02c8301c7358bbec1abcaebfe1e19ab9
       bad The two models disagree about what "input" means: e117780df32ee46ccab0c448122c9360febe2a4669f11350ed26e09c5dc52f1f
-      rule Response builders never invent fields: 712c603e40bf8bf2cd957e337e26a8e975a4325f05348eb92bdedd19b2f270ce
-      test openai: ff4db5ce30c581dbe0adf9b497d300ec95790122f5a6643e00ca143809681267
+      rule Response builders never invent fields: 1a9f1e2f97d11ff69bcc11937a59b5ccec9ba2592b44ec886d637fc620562d09
+      test openai: ac1d21f0f54971575e1e6c3fad97e1c4d44bededbedb489bffbc27d81da7b954
   src/params.js:
     hash: b875f0fc1a810b120c637f741dc1c21fb278ec5ad4ee5208724e1ee1bb42a888
     target: 30066242149bc81b68a4db2d5e9feb1efdbdeac9e22711dbf206b62ff56a2387
@@ -164,8 +164,8 @@ files:
       invariant Responses only renames canonical usage: ec2a9dc4dd6040da0efc4461529b85c442c4e58175d4a2d170ae2320f32aa3b3
       test responses: 3b44d905b94bd3b97aa1acf9e9658bbf574ae928998f8582f967d58b36bf6b5a
   src/server.js:
-    hash: 214249f628937920c44a4f8e37559ce2b06c4f5e078c8f5505bde9fa958b23e3
-    target: b76f17134d353130264e41f5f2d920ba8d93001254dc1cde080e93d668a0bb12
+    hash: d711134ad2a9eea8419331273bf580e7d9423f55f9138aaa4adbe48deacb2354
+    target: ad1739ef689cfbdd27f85a39221fde344bcecc6ffa4ccd7cd3f66eb37fd4ad4b
     blocks:
       goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
       scope What this module owns: a057aff980e722734c52795a75b5d03c3c69dc0a71c85f91835705e3615bcb5d
@@ -184,14 +184,14 @@ files:
       rule Streaming headers are withheld until the agent produces something: 8bbc3b9fc5b420f4ea7868731652145c26657da505f492ed2ea05389b684b406
       decision Coalesce a stalled stream; do not stall the turn: df672d4f3135d373be2eab1c01dfbb2a1d3943a58afd80b34a69d2c5a1dad77e
       rule Every response carries an OpenAI-shaped error body: 808711ce073af6f143deeb64fcd768d9989a1d1a6151df1fa486e0a9ca457c16
-      invariant x_acp2api is append-only external truth: 0e31b595c2a5160eed43bbb28d91a8b1c1813d43e6037ea21100223cc8aa9f30
+      invariant x_acp2api is append-only external truth: 12dec844f122f2ad51572973d3ac9b04dcfc46fbe075a14264fdd7d6036ab5c2
       invariant CORS is opt-in and covers the whole HTTP response: eb6e90a4be0a21c4f596b70189d8e9d0dda5ba117386161586736f927ba53b00
       func handleResponse: d749dea9aa4468b511d930ef8086ef6ddacc4caca24031c1109d1bb547020856
       func handleResponse > invariant A conversation is pinned to its agent: 9d3ec31344ff11e74bea866f319263fa432df4dd1ca6d449f89d02ec8217f7bc
       func handleResponse > invariant A failed first turn leaves nothing behind: 6ed4c657b23d4ea3dcf87dbf551fbaeafeffa2e0e2c6f4a58a5fd9b47adb59f4
       func handleResponse > invariant Responses tool turns keep the same escape hatches: 4d1fbac573cb38d12fa5519bfa47b0b2a05e46a2466c121ba95d48d5cf65507e
       invariant Closing the server closes every agent: 315bc80e3612937b67068e06fdb2059752ccb7edda060e44e7497387159f04b9
-      test server: 6896969862d6485e88b3298b95cbdd9665fec6915455ceae50a531acb6da1847
+      test server: 7b6b5f65c20d4babc2d7484ea7f287e31f36ec5b53e570d1f2825cd3bcf02fae
   src/sessions.js:
     hash: 6003a269c93f8ef7a18f9b6dae2d3ae660c37bc1643dcf429993a6e50b1680a6
     target: 7b8e4568a9844c5577b36fe2fec18db6c6b28b6d148f7d27c207b4651c95807a
