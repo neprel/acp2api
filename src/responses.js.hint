@@ -67,6 +67,13 @@ are fixed at `session/new`, and silently reopening would lose Responses context.
 holding a truncated answer. Reasoning becomes its own `reasoning` output item ahead
 of the message, matching where OpenAI puts it.
 
+The response object carries the same append-only `x_acp2api` facts as Chat. Context
+and cost remain absent when the agent did not report them. In a stream the object
+rides the existing terminal `response.completed` event; no new event type is
+created. Retirement replay attribution is Chat-only: a retired
+`previous_response_id` is already visible as 404 and must not be converted into a
+fresh Responses conversation.
+
 # rule The stream is ordered, and that ordering is the contract {#event_order}
 
 Unlike chat completions' uniform chunks, these events are typed and sequenced: an
@@ -98,6 +105,7 @@ field names only. Cache arithmetic and totals must never be reimplemented here.
   `temperature` is ignored and reported
 - stop reasons map to `status`, with `incomplete_details` when truncated
 - reasoning appears as its own output item before the message
+- context and cost annotations are present only when reported, including on the terminal streamed response object
 - a conversation continues in the **same** ACP session, provable by its session id
 - a chain continues from any response in it, not only the tip
 - an unknown `previous_response_id` is 404; a mismatched model is 400

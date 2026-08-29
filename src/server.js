@@ -393,7 +393,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions,
       session = await agent.resumeSession(conversation.sessionId);
       if (session) sessions.revive(convId, session);
       else {
-        await sessions.discard(convId, registry);
+        await sessions.retire(convId, "revive_failed", registry);
         convId = null;
       }
     }
@@ -422,7 +422,7 @@ async function handleResponse(req, res, registry, config, log, params, sessions,
         throw error;
       }
       opened = true;
-      convId = sessions.open(request.model, session, { bench });
+      convId = sessions.open(request.model, session, { bench, replayable: false });
       sessions.claim(convId);
       releasesConversation = true;
     }
@@ -504,7 +504,10 @@ async function handleResponse(req, res, registry, config, log, params, sessions,
   const failed = async (e, requestTurn) => {
     // A conversation that never produced a response is not a conversation. Leaving
     // it behind would retain a live login nobody can ever reach again.
-    if ((opened || session?.dead) && convId) await sessions.discard(convId, registry);
+    if ((opened || session?.dead) && convId) {
+      if (session?.dead) await sessions.retire(convId, "dead_session", registry);
+      else await sessions.discard(convId, registry);
+    }
     if (requestTurn.clientGone()) {
       log("warn", `${request.model}: client disconnected`);
       return res.end();
@@ -624,6 +627,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
   let keyed = false;
   let opened = false;
   let session = null;
+  let replay = null;
   const run = async (requestTurn) => {
     const id = newCompletionId();
     const created = Math.floor(Date.now() / 1000);
@@ -688,7 +692,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
         // side is still suspended inside its own tool call, and handing it a fresh
         // prompt asks it to do two things at once. Closing it costs the thread's
         // context, which the abandoned turn had already lost.
-        await sessions.discard(match.convId, registry);
+        await sessions.retire(match.convId, "abandoned_tool_turn", registry);
         match = null;
       } else {
         requestTurn.abortPendingWith(match.pending.abort);
@@ -715,7 +719,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
     }
     if (match && toolResults.length > 0) {
       log("warn", `${model}: discarding a settled tool turn before accepting late results${callerKey ? ` [${callerKey}]` : ""}`);
-      await sessions.discard(match.convId, registry);
+      await sessions.retire(match.convId, "late_results", registry);
       match = null;
     }
 
@@ -797,7 +801,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
         sessions.revive(convId, session);
         log("info", `${model}: resumed ${match.sessionId}${callerKey ? ` [${callerKey}]` : ""}`);
       } else {
-        await sessions.discard(convId, registry);
+        await sessions.retire(convId, "revive_failed", registry);
         convId = null;
       }
     }
@@ -845,6 +849,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       }
       convId = sessions.open(model, session, { systemId, prefix, key: callerKey || null, bench });
       sessions.claim(convId);
+      replay = sessions.consumeRetirement(model, { key: callerKey || null, systemId, prefix });
       log(
         "info",
         `${model}: new session for ${prefix.length} message(s)${callerKey ? ` [${callerKey}]` : ""}` +
@@ -860,6 +865,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       return await runToolTurn({
         res, agent, session, blocks, controller: requestTurn.controller, limit, sessions, tools, registry, convId,
         bench, prefix, meta, stream, includeUsage, log, model, ignored: reported,
+        replay,
         clientGone: requestTurn.clientGone,
         timedOut: requestTurn.timedOut,
         timeout,
@@ -876,7 +882,7 @@ async function handleCompletion(req, res, registry, config, log, params, session
       const settled = settleUsage(sessions, convId, turn);
       const retired = await retireDeadConversation(sessions, convId, session, registry);
       if (!retired) remember(sessions, convId, prefix, turn.text);
-      return send(res, 200, completion({ ...meta, ...settled, ignored: reported }));
+      return send(res, 200, completion({ ...meta, ...settled, ignored: reported, session: replay }));
     }
 
     // Headers go out only once the turn is under way. Sending them earlier would
@@ -918,7 +924,14 @@ async function handleCompletion(req, res, registry, config, log, params, session
     start(); // an empty turn still owes the client a well-formed stream
     // Mid-stream there is no status left to change, so say "length": the answer is
     // genuinely truncated, and that is the closest honest finish_reason.
-    write(res, chunk({ ...meta, delta: {}, finishReason: requestTurn.timedOut() ? "length" : finishOf(turn.stopReason) }));
+    write(res, chunk({
+      ...meta,
+      delta: {},
+      finishReason: requestTurn.timedOut() ? "length" : finishOf(turn.stopReason),
+      context: settled.context,
+      cost: settled.cost,
+      session: replay,
+    }));
     if (includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
     writeDone(res);
     endSse(res);
@@ -940,7 +953,8 @@ async function handleCompletion(req, res, registry, config, log, params, session
     // the unheard turns are simply resent, since `remember` never ran.
     const abandoned = requestTurn.clientGone() || requestTurn.timedOut();
     if (convId && (session?.dead || !(keyed && !opened && abandoned))) {
-      await sessions.discard(convId, registry);
+      if (session?.dead) await sessions.retire(convId, "dead_session", registry);
+      else await sessions.discard(convId, registry);
       convId = null;
     }
     if (requestTurn.clientGone()) {
@@ -1247,6 +1261,7 @@ async function settleToolTurn(o) {
       // that was handed `temperature` and dropped it, and the caller has the same
       // right to know as it would on any other answer.
       ignored: o.ignored,
+      session: o.replay,
     });
     // A headerless client finds this suspended turn by resending the history plus
     // the assistant tool-call message it just received. Record that exact message
@@ -1258,7 +1273,7 @@ async function settleToolTurn(o) {
     // itself and the terminal frame are left.
     start();
     write(res, chunk({ ...meta, delta: { tool_calls: toolCallDeltas(outcome.calls) } }));
-    write(res, chunk({ ...meta, delta: {}, finishReason: "tool_calls" }));
+    write(res, chunk({ ...meta, delta: {}, finishReason: "tool_calls", session: o.replay }));
     writeDone(res);
     return endSse(res);
   }
@@ -1272,12 +1287,26 @@ async function settleToolTurn(o) {
   const retired = await retireDeadConversation(sessions, convId, pending.session, o.registry);
   if (!retired) remember(sessions, convId, pending.prefix, turn.text);
   if (!o.stream) {
-    return send(res, 200, completion({ ...meta, ...settled, ignored: o.ignored, suspectedTextToolCall: suspected }));
+    return send(res, 200, completion({
+      ...meta,
+      ...settled,
+      ignored: o.ignored,
+      suspectedTextToolCall: suspected,
+      session: o.replay,
+    }));
   }
   // The text left with the deltas as it was produced; an empty turn still owes the
   // client a well-formed stream, which is what `start()` guarantees here.
   start();
-  write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason), suspectedTextToolCall: suspected }));
+  write(res, chunk({
+    ...meta,
+    delta: {},
+    finishReason: finishOf(turn.stopReason),
+    suspectedTextToolCall: suspected,
+    context: settled.context,
+    cost: settled.cost,
+    session: o.replay,
+  }));
   if (o.includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
   writeDone(res);
   return endSse(res);
@@ -1356,15 +1385,15 @@ function remember(sessions, convId, prefix, text) {
 /** Drops the conversation behind a session the agent layer declared unusable. */
 async function retireDeadConversation(sessions, convId, session, registry) {
   if (!convId || !session?.dead) return false;
-  await sessions.discard(convId, registry);
+  await sessions.retire(convId, "dead_session", registry);
   return true;
 }
 
 /** Covers a tool turn whose request detached before its drain grace expired. */
 function watchDeadTurn(pending, sessions, convId, registry) {
   pending.turn.then(
-    () => pending.session?.dead && !pending.attached && sessions.discard(convId, registry),
-    () => pending.session?.dead && !pending.attached && sessions.discard(convId, registry),
+    () => pending.session?.dead && !pending.attached && sessions.retire(convId, "dead_session", registry),
+    () => pending.session?.dead && !pending.attached && sessions.retire(convId, "dead_session", registry),
   ).catch(() => {});
 }
 

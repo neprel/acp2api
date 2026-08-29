@@ -80,21 +80,21 @@ files:
       verification_and_unit_test_criteria: 6e14b34d06b29f2ade3ba56ec5fde641e5cfc4fedd3202b6c5727f8c74514d37
       scope_boundary What this is not: 428290e591d79576ecb4ab2f8cb471de74c76c85db79e6e7abf0166821e9b21c
   src/metrics.js:
-    hash: 6172931a99be65a071a5510968fd179d762f604760cd0cf89a018c7488f4f5f5
-    target: aae28db1ea8af93fa846916961930882fe0512f92d5bc4222244eae1b7012728
+    hash: cd65fb8c9a5b4379ca01c9b508b94d6d0642441c717a99dd2db88cc9b7e4cde3
+    target: 10960ec03080a3bd88acef429d55ec5852d3828007b50e8a381c5992bad8b8e4
     blocks:
       goal src/metrics.js: 6d159fcb01422176876a5fa27b8d55cd75307070fd2bc86d1c73ffc3ee5bbc93
       decision The bridge is the measuring point, not the agents: 010121a799ad2a47bbcd5945a4c27159482aa32126092c1286c6611133813c30
-      rule Where each number is recorded, and why not anywhere else: 43d8ddcdba23f740234e55478de589883bd9dd6ffbe345094c1e5721b88e3453
-      invariant Silence must not read as zero: 7cd3a0f80521524b2d74b243bcdad4042f7141e96e006179c1bc4a9aefed9c77
+      rule Where each number is recorded, and why not anywhere else: 94e7e8839880d7f3b9873d9d2133b44a81297ff2494dff6bdce40483233283be
+      invariant Silence must not read as zero: 4aa2cd77beeb48e35b9e818ac881b740ab5d127928729459b2e25f2ec7c6d5c4
       bad Two labels that must never be added: 59f8aab6f1ef5535463f9aaef6f01de867e451af1dbae5e6b1d9e6ea1cacc67f
       rule Operator labels are declared, not discovered: b880aaae6a51c01bd266171b4fb9f0ff9eb7676c5b065ac3c5dd0875db9080c1
       rule Quota is not here, and that is deliberate: f127bdde723adefcde8c3a600b9e638b373c71a34bfb627c167ae2bade13b765
       rule Counters are process-lifetime and in memory: 547c60a63efa014a1c74d5099aa53a84e549d9e3e57a9e75e8f1ab126a963c48
-      done Acceptance: 99af01fa71db3a33f09368f59867ef75f0dade08d8fc083ed2640059677e3e3a
+      done Acceptance: 6d3badbe04a1edbfab8b87b067921a0f67e15f20c8e2add58e28618c048ba492
   src/openai.js:
-    hash: 585d620c43dbe362b8871fd079c0b72ae2a5c0c1e7c1b7a55a0f298396eed6ee
-    target: ff5f5ca44c7eea7205f6ec128ac13b776a5f44201f82f48840cd2b71e3bc92ae
+    hash: 4f81d021dfb33582176da6f14b699b8c3b31148dbc3b626342df43cdba276930
+    target: 3459bdf16e0ceb831c1e5b7bd84b2c1065cea8a949cda5fd8afa8f2136816f06
     blocks:
       goal Translate between two shapes, and nothing else: 955663737f6dda9934717a4edb927f8f278384584f7e57a242a4d640466ffa89
       invariant No I/O, ever: f12859433f466c77767b17812765fe9c13dee23832810b6d45f7635201cfd215
@@ -112,8 +112,8 @@ files:
       rule ACP usage is per SESSION; a response reports per TURN: 523c234d5b0b9dde112d2ee76fbac4f7e84001e0110e6437dd5fdebd98bdcb71
       invariant One canonical OpenAI usage mapping: 87e000b917c66301a124110cad5246be02c8301c7358bbec1abcaebfe1e19ab9
       bad The two models disagree about what "input" means: e117780df32ee46ccab0c448122c9360febe2a4669f11350ed26e09c5dc52f1f
-      rule Response builders never invent fields: 27cab814126b5c04a57e6f9ac86c2ac9475be7190ac62fce5dacd63ad6a4f717
-      test openai: f3ec729306532bc1798048febe2effe0ee4ed864a3877493362be1a1f3177f60
+      rule Response builders never invent fields: 712c603e40bf8bf2cd957e337e26a8e975a4325f05348eb92bdedd19b2f270ce
+      test openai: ff4db5ce30c581dbe0adf9b497d300ec95790122f5a6643e00ca143809681267
   src/params.js:
     hash: b875f0fc1a810b120c637f741dc1c21fb278ec5ad4ee5208724e1ee1bb42a888
     target: 30066242149bc81b68a4db2d5e9feb1efdbdeac9e22711dbf206b62ff56a2387
@@ -147,8 +147,8 @@ files:
       rule Every note is one line: bc3c4d6870c3b11f520e2e565fbe4a43af1c85108da70cd2e1156c2b577a0ad8
       test progress: 33186c5d620168e7a6091616cde0d9c3d05e7c8e0b898203e9c90c1dfbe70096
   src/responses.js:
-    hash: e03d52e7be6b1687e5f2b8452eb1ab0ac55720b9424b4f82ea1fc97ebe62f343
-    target: 96a1f66541f2ec0bc390783ae25bfb95f0c9f00e55168b03aea42dc9d70c4baf
+    hash: 8eebb09614d9688aeefc9229873c7f39cbe986102b9c354aac4e7bb961867660
+    target: 1de8c1d665753060c5b340fc1edc0d711a5b9c2a63b4463249473d52ac5d5b99
     blocks:
       goal The surface that actually fits ACP: d395b4fdeea633ac8b4a04fa85c15b0b2f3a2d7165ca598e184f19a89d79b35f
       invariant Pure translation, like openai.js: 2e7134cd7359754482238d1c2cd6723c55d2619eddd589ff38585d05bf53e0fe
@@ -159,13 +159,13 @@ files:
       func parseResponsesRequest > rule store defaults to true: a5a4a7aba78da8fab5f8d1d1a41546ce028c4fbbeb9711eb33ab0bea841470a1
       func parseResponsesRequest > error unsupported_parameter: fbaea481e7309f7ce4a42d7675d4c4ede49e5838b40c98bc6f9f9654c469d840
       func responseObject: de5c5d151105a908f1c88a17f26cd2d4da23174e55c2d818457e1701e5b46864
-      func responseObject > rule status comes from the ACP stop reason, and incompleteness is stated: cd398b700992d3429b73c581f58023fd363dab9ebdb07733674de3fdae7f5123
+      func responseObject > rule status comes from the ACP stop reason, and incompleteness is stated: e3fbe91f47b9dc1861759cf8e6f41267ac24c651ef462cc1a8ba4df2877f7257
       rule The stream is ordered, and that ordering is the contract: c8465d0dbb7d171221dd9dc8afddca3d3999759d0f502a3fcab573750c14a786
       invariant Responses only renames canonical usage: ec2a9dc4dd6040da0efc4461529b85c442c4e58175d4a2d170ae2320f32aa3b3
-      test responses: c0873bf93ae37d0254fe34164e275523fc045b1900bcb58382f5984ba4563162
+      test responses: 3b44d905b94bd3b97aa1acf9e9658bbf574ae928998f8582f967d58b36bf6b5a
   src/server.js:
-    hash: e3ff203327d87cb2bddced5c688db30aa28b7148542a6cbd9c4831c2ec1123f7
-    target: 53077ab86088bd56aaacf4c7f02c83341912f2de75dea974ccfe9757c877368b
+    hash: 214249f628937920c44a4f8e37559ce2b06c4f5e078c8f5505bde9fa958b23e3
+    target: b76f17134d353130264e41f5f2d920ba8d93001254dc1cde080e93d668a0bb12
     blocks:
       goal The status code is the product: 7f5b1a71637b2e5441dd12e8a213ca0ce8eab1c595f84d015740f82a8f64fd86
       scope What this module owns: a057aff980e722734c52795a75b5d03c3c69dc0a71c85f91835705e3615bcb5d
@@ -177,22 +177,24 @@ files:
       invariant Every HTTP surface uses the shared turn lifecycle > invariant A live tool call id is the strongest Chat continuation identity: 3c00e81135643544e0ff0d99a5c57c88c0b187d965c8ec30c92cb3e49914433a
       invariant Every HTTP surface uses the shared turn lifecycle > invariant A session that never answered is discarded: e6bc789e724c205ef5274911a620b4ca380cad0ffd9c0352f1bace47cd01fd08
       invariant Every HTTP surface uses the shared turn lifecycle > invariant A dead session retires its conversation: 9188eb8c3213c0bf805aaa89fd326914c7a00efe8d41cc2bd5933bb21461e918
+      invariant Every HTTP surface uses the shared turn lifecycle > rule Every caused retirement names the stable reason: d566c6112d679f80ee59ecc81c301e378ba6d1ce7083d130549f1e49f7d23d5b
       invariant Every HTTP surface uses the shared turn lifecycle > rule A turn nobody waited for does not cost a KEYED session: 1e6598b0c96cad34a5f96eddd7f86ed4f2ec1526d2e4ea308d9d077e5de99d18
       invariant Every HTTP surface uses the shared turn lifecycle > invariant Timeout and disconnect are tracked separately: a71f5487c303cd2b70468975fef12412be7aec436a9bf753be4e03744d87e489
       invariant Every HTTP surface uses the shared turn lifecycle > bad A conversation must always have a way OUT of a suspended turn: 6d702f7d8276f4ef9eccc5bd5384150c4324a0628417db1b0dede7116bbd500c
       rule Streaming headers are withheld until the agent produces something: 8bbc3b9fc5b420f4ea7868731652145c26657da505f492ed2ea05389b684b406
       decision Coalesce a stalled stream; do not stall the turn: df672d4f3135d373be2eab1c01dfbb2a1d3943a58afd80b34a69d2c5a1dad77e
       rule Every response carries an OpenAI-shaped error body: 808711ce073af6f143deeb64fcd768d9989a1d1a6151df1fa486e0a9ca457c16
+      invariant x_acp2api is append-only external truth: 0e31b595c2a5160eed43bbb28d91a8b1c1813d43e6037ea21100223cc8aa9f30
       invariant CORS is opt-in and covers the whole HTTP response: eb6e90a4be0a21c4f596b70189d8e9d0dda5ba117386161586736f927ba53b00
       func handleResponse: d749dea9aa4468b511d930ef8086ef6ddacc4caca24031c1109d1bb547020856
       func handleResponse > invariant A conversation is pinned to its agent: 9d3ec31344ff11e74bea866f319263fa432df4dd1ca6d449f89d02ec8217f7bc
       func handleResponse > invariant A failed first turn leaves nothing behind: 6ed4c657b23d4ea3dcf87dbf551fbaeafeffa2e0e2c6f4a58a5fd9b47adb59f4
       func handleResponse > invariant Responses tool turns keep the same escape hatches: 4d1fbac573cb38d12fa5519bfa47b0b2a05e46a2466c121ba95d48d5cf65507e
       invariant Closing the server closes every agent: 315bc80e3612937b67068e06fdb2059752ccb7edda060e44e7497387159f04b9
-      test server: 76830692f541566dcc333dc89a1b3d0373c78d3bdef665e0bb39e3e8c596319c
+      test server: 6896969862d6485e88b3298b95cbdd9665fec6915455ceae50a531acb6da1847
   src/sessions.js:
-    hash: 638b2b173a6e9acf87caa69a5afe8c17236468601cb9e4d9dc8a63df1f6b6f8e
-    target: 401e35226ce8802a88d4e0d10df4e26dbd80292d3b046a400122c021e6a3179d
+    hash: 6003a269c93f8ef7a18f9b6dae2d3ae660c37bc1643dcf429993a6e50b1680a6
+    target: 7b8e4568a9844c5577b36fe2fec18db6c6b28b6d148f7d27c207b4651c95807a
     blocks:
       goal Keep conversations alive without leaking logins: 21d91386497248afb75265c83c7e8844c46df84cd811f8d6d310d6b6af31273b
       invariant The unit of retention is a conversation, not a response: ec50861fa9dbcf1e5e4afe3d2fd2f68b4d8f9439dc442a68430ef69d387f1bea
@@ -207,10 +209,11 @@ files:
       "openquestion Rename server.busy: fork": 0594f090c28d87909e8efdf53b1d73c2ac5000d66432b408d638be71a95660a6
       rule Going quiet costs a session, never a conversation: 868c95d3f841706584993362e2b15da462b3cf6b768111bc2138da73b72b3353
       rule Eviction is by last use, never by age: 7f28405dc2aa50602ad7b07abbd9473acdf3e1cfc5a7cd56be5c793e7549b179
+      invariant Retirement has a closed cause and a bounded attribution: 4bdec2519e1cbbbaad6e134e7bf89da07bf5043aba9095c73adfb5515aabd6f9
       func prune: de3a0bbf6a714099aada126dcd8e451e2fc289380e6338a55aff2abe76e33b7c
       func prune > arg agents: d8422b3bcf479ebc8f5d12d6b672498c2900e731c1072b71127eb267dde4741e
       func prune > invariant No clock of its own: 6c9a7d4091d92c670d827c2f6c47075fc873a1200f8eb245e4d046ba06bd3396
-      test sessions: 83f8e3eeffb26fc76e9c96336421884a32a916064d46ae45078558f012d62b4c
+      test sessions: 01eca419e89597108e4a3846bebf01465d0e6047385fb3234b69b019fa0b271c
   src/terminal.js:
     hash: bfa82662d6fbc00f51228945262bc6acfdf93d0370fa8226fd14a8c7f4107cb7
     target: 75c1a0237c2f7a39d02af711201a9e6f1188efb90c96e3f1177e9d12dc8b8893
@@ -225,13 +228,13 @@ files:
       bad Never let a command outlive what asked for it: ae314d725a9d491e2e826a955eab0898c8ee603ac4d02b5e355e35a6c702dd97
       test terminal: 1f55586c7d62ce2f519ee0d18e1dbc268a80e6e58f59507aa7a8ec780b6aa66e
   test/fixtures/fake-agent.js:
-    hash: 2a811b1f7f0dfef202cc09ad1d3f812402542a9f2cd0dbd74d69fd35f7463f3d
-    target: 6665555086be4ea83e6a73d845147149fb88ae475f303497aa0d069fdaf7a626
+    hash: d3d00096ef8a0f4ff63498bebd1e77a15919d267219b67576a8ce0405f2900f4
+    target: 7c8c6f693e933f604be0ad45ad63689fb1cf3d7087fb5639f667f999bfae8761
     blocks:
       goal Prove the wire, not the wiring: 17d265dbad00362dcd608b670dc28b0ade984644220a31e8f2371da95efebbce
       rule Extend the fixture, never reach for a mocking library: 08d0b55afcfcf216eb1cec8ae8750fd24d0a760ff1de3414f8c461140563b5a1
-      rule Prompt keywords: f6258750480a1234e19357398086c0d8102258b1f10db611e7a8ea4277cfd758
-      rule Pre-session and process fixture modes: cbb02ec0f54f61ce216a34cceabcf83b3f728c86661fb6237c98a78253c12e98
+      rule Prompt keywords: 393b5f0ddb74a9ea0362488b35a4906d14fe16d8a69a757510ce11c6db4107b2
+      rule Pre-session and process fixture modes: c25af97539f7113c0d162a5e6898834d49ce220e487a0c4468d77ca6f6ff3c4d
       invariant A session rejects overlapping prompts: 3f84aed1a8c324b530f0f8365fc85dc360f81c92ffaf57731e11e9fbbcf84a57
       rule The option set must stay unstable: e06d9cce4804ae10874e332c9a046f90af88a0aacec5e0e88299c3d8d15344c6
       invariant Session ids are monotonic, never reused: 566efd9c0feaf8f8b1991b01e586d71bae22a48826e8d80c703ba1b457c5e720

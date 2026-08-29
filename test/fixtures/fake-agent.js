@@ -24,6 +24,7 @@
  *   ECHOMCP     -> answers with the mcpServers it was given
  *   WORK        -> a plan, a diff and a failed tool (the progress renderer)
  *   FILL        -> reports a context window 95% used (retirement)
+ *   TELEMETRY   -> reports deterministic context and cumulative cost
  *   AMNESIA     -> forgets its own session, so a later resume fails
  *   SHELL       -> drives the client terminal end to end
  *   ESCAPE      -> asks to run outside the workspace, and reports the refusal
@@ -281,6 +282,15 @@ const app = acp
     state.abort = new AbortController();
 
     if (text.includes("HANG_CLOSE")) state.hangClose = true;
+    if (text.includes("TELEMETRY")) {
+      state.cost = (state.cost ?? 0) + 1.25;
+      await say({
+        sessionUpdate: "usage_update",
+        used: 1,
+        size: 3,
+        cost: { amount: state.cost, currency: "USD" },
+      });
+    }
 
     // Large enough to fill the HTTP socket while a client is not reading. This is
     // a measurement turn, not a synthetic response object: every byte crosses the

@@ -90,6 +90,15 @@ const nextId = (prefix) => `${prefix}_${Date.now().toString(36)}${(counter++).to
 
 export const newResponseId = () => nextId("resp");
 
+const RETIREMENT_REASONS = {
+  context_fill: "context full",
+  forgotten: "forgotten",
+  revive_failed: "revive failed",
+  dead_session: "dead session",
+  abandoned_tool_turn: "abandoned tool turn",
+  late_results: "late tool results",
+};
+
 /**
  * Length of the longest common prefix of two fingerprint lists -- how much of an
  * incoming history a session has already heard.
@@ -108,6 +117,7 @@ export class SessionStore {
   #conversations = new Map(); // convId -> {agentName, session, responses:Set, lastUsed}
   #responses = new Map(); // responseId -> {convId, response}
   #keys = new Map(); // `${agentName} ${callerKey}` -> convId
+  #tombstones = []; // bounded retirement attribution for a later fresh Chat turn
 
   constructor({
     max = 100,
@@ -118,6 +128,7 @@ export class SessionStore {
     log = () => {},
     onClose = () => {},
     onPendingClear = () => {},
+    tombstoneMax = 1_000,
     // Optional. Held here rather than threaded through five call sites because this
     // store already owns the per-conversation baselines and the agent name, which
     // are exactly what a per-turn metric is made of. Null when metrics are off, and
@@ -139,6 +150,7 @@ export class SessionStore {
     // How full a session's context window may get before it stops being offered to
     // the next request. 0 disables the check entirely. See `#full`.
     this.maxContextFill = maxContextFill;
+    this.tombstoneMax = tombstoneMax;
     this.now = now;
     this.log = log;
   }
@@ -197,7 +209,7 @@ export class SessionStore {
   }
 
   /** Starts a conversation around a freshly opened session. Returns its id. */
-  open(agentName, session, { systemId = null, prefix = [], key = null, bench = null } = {}) {
+  open(agentName, session, { systemId = null, prefix = [], key = null, bench = null, replayable = true } = {}) {
     const convId = nextId("conv");
     this.#conversations.set(convId, {
       agentName,
@@ -227,6 +239,9 @@ export class SessionStore {
       // answer it. The conversation stays busy while this is set, and the next
       // request carrying results picks the same turn up rather than starting one.
       pending: null,
+      // Responses has a proxy-proof previous_response_id and reports retirement as
+      // 404. Only Chat resends enough identity to attribute a later fresh replay.
+      replayable,
     });
     // A key is installed only for a new conversation. Once installed, a request
     // that finds it busy is refused or steered; it never opens another conversation
@@ -487,6 +502,60 @@ export class SessionStore {
     }
   }
 
+  #expireTombstones() {
+    const cutoff = this.now() - this.forgetTtlMs;
+    this.#tombstones = this.#tombstones.filter((tombstone) => tombstone.at > cutoff);
+  }
+
+  #rememberTombstone(conv, reason) {
+    if (!conv.replayable) return;
+    this.#expireTombstones();
+    const prefixFingerprints = conv.prefix.length ? [conv.systemId, ...conv.prefix] : null;
+    if (!conv.key && !prefixFingerprints) return;
+    this.#tombstones.push({
+      ...(conv.key ? { key: conv.key } : {}),
+      ...(prefixFingerprints ? { prefixFingerprints } : {}),
+      agentName: conv.agentName,
+      reason,
+      at: this.now(),
+    });
+    if (this.#tombstones.length > this.tombstoneMax) {
+      this.#tombstones.splice(0, this.#tombstones.length - this.tombstoneMax);
+    }
+  }
+
+  /** Consumes the most specific retirement matching a fresh Chat conversation. */
+  consumeRetirement(agentName, { key = null, systemId = null, prefix = [] } = {}) {
+    this.#expireTombstones();
+    let found = -1;
+    if (key) {
+      for (let i = this.#tombstones.length - 1; i >= 0; i -= 1) {
+        const tombstone = this.#tombstones[i];
+        if (tombstone.agentName === agentName && tombstone.key === key) {
+          found = i;
+          break;
+        }
+      }
+    }
+    if (found < 0) {
+      const incoming = [systemId, ...prefix];
+      let longest = -1;
+      for (let i = 0; i < this.#tombstones.length; i += 1) {
+        const tombstone = this.#tombstones[i];
+        const recorded = tombstone.prefixFingerprints;
+        if (tombstone.agentName !== agentName || !recorded || recorded.length > incoming.length) continue;
+        if (!recorded.every((value, index) => value === incoming[index])) continue;
+        if (recorded.length >= longest) {
+          found = i;
+          longest = recorded.length;
+        }
+      }
+    }
+    if (found < 0) return null;
+    const [tombstone] = this.#tombstones.splice(found, 1);
+    return { replayed: true, reason: tombstone.reason };
+  }
+
   /** Marks a conversation as serving a turn, so no other request joins it. */
   claim(convId) {
     const conv = this.#conversations.get(convId);
@@ -578,8 +647,8 @@ export class SessionStore {
       if (conv.busy) continue;
       // Retired: it has stopped being offered, and resuming a session with no room
       // left in its context would only hit the same wall again.
-      if (this.#full(conv)) await this.#close(convId, "context full", agents);
-      else if (conv.lastUsed < forgetCutoff) await this.#close(convId, "forgotten", agents);
+      if (this.#full(conv)) await this.retire(convId, "context_fill", agents);
+      else if (conv.lastUsed < forgetCutoff) await this.retire(convId, "forgotten", agents);
       else if (conv.lastUsed < idleCutoff) await this.park(convId, agents);
     }
     // The cap is a bound on RESIDENT sessions -- the expensive thing -- so parked
@@ -601,6 +670,13 @@ export class SessionStore {
    */
   async discard(convId, agents) {
     await this.#close(convId, "discarded", agents);
+  }
+
+  /** Retires a conversation under the closed, metrics-safe reason vocabulary. */
+  async retire(convId, reason, agents) {
+    const why = RETIREMENT_REASONS[reason];
+    if (!why) throw new Error(`unknown retirement reason "${reason}"`);
+    await this.#close(convId, why, agents, reason);
   }
 
   /**
@@ -652,7 +728,7 @@ export class SessionStore {
     for (const convId of [...this.#conversations.keys()]) await this.#close(convId, "shutdown", agents);
   }
 
-  async #close(convId, why, agents) {
+  async #close(convId, why, agents, retirementReason = null) {
     const conv = this.#conversations.get(convId);
     if (!conv) return;
     this.#clearPending(convId, conv);
@@ -663,6 +739,10 @@ export class SessionStore {
     const keyed = conv.key ? `${conv.agentName} ${conv.key}` : null;
     if (keyed && this.#keys.get(keyed) === convId) this.#keys.delete(keyed);
     this.#reportLive(conv.agentName);
+    if (retirementReason) {
+      this.#rememberTombstone(conv, retirementReason);
+      this.metrics?.retired(conv.agentName, retirementReason);
+    }
     this.log("info", `session ${convId} (${conv.agentName}) closed: ${why}`);
     // Before the session goes: anything else attached to this conversation has to
     // go too, or a tool call held open outlives everything that could answer it.

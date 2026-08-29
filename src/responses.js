@@ -138,7 +138,7 @@ export function toolOutputsIn(input) {
 }
 
 /** Builds the response object. `status` is derived from the ACP stop reason. */
-export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored, calls, suspectedTextToolCall }) {
+export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored, calls, suspectedTextToolCall, context, cost, session }) {
   const [status, incomplete] = STATUS[stopReason] ?? ["completed", null];
   return {
     id,
@@ -181,7 +181,7 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
     incomplete_details: incomplete ? { reason: incomplete } : null,
     error: null,
     usage: renameUsage(usage),
-    ...acp2apiAnnotation({ ignored, suspectedTextToolCall }),
+    ...acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session }),
   };
 }
 

@@ -105,6 +105,22 @@ fresh session rather than paying one 502 to discover the retained handle is dead
 Tool turns apply the same rule even when their HTTP request detached before the
 prompt finally settled.
 
+## rule Every caused retirement names the stable reason {#retirement_causes}
+
+Handlers call `sessions.retire`, not generic `discard`, when a conversation ends
+because resume failed (`revive_failed`), a drain-dead session cannot be reused
+(`dead_session`), Chat input abandons a suspended tool turn
+(`abandoned_tool_turn`), or tool results arrive after that turn settled
+(`late_results`). Context-fill and forget-deadline retirement originate inside the
+store. These tokens feed both metrics and the next fresh Chat response; adding a
+new caused-retirement path without one is a contract error.
+
+`discard` remains correct for non-retirement cleanup: an ephemeral `store: false`
+response, a new turn that failed before producing any response, and rebuilding an
+unbenched Chat conversation with caller-resupplied history. Explicit Responses
+deletion and process shutdown are also visible lifecycle actions, not silent replay
+causes.
+
 ## rule A turn nobody waited for does not cost a KEYED session {#abandon_keeps_keyed}
 The exception to the invariant above, and the whole of steering. When the caller
 hangs up or the request times out, nothing is wrong with the agent: a human
@@ -229,6 +245,19 @@ without pinning an allocator's reserved-but-unused RSS pages.
 
 `{error: {message, type, code, param}}`. Clients branch on `error.code`, so a new
 failure mode needs a distinct code, not a new message under an existing one.
+
+# invariant `x_acp2api` is append-only external truth {#response_annotations}
+
+The extension is consumed by external tooling. Existing fields are never renamed,
+moved, or filled with guessed zeroes. Context and cost flow from the settled turn;
+one-shot Chat retirement attribution flows from the SessionStore tombstone. Their
+exact shapes and four-decimal context ratio are owned by
+[openai.js.hint#response_shape](./openai.js.hint).
+
+Non-streaming responses carry the extension on their response object. Chat streams
+put it on the existing terminal completion chunk (including a terminal tool-call
+chunk); Responses streams put it inside the response object on the existing
+`response.completed` event. No annotation creates a new SSE frame type.
 
 # invariant CORS is opt-in and covers the whole HTTP response
 

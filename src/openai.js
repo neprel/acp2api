@@ -195,7 +195,7 @@ export function toolResultsIn(messages) {
  * both, and dropping that text would lose the sentence that explains the call.
  * `null` rather than `""` when it said nothing, which is what OpenAI sends.
  */
-export function toolCallCompletion({ id, model, created, calls, text, reasoning, ignored }) {
+export function toolCallCompletion({ id, model, created, calls, text, reasoning, ignored, session }) {
   return {
     id,
     object: "chat.completion",
@@ -217,7 +217,7 @@ export function toolCallCompletion({ id, model, created, calls, text, reasoning,
         finish_reason: "tool_calls",
       },
     ],
-    ...acp2apiAnnotation({ ignored }),
+    ...acp2apiAnnotation({ ignored, session }),
   };
 }
 
@@ -360,15 +360,26 @@ export function toUsage(usage) {
 
 export const newCompletionId = () => `chatcmpl-${randomUUID().replace(/-/g, "")}`;
 
-export function acp2apiAnnotation({ ignored, suspectedTextToolCall } = {}) {
+export function acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session } = {}) {
   const value = {
     ...(ignored?.length ? { ignored } : {}),
     ...(suspectedTextToolCall ? { suspected_text_tool_call: suspectedTextToolCall } : {}),
+    ...(context?.size > 0
+      ? {
+          context: {
+            used: context.used,
+            size: context.size,
+            ratio: Math.round((context.used / context.size) * 10_000) / 10_000,
+          },
+        }
+      : {}),
+    ...(Number.isFinite(cost?.amount) ? { cost: { amount: cost.amount, currency: cost.currency } } : {}),
+    ...(session ? { session } : {}),
   };
   return Object.keys(value).length > 0 ? { x_acp2api: value } : {};
 }
 
-export function completion({ id, model, created, text, reasoning, stopReason, usage, ignored, suspectedTextToolCall }) {
+export function completion({ id, model, created, text, reasoning, stopReason, usage, ignored, suspectedTextToolCall, context, cost, session }) {
   return {
     id,
     object: "chat.completion",
@@ -391,7 +402,7 @@ export function completion({ id, model, created, text, reasoning, stopReason, us
     // Non-standard, and safe: every client reads choices[0], so an extra key costs
     // nothing -- while silently dropping `temperature` and saying nothing would let
     // a caller believe a setting took effect that never could.
-    ...acp2apiAnnotation({ ignored, suspectedTextToolCall }),
+    ...acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session }),
   };
 }
 
@@ -403,14 +414,14 @@ export function usageChunk({ id, model, created, usage }) {
   return { id, object: "chat.completion.chunk", created, model, choices: [], usage: toUsage(usage) };
 }
 
-export function chunk({ id, model, created, delta, finishReason = null, suspectedTextToolCall = null }) {
+export function chunk({ id, model, created, delta, finishReason = null, suspectedTextToolCall = null, context, cost, session }) {
   return {
     id,
     object: "chat.completion.chunk",
     created,
     model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
-    ...acp2apiAnnotation({ suspectedTextToolCall }),
+    ...acp2apiAnnotation({ suspectedTextToolCall, context, cost, session }),
   };
 }
 

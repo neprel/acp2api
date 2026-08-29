@@ -155,6 +155,30 @@ test("a response is created, stored, fetched and deleted", async (t) => {
   assert.equal((await call(`/v1/responses/${created.id}`)).status, 404);
 });
 
+test("Responses context and cost annotations are present only when reported, including streams", async (t) => {
+  const call = await start(t);
+  const ask = async (input, stream) => {
+    const res = await call("/v1/responses", post({ model: "fake", input, stream, store: false }));
+    assert.equal(res.status, 200);
+    if (!stream) return await res.json();
+    const frames = sseFrames(await res.text());
+    assert.equal(frames.at(-1).data, "[DONE]");
+    const terminal = frames.slice(0, -1).map((frame) => JSON.parse(frame.data)).findLast(
+      (event) => event.type === "response.completed",
+    );
+    return terminal.response;
+  };
+
+  for (const stream of [false, true]) {
+    const reported = await ask(`TELEMETRY stream=${stream}`, stream);
+    assert.deepEqual(reported.x_acp2api.context, { used: 1, size: 3, ratio: 0.3333 });
+    assert.deepEqual(reported.x_acp2api.cost, { amount: 1.25, currency: "USD" });
+
+    const silent = await ask(`silent stream=${stream}`, stream);
+    assert.equal(silent.x_acp2api, undefined);
+  }
+});
+
 test("previous_response_id continues in the SAME ACP session", async (t) => {
   const call = await start(t);
   const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
@@ -459,6 +483,38 @@ test("a conversation nobody returns to is eventually forgotten, not parked forev
   clock += 1001;
   await store.prune(agents);
   assert.equal(store.find("resp_1"), null, "past the forget bound it is genuinely gone");
+});
+
+test("retirement tombstones expire, stay bounded, and exclude Responses conversations", async () => {
+  const agents = new Map([["a", { closeSession: () => {} }]]);
+  let clock = 100;
+  const store = new SessionStore({ ttlMs: 1, forgetTtlMs: 10, tombstoneMax: 2, now: () => clock });
+
+  const retire = async (key, reason = "forgotten", replayable = true) => {
+    const conv = store.open("a", { id: `session-${key}` }, { key, replayable });
+    await store.retire(conv, reason, agents);
+  };
+
+  await retire("expired");
+  clock += 11;
+  assert.equal(store.consumeRetirement("a", { key: "expired" }), null, "tombstones expire with forgetTtlMs");
+
+  await retire("oldest", "context_fill");
+  clock += 1;
+  await retire("middle", "revive_failed");
+  clock += 1;
+  await retire("newest", "dead_session");
+  assert.equal(store.consumeRetirement("a", { key: "oldest" }), null, "the oldest entry is evicted at the cap");
+  assert.deepEqual(store.consumeRetirement("a", { key: "middle" }), { replayed: true, reason: "revive_failed" });
+  assert.equal(store.consumeRetirement("a", { key: "middle" }), null, "a tombstone is consumed once");
+  assert.deepEqual(store.consumeRetirement("a", { key: "newest" }), { replayed: true, reason: "dead_session" });
+
+  await retire("responses", "forgotten", false);
+  assert.equal(
+    store.consumeRetirement("a", { key: "responses" }),
+    null,
+    "Responses continuations expose retirement as 404 instead",
+  );
 });
 
 test("forgetting one response of a chain keeps the conversation alive", async () => {

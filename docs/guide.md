@@ -317,6 +317,47 @@ and echoed back on the response as `x_acp2api.ignored`, which no client trips ov
 because everything reads `choices[0]`. Set `server.unsupportedParams` to `ignore`
 to drop the reporting or `error` to refuse those too.
 
+## Response facts in `x_acp2api`
+
+`x_acp2api` is the bridge's append-only annotation channel. Its fields appear only
+when the bridge has the corresponding fact; missing telemetry is absent, never
+invented as zero:
+
+```jsonc
+"x_acp2api": {
+  "context": {"used": 8123, "size": 200000, "ratio": 0.0406},
+  "cost": {"amount": 0.03125, "currency": "USD"},
+  "session": {"replayed": true, "reason": "context_fill"}
+}
+```
+
+`context.used` and `context.size` are the raw values the agent reported. `ratio` is
+`used / size`, rounded to four decimal places for a stable display value; use the
+raw pair when more precision matters. `cost` is the agent's own account of this
+turn, settled from its session-cumulative report rather than computed by the
+bridge.
+
+`session` appears on the first Chat response after a retired conversation had to be
+replayed into a fresh ACP session. The reason is one of:
+
+| reason | meaning |
+| --- | --- |
+| `context_fill` | the previous session reached `maxContextFill` |
+| `forgotten` | the conversation outlived `forgetTtlMs` — this is the field requester's `ttl`; an ordinary TTL park is not retirement |
+| `revive_failed` | the agent could not resume a parked session |
+| `dead_session` | a cancelled turn failed to drain and killed the session |
+| `abandoned_tool_turn` | the caller sent new input instead of answering a suspended tool call |
+| `late_results` | tool results arrived after their suspended turn had already settled |
+
+The annotation is consumed once. A genuinely new Chat conversation has no
+`session` field. Responses continuations already have a proxy-proof address in
+`previous_response_id`; after retirement that id returns 404 instead of silently
+replaying, so Responses never receives this tombstone annotation.
+
+On a Chat stream these facts ride the existing terminal completion chunk. On a
+Responses stream they live in the response object carried by the terminal
+`response.completed` event. No extra SSE event is introduced.
+
 The ACP-native way to vary what a request cannot carry is **another agent entry**:
 names are model ids, so "codex at low effort" is simply another model id.
 

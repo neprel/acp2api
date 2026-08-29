@@ -169,6 +169,11 @@ export class Metrics {
     if (series?.size === 0) this.#gauges.delete("acp2api_sessions_live");
   }
 
+  /** Counts conversations retired for a cause a later fresh Chat turn may replay. */
+  retired(agent, reason) {
+    this.counter("acp2api_sessions_retired_total", { agent, reason });
+  }
+
   /** The whole registry in Prometheus text exposition format. */
   render() {
     const out = [];
@@ -228,5 +233,6 @@ const HELP = {
   acp2api_cost_total: "Cost the agent reported for its own turns, in its own currency.",
   acp2api_context_fill_ratio: "How full a session's context window is, 0 to 1.",
   acp2api_sessions_live: "Sessions currently held open.",
+  acp2api_sessions_retired_total: "Conversations retired, by stable cause.",
   acp2api_turn_duration_seconds: "Wall-clock time from prompt to answer.",
 };

@@ -154,6 +154,32 @@ test("a non-streaming completion returns content, reasoning and usage", async (t
   assert.equal(body.usage.total_tokens, 33);
 });
 
+test("context and cost annotations are present only when reported, including streams", async (t) => {
+  const call = await start(t);
+  const ask = async (content, stream) => {
+    const res = await call(
+      "/v1/chat/completions",
+      chat({ model: "fake", messages: [{ role: "user", content }], stream }),
+    );
+    assert.equal(res.status, 200);
+    if (!stream) return await res.json();
+    const frames = (await res.text()).split("\n\n").filter(Boolean).map((frame) => frame.replace(/^data: /, ""));
+    assert.equal(frames.at(-1), "[DONE]");
+    return frames.slice(0, -1).map((frame) => JSON.parse(frame)).findLast(
+      (part) => part.choices[0]?.finish_reason != null,
+    );
+  };
+
+  for (const stream of [false, true]) {
+    const reported = await ask(`TELEMETRY stream=${stream}`, stream);
+    assert.deepEqual(reported.x_acp2api.context, { used: 1, size: 3, ratio: 0.3333 });
+    assert.deepEqual(reported.x_acp2api.cost, { amount: 1.25, currency: "USD" });
+
+    const silent = await ask(`silent stream=${stream}`, stream);
+    assert.equal(silent.x_acp2api, undefined);
+  }
+});
+
 test("a streaming completion emits SSE deltas and terminates with [DONE]", async (t) => {
   const call = await start(t);
   const res = await call(
@@ -1200,11 +1226,46 @@ test("a session that has filled its context window is retired, not reused", asyn
   const said = async (res) => (await res.json()).choices[0].message.content;
 
   assert.match(await said(await ask("FILL", "thread-f")), /^s1/);
-  assert.match(
-    await said(await ask("ECHOSESSION next", "thread-f")),
-    /^s2/,
-    "a 95%-full session must not be handed the next turn",
+  const replayed = await ask("ECHOSESSION next", "thread-f");
+  const replayedBody = await replayed.json();
+  assert.match(replayedBody.choices[0].message.content, /^s2/, "a 95%-full session must not be handed the next turn");
+  assert.deepEqual(replayedBody.x_acp2api.session, { replayed: true, reason: "context_fill" });
+
+  const ordinary = await ask("ECHOSESSION new", "unrelated-thread");
+  assert.equal((await ordinary.json()).x_acp2api?.session, undefined, "a genuinely new conversation is not a replay");
+
+  const consumed = await ask("ECHOSESSION after", "thread-f");
+  assert.equal((await consumed.json()).x_acp2api?.session, undefined, "retirement attribution appears only once");
+
+  assert.equal((await ask("FILL", "thread-f-stream")).status, 200);
+  const streamed = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "ECHOSESSION next" }], stream: true }),
+    headers: { "x-conversation-id": "thread-f-stream" },
+  });
+  const frames = (await streamed.text()).split("\n\n").filter(Boolean).map((frame) => frame.replace(/^data: /, ""));
+  const terminal = frames.slice(0, -1).map((frame) => JSON.parse(frame)).findLast(
+    (part) => part.choices[0]?.finish_reason != null,
   );
+  assert.deepEqual(terminal.x_acp2api.session, { replayed: true, reason: "context_fill" });
+});
+
+test("a forgotten headerless conversation attributes the resent prefix replay", async (t) => {
+  const call = await start(t, { server: { sessionTtlMs: 1, forgetTtlMs: 1_000 } });
+  const ask = (messages) => call("/v1/chat/completions", chat({ model: "fake", messages }));
+  const original = [{ role: "user", content: "ECHOSESSION original" }];
+
+  const first = await (await ask(original)).json();
+  assert.match(first.choices[0].message.content, /^s1/);
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  await ask([{ role: "user", content: "ECHOSESSION unrelated" }]);
+  await call.until(/closed: forgotten/);
+
+  const replayed = await (await ask([
+    ...original,
+    first.choices[0].message,
+    { role: "user", content: "ECHOSESSION continued" },
+  ])).json();
+  assert.deepEqual(replayed.x_acp2api.session, { replayed: true, reason: "forgotten" });
 });
 
 test("retirement is off when no ceiling is configured", async (t) => {
@@ -1303,7 +1364,9 @@ test("a session the agent cannot resume becomes a fresh one, not an error", asyn
 
   const res = await ask("ECHOSESSION two", "thread-q");
   assert.equal(res.status, 200, "a lost session is answered, not turned into a 502");
-  assert.doesNotMatch(await said(res), /^s1/, "and answered from a session that exists");
+  const body = await res.json();
+  assert.doesNotMatch(body.choices[0].message.content, /^s1/, "and answered from a session that exists");
+  assert.deepEqual(body.x_acp2api.session, { replayed: true, reason: "revive_failed" });
 });
 
 test("with the terminal capability on, the agent's commands run here", async (t) => {

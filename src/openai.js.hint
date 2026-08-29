@@ -147,6 +147,18 @@ passes while production is wrong again.
 sent as `""` or `[]`. An unknown future ACP stop reason maps to `"stop"`, never to
 an invalid `finish_reason` that a strict client would reject.
 
+`x_acp2api` is consumed by external tooling and is append-only: existing fields
+must never be renamed or moved. `context` is `{used, size, ratio}` only when the
+agent reported a non-zero context size; `ratio` is `used / size` rounded to four
+decimal places, while the raw pair remains available to consumers that need more
+precision. `cost` is the agent-reported `{amount, currency}` for the settled turn.
+`session` is the one-shot `{replayed: true, reason}` Chat retirement attribution.
+Any unavailable fact is absent, not zero or an empty object.
+
+For Chat streaming, annotations ride the terminal completion chunk, the same place
+as `ignored`; a tool-call handover likewise puts them on its terminal `tool_calls`
+chunk. No annotation creates a separate frame.
+
 `toolCallDeltas` emits complete accumulator entries. Every entry carries its
 zero-based `index` plus `id`, `type`, function name and arguments; without the index
 an OpenAI SDK cannot assemble more than one streamed call deterministically.
@@ -168,4 +180,5 @@ an OpenAI SDK cannot assemble more than one streamed call deterministically.
 - `makeLimiter` returns null when unconstrained; holds split stop prefixes, cuts before a stop sequence; truncates on budget
 - stop reasons map to `finish_reason`, and an unknown one maps to `"stop"`
 - `reasoning_content` and `x_acp2api` are absent, not empty, when there is nothing to report
+- context and cost retain their raw values and appear on non-streaming and terminal streaming shapes only when reported
 - the single exported usage mapper handles ACP counters, cache reads, and reasoning

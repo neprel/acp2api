@@ -31,6 +31,7 @@ Three ownership sites, and the split is not arbitrary.
 | `turns_total`, `turn_duration_seconds` | `Agent#turn` | the one funnel every caller path goes through, and the ONLY place that sees a turn that threw |
 | tokens, cost, context fill | `settleUsage` in server.js | runs exactly once per turn and holds the only per-turn figures that exist |
 | `sessions_live` | SessionStore open/park/revive/close transitions | the store is the owner that knows whether a conversation has a resident ACP session |
+| `sessions_retired_total` | SessionStore `retire`/`#close` | the store is the source that owns the closed reason and agent name |
 
 `settleUsage` reaches the recorder as `sessions.metrics?.` rather than taking it as
 an argument, because there are five call sites for it and threading a parameter
@@ -61,6 +62,13 @@ The same absence rule applies to `sessions_live`: when an agent's last resident
 session parks or closes, its series is removed rather than exported as zero. A
 scrape therefore never gains a zero-only agent merely because it once held a
 session.
+
+`sessions_retired_total` likewise appears only after a retirement. Its only native
+labels are `{agent, reason}`; the closed reason vocabulary is `context_fill`,
+`forgotten`, `revive_failed`, `dead_session`, `abandoned_tool_turn`, and
+`late_results`. Conversation ids are forbidden by [#label_hazards](#label_hazards),
+and an unknown reason fails before recording rather than becoming an unbounded
+label value.
 
 # bad Two labels that must never be added {#label_hazards}
 
@@ -116,5 +124,6 @@ running, not counters that start at the moment they looked.
 - operator labels appear on every sample and never leak between agents
 - a rate-limited turn is counted once, as `rate_limited`, and not also as `ok`
 - live-session series follow open/park/revive/close and disappear at zero
+- retirement counters use only the closed `{agent, reason}` vocabulary and emit no zero series
 - quotes and newlines in a label value cannot break the exposition format
 - `/metrics` answers `text/plain; version=0.0.4`; every other path is 404

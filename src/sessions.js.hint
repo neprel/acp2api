@@ -235,6 +235,32 @@ the provider's side with its own TTL, refreshed by use; a live child process war
 nothing. What continuity actually buys is that the agent does not re-orient from
 scratch.
 
+# invariant Retirement has a closed cause and a bounded attribution {#retirement_attribution}
+
+`retire` accepts exactly `context_fill`, `forgotten`, `revive_failed`,
+`dead_session`, `abandoned_tool_turn`, or `late_results`; an unknown token throws.
+The vocabulary is shared by the metric and `x_acp2api.session.reason`. In
+particular, the forget deadline is `forgotten`, never `ttl`: an ordinary TTL expiry
+parks a resumable conversation and is not retirement.
+
+A replayable Chat conversation records `{key?, prefixFingerprints?, agentName,
+reason, at}` as it retires. Key matching is exact. Prefix matching compares the
+existing canonical fingerprints as `[systemId, ...prefix]`, chooses the longest
+matching prefix (newest on a tie), and never invents a second message comparison
+form. A matching fresh session consumes the tombstone and annotates only its first
+response; an unrelated fresh conversation consumes nothing.
+
+Tombstones expire after `forgetTtlMs` and the store retains at most 1,000, evicting
+the oldest first. Both bounds are necessary: attribution must neither outlive the
+conversation-retention policy nor grow with process-lifetime traffic. Responses
+conversations do not create tombstones because `previous_response_id` is already a
+proxy-proof address and exposes retirement as 404.
+
+Generic `discard`, deleting the last stored Responses object, `store: false`, and
+shutdown are cleanup rather than attributed retirement. A newly opened turn that
+fails before any successful response likewise has nothing a later request can
+truthfully call a replay.
+
 # func prune {#prune}
 
 ## arg agents
@@ -258,3 +284,5 @@ held, because this module must not depend on the agent layer.
 - a busy conversation is neither matched nor evicted
 - a pending conversation is matched by its emitted tool-call prefix
 - an unattended pending turn clears busy when it settles and can then be pruned
+- retirement tombstones match keys and canonical prefixes once, expire with `forgetTtlMs`, and evict oldest at 1,000
+- Responses conversations never create Chat replay tombstones

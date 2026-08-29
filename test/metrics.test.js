@@ -95,6 +95,36 @@ test("the live-session gauge follows store residency without a zero series", asy
   assert.doesNotMatch(metrics.render(), /acp2api_sessions_live/);
 });
 
+test("retirement counts stable causes without inventing a zero series", async () => {
+  const metrics = new Metrics();
+  const store = new SessionStore({ metrics });
+  const agents = new Map([["claude", { closeSession: async () => {} }]]);
+  assert.doesNotMatch(metrics.render(), /acp2api_sessions_retired_total/);
+
+  const reasons = [
+    "context_fill",
+    "forgotten",
+    "revive_failed",
+    "dead_session",
+    "abandoned_tool_turn",
+    "late_results",
+  ];
+  for (const reason of reasons) {
+    const conv = store.open("claude", { id: `s-${reason}` });
+    await store.retire(conv, reason, agents);
+  }
+
+  assert.deepEqual(sample(metrics, "acp2api_sessions_retired_total{"), reasons.map(
+    (reason) => `acp2api_sessions_retired_total{agent="claude",reason="${reason}"} 1`,
+  ));
+  assert.match(metrics.render(), /# TYPE acp2api_sessions_retired_total counter/);
+
+  const invalid = store.open("claude", { id: "s-invalid" });
+  await assert.rejects(store.retire(invalid, "ttl", agents), /unknown retirement reason "ttl"/);
+  await store.discard(invalid, agents);
+  assert.equal(sample(metrics, "acp2api_sessions_retired_total{").length, reasons.length);
+});
+
 test("cost is summed in the currency the agent named", () => {
   const m = new Metrics();
   m.recordUsage({ agent: "claude", cost: { amount: 0.25, currency: "USD" } });
