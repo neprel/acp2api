@@ -100,6 +100,12 @@ export class ToolBridge {
     if (bench && Array.isArray(tools)) bench.tools = tools;
   }
 
+  /** Names of the caller tools this bench currently offers. */
+  toolNames(token) {
+    const bench = this.#benches.get(token);
+    return (bench?.tools ?? []).map((tool) => tool?.function?.name).filter((name) => typeof name === "string");
+  }
+
   /** Every call parked on this bench and not yet handed to the caller. */
   parked(token) {
     const bench = this.#benches.get(token);

@@ -35,6 +35,7 @@ The prompt text selects the behaviour, so a test asks for the failure it wants.
 | `LONG_OUTPUT` | streams 256 chunks of 8 KiB over real ACP stdio | slow-reader HTTP backpressure measurement |
 | `ECHOMCP` | answers with the `mcpServers` it received | that MCP config reaches `session/new` |
 | `ECHOSESSION` | answers with its own session id | which session a turn actually ran in |
+| `TEXT_TOOL_CALL` | answers `submit_plan({"x":1})` without calling the served tool | text imitation diagnostics never fabricate a call |
 | anything else | echoes after a thought chunk and a tool call | the ordinary path |
 
 Adding a keyword means adding a row here. A branch nobody can find from this table
@@ -56,6 +57,8 @@ Failures before a prompt exists are selected through the fixture environment:
 | `LONG_CAPTURE_FILE=<path>` | marks when a `LONG_OUTPUT` turn has emitted all 2 MiB, before the HTTP reader resumes |
 | `NO_CONFIG_OPTIONS=1` | returns no config options from `session/new` |
 | `PROBE_GUARD=1` | fails if a probe sends `session/set_config_option` or `session/prompt` |
+| `SET_CONFIG_CAPTURE_FILE=<path>` | appends `<configId>=<value>` for every `session/set_config_option` request |
+| `ANTHROPIC_MODEL=<value>` | reports that value as the initial model `currentValue`, mirroring Claude's process-level selector |
 
 Keep these modes environmental: no prompt or session exists when initialize and
 process shutdown behaviour must be selected.

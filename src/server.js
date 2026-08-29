@@ -24,6 +24,17 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const RESPONSES_STREAM = Symbol("responsesStream");
 const SSE_STATE = Symbol("sseState");
 
+const regexLiteral = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function suspectedTextToolCall(tools, bench, text, model, log) {
+  const tool = tools.toolNames(bench).find((name) =>
+    new RegExp(`(?:^|[^A-Za-z0-9_])${regexLiteral(name)}\\s*\\(`).test(text),
+  );
+  if (!tool) return null;
+  log("warn", `${model}: answer text looks like a call to caller tool "${tool}", but the agent made no tool call`);
+  return { agent: model, tool };
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const parts = [];
@@ -1118,7 +1129,8 @@ async function settleResponseTurn(o) {
 
   sessions.setPending(convId, null);
   const turn = { ...outcome.turn, text: pending.seen.text, reasoning: pending.seen.reasoning };
-  const body = shape(settleUsage(sessions, convId, turn));
+  const suspected = suspectedTextToolCall(tools, pending.bench, turn.text, o.model, o.log);
+  const body = shape({ ...settleUsage(sessions, convId, turn), suspectedTextToolCall: suspected });
   const retired = await retireDeadConversation(sessions, convId, pending.session, o.registry);
   if (o.sessionsRecord && !retired) sessions.record(convId, o.id, body);
   return streamed(body);
@@ -1256,13 +1268,16 @@ async function settleToolTurn(o) {
   sessions.setPending(convId, null);
   const turn = { ...outcome.turn, text: pending.seen.text, reasoning: pending.seen.reasoning };
   const settled = settleUsage(sessions, convId, turn);
+  const suspected = suspectedTextToolCall(tools, pending.bench, turn.text, o.model, o.log);
   const retired = await retireDeadConversation(sessions, convId, pending.session, o.registry);
   if (!retired) remember(sessions, convId, pending.prefix, turn.text);
-  if (!o.stream) return send(res, 200, completion({ ...meta, ...settled, ignored: o.ignored }));
+  if (!o.stream) {
+    return send(res, 200, completion({ ...meta, ...settled, ignored: o.ignored, suspectedTextToolCall: suspected }));
+  }
   // The text left with the deltas as it was produced; an empty turn still owes the
   // client a well-formed stream, which is what `start()` guarantees here.
   start();
-  write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason) }));
+  write(res, chunk({ ...meta, delta: {}, finishReason: finishOf(turn.stopReason), suspectedTextToolCall: suspected }));
   if (o.includeUsage && settled.usage) write(res, usageChunk({ ...meta, usage: settled.usage }));
   writeDone(res);
   return endSse(res);

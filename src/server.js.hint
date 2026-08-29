@@ -282,6 +282,8 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - an unrelated failure is 502; an unknown model is 404 naming what is available
 - `temperature` returns 200 and reports itself in `x_acp2api.ignored`
 - a tool-sending client is answered through its MCP bench; `tool_choice` remains ignored
+- answer text that imitates a declared caller tool call produces one warning and
+  `x_acp2api.suspected_text_tool_call`, but is never rewritten into a tool call
 - proxy-mutated Chat tool history resumes by live `tool_call_id`; cross-model and
   multi-turn ids are refused without consuming either pending turn
 - `unsupportedParams: error` turns the ignorable ones into 400 as well

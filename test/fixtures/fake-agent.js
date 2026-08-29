@@ -31,6 +31,7 @@
  *   ECHOMODE    -> answers with the permission mode it was put into
  *   ECHOHEARD   -> answers with everything it has been told, and its fork parent
  *   RUNCMD      -> two shell results, in both shapes an agent may send them
+ *   TEXT_TOOL_CALL -> prints submit_plan({...}) without calling the served tool
  * anything else is echoed back after one thought chunk.
  */
 import { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";
@@ -181,7 +182,7 @@ const app = acp
     // accident when the id happens to come round again.
     const sessionId = `s${++opened}`;
     const state = {
-      model: "fast",
+      model: process.env.ANTHROPIC_MODEL ?? "fast",
       effort: "low",
       mode: "plan",
       verbose: false,
@@ -243,12 +244,21 @@ const app = acp
   })
   .onRequest(acp.methods.agent.session.setConfigOption, ({ params }) => {
     if (process.env.PROBE_GUARD) throw new Error("probe sent session/set_config_option");
+    if (process.env.SET_CONFIG_CAPTURE_FILE) {
+      appendFileSync(process.env.SET_CONFIG_CAPTURE_FILE, `${params.configId}=${params.value}\n`);
+    }
     const state = sessions.get(params.sessionId);
     if (!state) throw new Error(`no such session ${params.sessionId}`);
     if (params.configId === "verbose") state.verbose = params.value;
     else if (params.configId === "permission-mode") state.mode = params.value;
     else state[params.configId === "effort" ? "effort" : "model"] = params.value;
     return { configOptions: optionsFor(state) };
+  })
+  .onRequest(acp.methods.agent.session.setMode, ({ params }) => {
+    const state = sessions.get(params.sessionId);
+    if (!state) throw new Error(`no such session ${params.sessionId}`);
+    state.mode = params.modeId;
+    return {};
   })
   .onNotification(acp.methods.agent.session.cancel, ({ params }) => {
     const state = sessions.get(params.sessionId);
@@ -563,6 +573,14 @@ const app = acp
         content: { type: "text", text: JSON.stringify(state.mcp) },
       });
       return { stopReason: "end_turn" };
+    }
+
+    if (text.includes("TEXT_TOOL_CALL")) {
+      await say({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: 'submit_plan({"x":1})' },
+      });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 
     // Streams one word at a time so `stop` and `max_tokens` have somewhere to cut.

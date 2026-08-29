@@ -486,7 +486,13 @@ function normalizeAgent(a, i, server, seen) {
     type,
     command,
     args: a.args ?? spawnable?.args ?? [],
-    env: a.env,
+    // claude-agent-acp reads this before session/new, so the live model option is
+    // already correct and needs no transcript-visible /model RPC. Explicit env is
+    // last: an operator override always beats a value derived from `model:`.
+    env: {
+      ...(type === "claude" && a.model != null ? { ANTHROPIC_MODEL: String(a.model) } : {}),
+      ...a.env,
+    },
     // Resolved through the same rules as server.cwd so an agent can be pinned to
     // its own workspace (e.g. one repo per agent) without absolute paths.
     cwd: a.cwd ? (isAbsolute(a.cwd) ? a.cwd : resolve(server.cwd, a.cwd)) : server.cwd,

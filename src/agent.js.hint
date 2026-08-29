@@ -73,7 +73,9 @@ The only error type leaving this module. Always carries `status` and `code`:
 ## flow
 1. Connect (memoized) — spawn, `initialize`, remember capabilities.
 2. Build the session, declaring the agent's MCP servers.
-3. Apply model, then reasoning, then raw options — re-reading the option set each time.
+3. Apply model, then reasoning, then mode, then raw options — re-reading the option
+   set after every `session/set_config_option`. For Claude only, mode uses the clean
+   `session/set_mode` method instead; Codex and general agents keep the config-option path.
 4. Prompt; consume updates, consulting `limit` after each text chunk.
 5. On cut: cancel, then drain to the stop message without accumulating.
 6. Always: remove the abort listener, dispose, and `session/close` when supported.
@@ -96,7 +98,7 @@ not separately in chat, Responses, and their tool-resume paths.
 
 Opens one unconfigured cold session through the same memoized connection,
 `#bounded` deadlines and session builder as an ordinary request. Returns the live
-config option ids/categories/types/named values and the initialize response's
+config option ids/categories/types/current values/named values and the initialize response's
 steering, session and MCP capability highlights, then closes the session.
 
 It must never apply configured options, fork/warm a base, or call
@@ -348,6 +350,8 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 
 - a turn streams reasoning, tool calls and text in order, and reports usage
 - model and reasoning are selected by category, not by option id
+- a Claude model whose derived environment matches sends no config RPC; an
+  operator-forced mismatch sends one and logs the transcript hazard
 - raw `options` address an id directly, including booleans
 - an unavailable model value names every offered value; an unknown option id and a
   configured selection against no options are 400 — never a fallback

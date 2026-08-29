@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -77,6 +77,64 @@ test("model and reasoning are applied by category, not by option id", async (t) 
   assert.equal(turn.reasoning, "thinking(high)");
 });
 
+test("options already at their exact current values send no set RPCs", async (t) => {
+  const dir = await temporary(t);
+  const capture = join(dir, "sets");
+  await writeFile(capture, "");
+  const agent = makeAgent({
+    agent: {
+      model: "fast",
+      reasoning: "low",
+      mode: "plan",
+      options: { verbose: false },
+      env: { SET_CONFIG_CAPTURE_FILE: capture },
+    },
+  });
+  t.after(() => agent.close());
+
+  assert.equal((await agent.prompt([{ type: "text", text: "hi" }])).text, "[fast] hi");
+  assert.equal(await readFile(capture, "utf8"), "");
+});
+
+test("a Claude model selected through the environment sends no set RPC", async (t) => {
+  const dir = await temporary(t);
+  const capture = join(dir, "sets");
+  await writeFile(capture, "");
+  const agent = makeAgent({
+    agent: { type: "claude", model: "smart", env: { SET_CONFIG_CAPTURE_FILE: capture } },
+  });
+  t.after(() => agent.close());
+
+  assert.equal((await agent.prompt([{ type: "text", text: "hi" }])).text, "[smart] hi");
+  assert.equal(await readFile(capture, "utf8"), "");
+});
+
+test("a mismatched Claude model environment falls back loudly to one set RPC", async (t) => {
+  const dir = await temporary(t);
+  const capture = join(dir, "sets");
+  await writeFile(capture, "");
+  const logs = [];
+  const agent = makeAgent({
+    agent: {
+      type: "claude",
+      model: "smart",
+      env: { ANTHROPIC_MODEL: "fast", SET_CONFIG_CAPTURE_FILE: capture },
+    },
+    log: (level, message) => logs.push({ level, message }),
+  });
+  t.after(() => agent.close());
+
+  assert.equal((await agent.prompt([{ type: "text", text: "hi" }])).text, "[smart] hi");
+  assert.equal(await readFile(capture, "utf8"), "model=smart\n");
+  assert.deepEqual(logs.filter(({ level }) => level === "warn"), [
+    {
+      level: "warn",
+      message:
+        'fake: model set by RPC; transcript will carry a /model entry (ANTHROPIC_MODEL produced currentValue "fast")',
+    },
+  ]);
+});
+
 test("raw options address an id directly, including booleans", async (t) => {
   const agent = makeAgent({ agent: { options: { verbose: true, model: "smart" } } });
   t.after(() => agent.close());
@@ -124,13 +182,19 @@ test("the option set is re-read after each set, because picking a model changes 
   // Selecting "lite" removes the thought_level selector, exactly as claude-agent-acp
   // does for Haiku. Resolving the reasoning option id up front would look it up in a
   // list it is no longer in, and fail with a nonsense message.
-  const agent = makeAgent({ agent: { model: "lite", reasoning: "high" } });
+  const dir = await temporary(t);
+  const capture = join(dir, "sets");
+  await writeFile(capture, "");
+  const agent = makeAgent({
+    agent: { model: "lite", reasoning: "high", env: { SET_CONFIG_CAPTURE_FILE: capture } },
+  });
   t.after(() => agent.close());
   await assert.rejects(agent.prompt([{ type: "text", text: "hi" }]), (e) => {
     assert.equal(e.status, 400);
     assert.match(e.message, /offers no thought_level selector/);
     return true;
   });
+  assert.equal(await readFile(capture, "utf8"), "model=lite\n");
 });
 
 test("a model with no reasoning selector works when none is asked for", async (t) => {

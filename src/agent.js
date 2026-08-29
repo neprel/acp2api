@@ -361,6 +361,10 @@ export class Agent {
         throw new AgentError(`${this.name}: agent offers no ${what}`, 400, "unsupported_option");
       }
       const { value } = want;
+      // claude-agent-acp implements this RPC through a local slash command whose
+      // result becomes transcript visible to the next turn. Do not issue it when
+      // the live session already reports the exact value the operator requested.
+      if (opt.currentValue === value) continue;
       const configId = opt.id;
       const payload = { sessionId: session.id, configId };
       if (opt.type === "boolean") {
@@ -375,7 +379,26 @@ export class Agent {
             "unsupported_option",
           );
         }
+        if (this.#spec.type === "claude" && want.category === "mode") {
+          await this.#bounded(
+            ctx.request(acp.methods.agent.session.setMode, { sessionId: session.id, modeId: choice.value }),
+            this.#server.agentRpcTimeoutMs,
+            "session/set_mode did not answer",
+          );
+          opts = opts.map((candidate) =>
+            candidate.id === opt.id ? { ...candidate, currentValue: choice.value } : candidate,
+          );
+          session.options = opts;
+          continue;
+        }
         Object.assign(payload, { value: choice.value });
+        if (this.#spec.type === "claude" && want.category === "model") {
+          this.#log(
+            "warn",
+            `${this.name}: model set by RPC; transcript will carry a /model entry ` +
+              `(ANTHROPIC_MODEL produced currentValue "${opt.currentValue}")`,
+          );
+        }
       }
       const res = await this.#bounded(
         ctx.request(acp.methods.agent.session.setConfigOption, payload),
@@ -490,6 +513,7 @@ export class Agent {
           id: option.id,
           category: option.category ?? null,
           type: option.type,
+          currentValue: option.currentValue,
           values: selectValues(option.options).map(({ value, name }) => ({ value, name })),
         })),
         capabilities: {

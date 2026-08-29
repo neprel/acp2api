@@ -50,6 +50,11 @@ The environment used for `${VAR}` expansion. Injected rather than read from
 ## result
 `{server, agents}` — never a partial object. Throws `ConfigError` instead.
 
+For `type: claude`, an agent's configured `model` also derives
+`env.ANTHROPIC_MODEL`, so the adapter starts on that model without a configuration
+RPC. An explicit `agents[].env.ANTHROPIC_MODEL` is applied afterwards and wins:
+operator-provided process environment is more specific than the bridge default.
+
 ## error ConfigError
 Every validation failure. `loadConfig` re-wraps it with the file path prefixed.
 Never throw a bare `Error` from this module: the CLI prints `ConfigError` as a clean
@@ -105,6 +110,7 @@ Merging the two would silently append adapter flags to someone's custom binary.
 - defaults fill in, and `cwd` resolves against `baseDir`
 - an absolute `cwd` is left alone; a per-agent `cwd` resolves against the server one
 - `claude`/`codex` resolve to the installed adapter entry, `general` demands `command`
+- a Claude model derives `ANTHROPIC_MODEL`, while an explicit env value wins
 - an explicit `command` overrides the preset and does not inherit its args
 - `resolvePreset` falls back to the bare bin name when the package is absent
 - duplicate agent names are rejected — they are the OpenAI model ids

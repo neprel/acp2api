@@ -79,6 +79,7 @@ test("--probe prints live options and capabilities without configuring or prompt
     id: "model",
     category: "model",
     type: "select",
+    currentValue: "fast",
     values: [
       { value: "fast", name: "Fast" },
       { value: "smart", name: "Smart" },

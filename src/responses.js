@@ -9,7 +9,7 @@
  *
  * Pure translation, like openai.js: no I/O, no clock beyond what callers pass in.
  */
-import { RequestError, toPromptBlocks, toUsage } from "./openai.js";
+import { acp2apiAnnotation, RequestError, toPromptBlocks, toUsage } from "./openai.js";
 
 /** Parameters that arrive under different names here than in chat completions. */
 const NATIVE = new Set([
@@ -138,7 +138,7 @@ export function toolOutputsIn(input) {
 }
 
 /** Builds the response object. `status` is derived from the ACP stop reason. */
-export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored, calls }) {
+export function responseObject({ id, model, created, text, reasoning, stopReason, usage, previousResponseId, instructions, store, ignored, calls, suspectedTextToolCall }) {
   const [status, incomplete] = STATUS[stopReason] ?? ["completed", null];
   return {
     id,
@@ -181,7 +181,7 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
     incomplete_details: incomplete ? { reason: incomplete } : null,
     error: null,
     usage: renameUsage(usage),
-    ...(ignored?.length ? { x_acp2api: { ignored } } : {}),
+    ...acp2apiAnnotation({ ignored, suspectedTextToolCall }),
   };
 }
 

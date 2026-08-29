@@ -250,6 +250,14 @@ waiting on a paid subscription forever.
 honest limit — the call is delivered whole in the terminal event rather than as a
 delta sequence, because the turn produced it whole.
 
+If an agent has these tools but finishes by printing call-shaped text such as
+`submit_plan({"x":1})`, acp2api leaves that answer exactly as written and adds
+`x_acp2api.suspected_text_tool_call: {agent, tool}`. It also logs one warning. The
+annotation is evidence of an imitation, not permission to fabricate a real call;
+the caller still received ordinary answer text. In the field, Codex at low
+reasoning imitated `submit_plan`, while high reasoning made the actual tool call.
+Raise that agent's configured `reasoning` when this annotation appears.
+
 Verified against a real Claude Code end to end: the agent listed the tool, called
 it, and finished the turn quoting a value that existed nowhere but the result sent
 back to it. Set `server.tools: off` to drop them instead, which is what every
@@ -287,9 +295,9 @@ Enabled CORS covers preflight requests and every API response.
 
 `session/prompt` carries exactly `{sessionId, prompt, _meta}` — no sampling knobs,
 no tools, no response format. An ACP agent is an *agent*, not a raw model endpoint:
-it owns its inference settings. There is no lower layer to reach either;
-`claude-agent-acp` reads only `ANTHROPIC_MODEL`, `MAX_THINKING_TOKENS` and
-`CLAUDE_CONFIG_DIR` — there is no temperature to set, anywhere.
+it owns its inference settings. There is no lower layer that exposes OpenAI
+sampling controls; `claude-agent-acp` has process-level model and thinking-budget
+environment settings, but no temperature to set anywhere.
 
 So parameters are split by **what breaks if we proceed**, not by what is supported.
 
@@ -327,6 +335,14 @@ id, because the ids differ per agent — Claude calls its reasoning selector `ef
 Codex calls it `reasoning_effort`. A `model` the agent does not offer is a **400**,
 never a silent fallback: you named that agent to get that model.
 
+For a `type: claude` agent, acp2api passes its configured `model` as
+`ANTHROPIC_MODEL` when it starts the adapter. An explicit `ANTHROPIC_MODEL` under
+the agent's `env:` mapping wins over that derived value. The live option still
+decides the truth: if `session/new` reports a different but offered
+`currentValue`, acp2api sets the model through ACP and warns that the resulting
+`/model` entry will be visible to the next turn. It never keeps a clean transcript
+by silently running the wrong model.
+
 Agent model lists move. On 2026-08-27, an adapter replaced `opus` with `opus[1m]`;
 the correct 400 prevented a silent fallback, but did not reveal the new spelling.
 Probe the configured agent directly:
@@ -335,10 +351,19 @@ Probe the configured agent directly:
 acp2api --config acp2api.yaml --probe claude-opus
 ```
 
-The command prints live config options (id, semantic category, type, and named
-values) plus steering, session, and MCP capability highlights. It reuses the same
+The output includes the live value before acp2api applies its config:
+
+```jsonc
+{"configOptions": [{"id": "model", "category": "model", "type": "select",
+  "currentValue": "default", "values": [{"value": "opus[1m]", "name": "Opus (1M context)"}, …]}]}
+```
+
+The command prints live config options (id, semantic category, type, current value,
+and named values) plus steering, session, and MCP capability highlights. It reuses the same
 ACP connection and session setup as the server, then closes cleanly. It never sends
 a prompt, so diagnosing a moved model list does not spend a subscription turn.
+For Claude, a model `currentValue` equal to the configured model confirms that the
+environment bypass will avoid the transcript-visible model-setting RPC.
 
 ## /v1/responses is the better fit
 

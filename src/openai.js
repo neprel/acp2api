@@ -217,7 +217,7 @@ export function toolCallCompletion({ id, model, created, calls, text, reasoning,
         finish_reason: "tool_calls",
       },
     ],
-    ...(ignored?.length ? { x_acp2api: { ignored } } : {}),
+    ...acp2apiAnnotation({ ignored }),
   };
 }
 
@@ -360,7 +360,15 @@ export function toUsage(usage) {
 
 export const newCompletionId = () => `chatcmpl-${randomUUID().replace(/-/g, "")}`;
 
-export function completion({ id, model, created, text, reasoning, stopReason, usage, ignored }) {
+export function acp2apiAnnotation({ ignored, suspectedTextToolCall } = {}) {
+  const value = {
+    ...(ignored?.length ? { ignored } : {}),
+    ...(suspectedTextToolCall ? { suspected_text_tool_call: suspectedTextToolCall } : {}),
+  };
+  return Object.keys(value).length > 0 ? { x_acp2api: value } : {};
+}
+
+export function completion({ id, model, created, text, reasoning, stopReason, usage, ignored, suspectedTextToolCall }) {
   return {
     id,
     object: "chat.completion",
@@ -383,7 +391,7 @@ export function completion({ id, model, created, text, reasoning, stopReason, us
     // Non-standard, and safe: every client reads choices[0], so an extra key costs
     // nothing -- while silently dropping `temperature` and saying nothing would let
     // a caller believe a setting took effect that never could.
-    ...(ignored?.length ? { x_acp2api: { ignored } } : {}),
+    ...acp2apiAnnotation({ ignored, suspectedTextToolCall }),
   };
 }
 
@@ -395,13 +403,14 @@ export function usageChunk({ id, model, created, usage }) {
   return { id, object: "chat.completion.chunk", created, model, choices: [], usage: toUsage(usage) };
 }
 
-export function chunk({ id, model, created, delta, finishReason = null }) {
+export function chunk({ id, model, created, delta, finishReason = null, suspectedTextToolCall = null }) {
   return {
     id,
     object: "chat.completion.chunk",
     created,
     model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
+    ...acp2apiAnnotation({ suspectedTextToolCall }),
   };
 }
 

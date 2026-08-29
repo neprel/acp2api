@@ -97,6 +97,7 @@ async function start(t, { agents, specs, server: serverOpts } = {}) {
   // The registry the server actually recorded into, so a test can assert on the
   // exported numbers rather than on a socket.
   call.metrics = server.metrics;
+  call.logs = lines;
   return call;
 }
 
@@ -1462,6 +1463,49 @@ const TOOLS = [
     },
   },
 ];
+
+const PLAN_TOOL = [{
+  type: "function",
+  function: {
+    name: "submit_plan",
+    description: "Submit a plan",
+    parameters: { type: "object", properties: { x: { type: "number" } } },
+  },
+}];
+
+test("text that imitates a declared tool call is warned and annotated, never rewritten", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "TEXT_TOOL_CALL" }],
+    tools: PLAN_TOOL,
+  }));
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.choices[0].message.content, 'submit_plan({"x":1})');
+  assert.equal(body.choices[0].finish_reason, "stop");
+  assert.equal(body.choices[0].message.tool_calls, undefined);
+  assert.deepEqual(body.x_acp2api.suspected_text_tool_call, { agent: "fake", tool: "submit_plan" });
+  assert.deepEqual(
+    call.logs.filter((line) => line.includes("answer text looks like a call to caller tool")),
+    ['fake: answer text looks like a call to caller tool "submit_plan", but the agent made no tool call'],
+  );
+});
+
+test("the same call-shaped text is silent when the caller declared no tools", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", chat({
+    model: "fake",
+    messages: [{ role: "user", content: "TEXT_TOOL_CALL" }],
+  }));
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.choices[0].message.content, 'submit_plan({"x":1})');
+  assert.equal(body.x_acp2api, undefined);
+  assert.equal(call.logs.some((line) => line.includes("answer text looks like a call to caller tool")), false);
+});
 
 test("a caller's tools are offered to the agent, and a call comes back as tool_calls", async (t) => {
   // The whole contract in one turn: the tools reach the agent as an MCP server it
