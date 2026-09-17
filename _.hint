@@ -24,9 +24,10 @@ Required: `@agentclientprotocol/sdk` (the protocol, zero transitive deps) and `y
 `@openai/codex` is a large download nobody using `general` should pay for.
 
 Development-only contract verification uses pinned `openai` (official SDK wire
-tests), `typescript` (HINT's JavaScript parser), and `@openhint/cli` (the reproducible
-spec gate). None may be imported by shipped runtime code or promoted to a runtime
-dependency.
+tests), `typescript` (HINT's JavaScript parser), `@openhint/cli` (the reproducible
+spec gate), and `@openhint/hintbook-software-engineer` (the npm hintbook named by
+`hint.yml`, required explicitly so clean CI does not depend on a machine cache).
+None may be imported by shipped runtime code or promoted to a runtime dependency.
 
 They are **dependencies, not global installs**, so their versions cannot drift with
 whatever `claude`/`codex` happens to be on PATH. `claude-agent-acp` bundles
