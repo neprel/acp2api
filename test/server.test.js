@@ -6,8 +6,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
+import { request as httpRequest } from "node:http";
 import { Agent, AgentError } from "../src/agent.js";
 import { normalizeConfig } from "../src/config.js";
+import { validateHttpIngress } from "../src/http-ingress.js";
 import { createServer } from "../src/server.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -98,10 +100,12 @@ async function start(t, { agents, specs, server: serverOpts } = {}) {
   // exported numbers rather than on a socket.
   call.metrics = server.metrics;
   call.logs = lines;
+  call.base = base;
   return call;
 }
 
 const chat = (body) => ({ method: "POST", body: JSON.stringify(body) });
+const responseRequest = (body) => ({ method: "POST", body: JSON.stringify(body) });
 
 test("/health needs no key and lists the configured models", async (t) => {
   const call = await start(t);
@@ -141,6 +145,128 @@ test("CORS is opt-in, answers preflight, and marks actual responses", async (t) 
   assert.equal(actual.headers.get("access-control-allow-origin"), "https://app.example");
 });
 
+test("foreign browser origins are refused before an agent is opened", async (t) => {
+  let opened = 0;
+  const agent = {
+    name: "fake",
+    spec: { type: "general" },
+    openSession: async () => {
+      opened += 1;
+      throw new Error("must not open");
+    },
+    close: async () => {},
+  };
+  const call = await start(t, { agents: new Map([["fake", agent]]) });
+  const res = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "hello" }] }),
+    headers: { origin: "https://evil.example" },
+  });
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).error.code, "invalid_origin");
+  assert.equal(opened, 0);
+});
+
+test("same-origin requests do not require CORS response headers", async (t) => {
+  const call = await start(t);
+  const res = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "hello" }] }),
+    headers: { origin: call.base },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("access-control-allow-origin"), null);
+});
+
+test("inference routes reject a wrong Host and non-JSON media type before spawn", async (t) => {
+  let opened = 0;
+  const agent = {
+    name: "fake",
+    spec: { type: "general" },
+    openSession: async () => {
+      opened += 1;
+      throw new Error("must not open");
+    },
+    close: async () => {},
+  };
+  const call = await start(t, {
+    agents: new Map([["fake", agent]]),
+    server: { allowedHosts: ["proxy.example:443"] },
+  });
+  const body = JSON.stringify({ model: "fake", messages: [{ role: "user", content: "hello" }] });
+
+  const raw = (host, path = "/v1/chat/completions") => new Promise((resolve, reject) => {
+    const request = httpRequest(`${call.base}${path}`, {
+      method: "POST",
+      headers: { host, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        json: () => JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+  const wrongHost = await raw("evil.example");
+  const wrongHostBody = wrongHost.json();
+  assert.equal(wrongHost.status, 400, JSON.stringify(wrongHostBody));
+  assert.equal(wrongHostBody.error.code, "invalid_host");
+
+  const allowedHost = await raw("proxy.example:443", "/no-such-route");
+  assert.equal(allowedHost.status, 404, "an explicitly allowed proxy authority reaches routing");
+
+  const wrongType = await call("/v1/chat/completions", {
+    method: "POST",
+    body,
+    headers: { "content-type": "text/plain" },
+  });
+  assert.equal(wrongType.status, 415);
+  assert.equal((await wrongType.json()).error.code, "unsupported_media_type");
+  assert.equal(opened, 0);
+});
+
+test("Docker published authorities work only when explicitly allowed by Host policy", async (t) => {
+  const dockerRequest = {
+    method: "GET",
+    headers: { host: "localhost:10021" },
+    socket: { localAddress: "172.17.0.2", localPort: 10021 },
+  };
+  assert.throws(
+    () => validateHttpIngress(dockerRequest, { host: "0.0.0.0", allowedHosts: [] }),
+    (error) => error.code === "invalid_host",
+  );
+  assert.doesNotThrow(() => validateHttpIngress(dockerRequest, {
+    host: "0.0.0.0",
+    allowedHosts: ["localhost:10021"],
+  }));
+
+  const call = await start(t, {
+    server: {
+      host: "0.0.0.0",
+      allowedHosts: ["localhost:10021", "127.0.0.1:10021"],
+    },
+  });
+  const raw = (host) => new Promise((resolve, reject) => {
+    const request = httpRequest(`${call.base}/health`, { headers: { host } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.on("error", reject);
+    request.end();
+  });
+
+  assert.equal((await raw("localhost:10021")).status, 200);
+  assert.equal((await raw("127.0.0.1:10021")).status, 200);
+  const refused = await raw("host.docker.internal:10021");
+  assert.equal(refused.status, 400);
+  assert.equal(JSON.parse(refused.body).error.code, "invalid_host");
+});
+
 test("a non-streaming completion returns content, reasoning and usage", async (t) => {
   const call = await start(t);
   const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "hello" }] }));
@@ -152,6 +278,426 @@ test("a non-streaming completion returns content, reasoning and usage", async (t
   assert.equal(body.choices[0].message.reasoning_content, "thinking(low)");
   assert.equal(body.choices[0].finish_reason, "stop");
   assert.equal(body.usage.total_tokens, 33);
+});
+
+test("Chat reasoning_effort is a per-turn override and resets to the configured baseline", async (t) => {
+  const call = await start(t);
+  const headers = { "x-conversation-id": "chat-reasoning" };
+  const ask = async (content, reasoning_effort) => {
+    const body = { model: "fake", messages: [{ role: "user", content }] };
+    if (reasoning_effort !== undefined) body.reasoning_effort = reasoning_effort;
+    const response = await call("/v1/chat/completions", { ...chat(body), headers });
+    assert.equal(response.status, 200);
+    return await response.json();
+  };
+
+  assert.equal((await ask("high turn", "high")).choices[0].message.reasoning_content, "thinking(high)");
+  assert.equal((await ask("baseline turn")).choices[0].message.reasoning_content, "thinking(low)");
+});
+
+test("Chat reasoning baseline survives park and resume after a temporary override", async (t) => {
+  for (const scenario of [
+    { baseline: "low", override: "high", spec: {} },
+    { baseline: "high", override: "low", spec: { reasoning: "high" } },
+  ]) {
+    await t.test(`configured baseline ${scenario.baseline}`, async (t) => {
+      const call = await start(t, {
+        server: { sessionTtlMs: 1 },
+        specs: [{
+          name: "fake",
+          type: "general",
+          command: process.execPath,
+          args: [FIXTURE],
+          ...scenario.spec,
+        }],
+      });
+      const ask = async (content, key, reasoning) => {
+        const body = { model: "fake", messages: [{ role: "user", content }] };
+        if (reasoning !== undefined) body.reasoning_effort = reasoning;
+        return await call("/v1/chat/completions", {
+          ...chat(body),
+          headers: { "x-conversation-id": key },
+        });
+      };
+
+      const first = await ask("FIRST", `reasoning-${scenario.baseline}`, scenario.override);
+      assert.equal(first.status, 200);
+      assert.equal((await first.json()).choices[0].message.reasoning_content, `thinking(${scenario.override})`);
+
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal((await ask("unrelated", `other-${scenario.baseline}`)).status, 200);
+      await call.until(/parked: s1/);
+
+      const resumed = await ask("SECOND", `reasoning-${scenario.baseline}`);
+      assert.equal(resumed.status, 200);
+      assert.equal((await resumed.json()).choices[0].message.reasoning_content, `thinking(${scenario.baseline})`);
+      await call.until(/resumed s1/);
+    });
+  }
+});
+
+test("Responses instructions are sent once and cannot change across a live chain", async (t) => {
+  const call = await start(t);
+  const first = await (await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOHEARD first",
+    instructions: "KEEP_THIS_INSTRUCTION",
+  }))).json();
+  const continued = await (await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOHEARD second",
+    instructions: "KEEP_THIS_INSTRUCTION",
+    previous_response_id: first.id,
+  }))).json();
+  const heard = JSON.parse(continued.output_text).heard;
+  assert.equal(heard.filter((entry) => entry.includes("KEEP_THIS_INSTRUCTION")).length, 1);
+
+  for (const instructions of ["CHANGED_INSTRUCTION", null]) {
+    const rejected = await call("/v1/responses", responseRequest({
+      model: "fake",
+      input: "must not run",
+      instructions,
+      previous_response_id: continued.id,
+    }));
+    assert.equal(rejected.status, 400);
+    assert.equal((await rejected.json()).error.code, "unsupported_parameter");
+  }
+
+  // A rejected change must release its atomic claim; the valid continuation still works.
+  const valid = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "after rejects",
+    instructions: "KEEP_THIS_INSTRUCTION",
+    previous_response_id: continued.id,
+  }));
+  assert.equal(valid.status, 200);
+});
+
+test("store:false advances then closes a Responses chain without creating a false tip", async (t) => {
+  const call = await start(t);
+  const first = await (await call("/v1/responses", responseRequest({ model: "fake", input: "ECHOSESSION first" }))).json();
+  const unstored = await (await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOSESSION unstored",
+    previous_response_id: first.id,
+    store: false,
+  }))).json();
+  assert.equal(unstored.store, false);
+  assert.equal(unstored.output_text, first.output_text, "the unstored turn still ran in the retained session");
+  assert.equal((await call(`/v1/responses/${unstored.id}`)).status, 404);
+  assert.equal((await call(`/v1/responses/${first.id}`)).status, 200, "older snapshots stay readable");
+  const continuation = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "must not cold start",
+    previous_response_id: first.id,
+  }));
+  assert.equal(continuation.status, 404);
+});
+
+test("a failed Responses resume is 404 and never cold-starts without history", async (t) => {
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const first = await (await call("/v1/responses", responseRequest({ model: "fake", input: "AMNESIA" }))).json();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  await (await call("/v1/responses", responseRequest({ model: "fake", input: "unrelated" }))).text();
+  await call.until(/parked: s1/);
+
+  const lost = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOHEARD must not run",
+    previous_response_id: first.id,
+  }));
+  assert.equal(lost.status, 404);
+  assert.equal((await lost.json()).error.code, "not_found");
+});
+
+test("a parked Responses conversation resumes with its caller MCP bench", async (t) => {
+  const call = await start(t, { server: { sessionTtlMs: 1 } });
+  const tools = [{
+    type: "function",
+    name: "lookup",
+    description: "lookup",
+    parameters: { type: "object", properties: {} },
+  }];
+  const firstResponse = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOMCP first",
+    tools,
+  }));
+  const first = await firstResponse.json();
+  assert.equal(firstResponse.status, 200, JSON.stringify(first));
+  assert.match(first.output_text, /\/mcp\//);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  await (await call("/v1/responses", responseRequest({ model: "fake", input: "unrelated" }))).text();
+  await call.until(/parked: s1/);
+
+  const resumed = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOMCP resumed",
+    tools,
+    previous_response_id: first.id,
+  }));
+  assert.equal(resumed.status, 200);
+  assert.match((await resumed.json()).output_text, /\/mcp\//);
+});
+
+test("a failed or timed-out continued Responses turn invalidates its old continuation tip", async (t) => {
+  for (const scenario of [
+    { input: "BOOM_AFTER_OUTPUT", status: 502, timeoutMs: 5_000 },
+    { input: "HANG", status: 504, timeoutMs: 3_000 },
+  ]) {
+    await t.test(scenario.input, async (t) => {
+      // This timeout also covers the setup turn. Keep it long enough for an ACP
+      // process to initialize on a loaded Node-version matrix; otherwise the test
+      // accidentally exercises a failed FIRST request and asks GET /undefined.
+      const call = await start(t, { server: { requestTimeoutMs: scenario.timeoutMs } });
+      const firstResponse = await call("/v1/responses", responseRequest({ model: "fake", input: "FIRST" }));
+      const first = await firstResponse.json();
+      assert.equal(firstResponse.status, 200, JSON.stringify(first));
+      const failed = await call("/v1/responses", responseRequest({
+        model: "fake",
+        input: scenario.input,
+        previous_response_id: first.id,
+      }));
+      assert.equal(failed.status, scenario.status);
+      await failed.text();
+      assert.equal((await call(`/v1/responses/${first.id}`)).status, 200, "old GET snapshot remains inspectable");
+
+      const continued = await call("/v1/responses", responseRequest({
+        model: "fake",
+        input: "ECHOHEARD must not run",
+        previous_response_id: first.id,
+      }));
+      assert.equal(continued.status, 404);
+      assert.equal((await continued.json()).error.code, "not_found");
+    });
+  }
+});
+
+test("disconnecting a continued Responses turn invalidates its old continuation tip", async (t) => {
+  const call = await start(t, { server: { requestTimeoutMs: 5_000 } });
+  const first = await (await call("/v1/responses", responseRequest({ model: "fake", input: "FIRST" }))).json();
+  const body = JSON.stringify({
+    model: "fake",
+    input: "HANG",
+    previous_response_id: first.id,
+    stream: true,
+  });
+  await new Promise((resolve, reject) => {
+    const request = httpRequest(`${call.base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    }, (response) => {
+      response.once("data", () => {
+        response.destroy();
+        resolve();
+      });
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+  await call.until(/closed: unstored response/);
+
+  const continued = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "ECHOHEARD must not run",
+    previous_response_id: first.id,
+  }));
+  assert.equal(continued.status, 404);
+  assert.equal((await continued.json()).error.code, "not_found");
+});
+
+test("Responses rejects standalone, unknown and mixed tool outputs before advancing a turn", async (t) => {
+  const call = await start(t);
+  const tools = [{
+    type: "function",
+    name: "read_file",
+    parameters: { type: "object", properties: {} },
+  }];
+  const standalone = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: [{ type: "function_call_output", call_id: "call_unknown", output: "must not disappear" }],
+  }));
+  assert.equal(standalone.status, 400);
+  assert.equal((await standalone.json()).error.code, "invalid_request_error");
+  const firstSession = await (await call(
+    "/v1/responses",
+    responseRequest({ model: "fake", input: "ECHOSESSION", store: false }),
+  )).json();
+  assert.equal(firstSession.output_text, "s1", "standalone output did not open or prompt a session");
+
+  const first = await (await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: 'USETOOL read_file {"path":"x"}',
+    tools,
+  }))).json();
+  const functionCall = first.output.find((item) => item.type === "function_call");
+  const mixed = await call("/v1/responses", responseRequest({
+    model: "fake",
+    previous_response_id: first.id,
+    input: [
+      { type: "function_call_output", call_id: functionCall.call_id, output: "right" },
+      { role: "user", content: "DO_NOT_LOSE_THIS_INSTRUCTION" },
+    ],
+    tools,
+  }));
+  assert.equal(mixed.status, 400);
+  assert.equal((await mixed.json()).error.code, "invalid_request_error");
+
+  const unknown = await call("/v1/responses", responseRequest({
+    model: "fake",
+    previous_response_id: first.id,
+    input: [{ type: "function_call_output", call_id: "call_unknown", output: "wrong" }],
+    tools,
+  }));
+  assert.equal(unknown.status, 400);
+  assert.equal((await unknown.json()).error.code, "invalid_request_error");
+
+  const resolved = await call("/v1/responses", responseRequest({
+    model: "fake",
+    previous_response_id: first.id,
+    input: [{ type: "function_call_output", call_id: functionCall.call_id, output: "right" }],
+    tools,
+  }));
+  assert.equal(resolved.status, 200);
+  assert.match((await resolved.json()).output_text, /RESULT:right/);
+});
+
+test("a concurrent duplicate function_call_output cannot steal a pending Responses turn", async (t) => {
+  const call = await start(t);
+  const tools = [{
+    type: "function",
+    name: "read_file",
+    parameters: { type: "object", properties: {} },
+  }];
+  const first = await (await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "USETOOL read_file {} DELAY_AFTER_TOOL",
+    tools,
+  }))).json();
+  const functionCall = first.output.find((item) => item.type === "function_call");
+  const result = responseRequest({
+    model: "fake",
+    previous_response_id: first.id,
+    input: [{ type: "function_call_output", call_id: functionCall.call_id, output: "ok" }],
+    tools,
+  });
+
+  const owner = call("/v1/responses", result);
+  await call.until(/answered 1 tool call/);
+  const duplicate = await call("/v1/responses", result);
+  const duplicateBody = await duplicate.json();
+  const completed = await owner;
+  const completedBody = await completed.json();
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicateBody.error.code, "conversation_busy");
+
+  assert.equal(completed.status, 200);
+  assert.match(completedBody.output_text, /RESULT:ok/);
+
+  const continued = await call("/v1/responses", responseRequest({
+    model: "fake",
+    previous_response_id: completedBody.id,
+    input: "ECHOSESSION",
+    tools,
+  }));
+  assert.equal(continued.status, 200);
+  assert.match((await continued.json()).output_text, /^s1$/);
+});
+
+test("recoverable Responses preflight errors preserve the tip until a prompt actually starts", async (t) => {
+  for (const toolEnabled of [false, true]) {
+    await t.test(toolEnabled ? "tool-enabled" : "ordinary", async (t) => {
+      const call = await start(t);
+      const tools = toolEnabled ? [{
+        type: "function",
+        name: "read_file",
+        parameters: { type: "object", properties: {} },
+      }] : undefined;
+      const withTools = (body) => tools ? { ...body, tools } : body;
+
+      const firstResponse = await call("/v1/responses", responseRequest(withTools({
+        model: "fake",
+        input: "FIRST",
+      })));
+      assert.equal(firstResponse.status, 200);
+      const first = await firstResponse.json();
+
+      const invalid = await call("/v1/responses", responseRequest(withTools({
+        model: "fake",
+        previous_response_id: first.id,
+        input: "NOT_SENT",
+        reasoning: { effort: "unknown-value" },
+      })));
+      assert.equal(invalid.status, 400);
+      assert.equal((await invalid.json()).error.code, "unsupported_option");
+
+      const corrected = await call("/v1/responses", responseRequest(withTools({
+        model: "fake",
+        previous_response_id: first.id,
+        input: "ECHOHEARD",
+      })));
+      assert.equal(corrected.status, 200);
+      const correctedBody = await corrected.json();
+      assert.deepEqual(JSON.parse(correctedBody.output_text).heard, ["FIRST", "ECHOHEARD"]);
+
+      const failed = await call("/v1/responses", responseRequest(withTools({
+        model: "fake",
+        previous_response_id: correctedBody.id,
+        input: "BOOM_AFTER_OUTPUT",
+      })));
+      assert.equal(failed.status, 502);
+      await failed.text();
+
+      const staleAfterStartedTurn = await call("/v1/responses", responseRequest(withTools({
+        model: "fake",
+        previous_response_id: correctedBody.id,
+        input: "must not run",
+      })));
+      assert.equal(staleAfterStartedTurn.status, 404);
+    });
+  }
+});
+
+test("interleaved Responses SSE is finalized before storage and GET matches its terminal object", async (t) => {
+  const call = await start(t);
+  const streamed = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "INTERLEAVE",
+    stream: true,
+  }));
+  assert.equal(streamed.status, 200);
+  const events = (await streamed.text())
+    .split("\n\n")
+    .filter(Boolean)
+    .map((frame) => frame.split("\n").find((line) => line.startsWith("data: ")).slice(6))
+    .filter((data) => data !== "[DONE]")
+    .map(JSON.parse);
+  const terminal = events.findLast((event) => event.type === "response.completed");
+  assert.ok(terminal);
+  assert.equal(terminal.response.output.length, 40, "every reasoning/message boundary is finalized as an item");
+  const fetched = await (await call(`/v1/responses/${terminal.response.id}`)).json();
+  assert.deepEqual(fetched, terminal.response);
+});
+
+test("interleaved Responses storage admission uses the finalized serialized size", async (t) => {
+  const call = await start(t, { server: { maxResponseBytes: 2_000 } });
+  const streamed = await call("/v1/responses", responseRequest({
+    model: "fake",
+    input: "INTERLEAVE",
+    stream: true,
+  }));
+  assert.equal(streamed.status, 200, "created/delta events commit SSE before storage admission");
+  const events = (await streamed.text())
+    .split("\n\n")
+    .filter(Boolean)
+    .map((frame) => frame.split("\n").find((line) => line.startsWith("data: ")).slice(6))
+    .filter((data) => data !== "[DONE]")
+    .map(JSON.parse);
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).code, "response_storage_full");
+  assert.ok(events.every((event) => event.type !== "response.completed"));
+  const responseId = events.find((event) => event.type === "response.created").response.id;
+  assert.equal((await call(`/v1/responses/${responseId}`)).status, 404);
 });
 
 test("context and cost annotations are present only when reported, including streams", async (t) => {
@@ -386,7 +932,7 @@ test("with server.tools off, a tool-sending framework is still answered", async 
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.choices[0].message.content, "[fast] hi");
-  assert.deepEqual(body.x_acp2api.ignored, ["temperature", "tool_choice", "tools"]);
+  assert.deepEqual(body.x_acp2api.ignored, ["temperature", "tools"]);
 });
 
 test("a growing history continues one session and sends only what is new", async (t) => {
@@ -841,7 +1387,7 @@ test("a history with tool calls and results reaches the agent intact", async (t)
       model: "fake",
       messages: [
         { role: "user", content: "fix it" },
-        { role: "assistant", content: null, tool_calls: [{ id: "c1", function: { name: "recall", arguments: "{}" } }] },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "recall", arguments: "{}" } }] },
         { role: "tool", tool_call_id: "c1", content: "you prefer tabs" },
       ],
     }),
@@ -1431,7 +1977,7 @@ test("a command asking to run outside the workspace is refused, not run", async 
   const call = await start(t, { server: { terminal: true } });
   const res = await call("/v1/chat/completions", chat({ model: "fake", messages: [{ role: "user", content: "ESCAPE" }] }));
   const said = (await res.json()).choices[0].message.content;
-  assert.match(said, /^REFUSED:.*outside workspace/);
+  assert.match(said, /^REFUSED:.*(?:outside workspace|absolute path is not allowed)/);
 });
 
 test("one command can be stopped without ending the turn", async (t) => {
@@ -1640,6 +2186,30 @@ test("a caller's tools are offered to the agent, and a call comes back as tool_c
   // Whatever the agent said before calling is carried too -- a message may hold
   // both, and that sentence is usually the one explaining the call.
   assert.match(body.choices[0].message.content, /TOOLS:read_file/);
+});
+
+test("tool_choice:none disables even a caller tool cached by a continued session", async (t) => {
+  const call = await start(t);
+  const headers = { "x-conversation-id": "tools-none" };
+  const first = await call("/v1/chat/completions", {
+    ...chat({ model: "fake", messages: [{ role: "user", content: "establish bench" }], tools: TOOLS }),
+    headers,
+  });
+  assert.equal(first.status, 200);
+
+  const denied = await call("/v1/chat/completions", {
+    ...chat({
+      model: "fake",
+      messages: [{ role: "user", content: 'USETOOL read_file {"path":"x"}' }],
+      tools: TOOLS,
+      tool_choice: "none",
+    }),
+    headers,
+  });
+  assert.equal(denied.status, 200);
+  const text = (await denied.json()).choices[0].message.content;
+  assert.match(text, /TOOLS:\s/);
+  assert.match(text, /ERROR:no such tool: read_file/);
 });
 
 test("a tool-enabled agent failure exits through the handler's timer cleanup", async (t) => {
@@ -2169,11 +2739,7 @@ test("the MCP endpoint answers the agent, which carries nothing but its token", 
   assert.equal(body.error.message, "unknown tool session");
 });
 
-test("tool_choice is reported as ignored even while the tools themselves are served", async (t) => {
-  // Serving the tools and honouring `tool_choice` are different promises. The
-  // agent decides what to call and when; there is no way to tell it "you must call
-  // this one" through a tool server. Dropping the parameter quietly, next to tools
-  // that DO work, is how a caller comes to believe `required` was honoured.
+test("unsupported tool_choice guarantees are rejected before a turn", async (t) => {
   const call = await start(t);
   const res = await call("/v1/chat/completions", {
     ...chat({
@@ -2185,7 +2751,8 @@ test("tool_choice is reported as ignored even while the tools themselves are ser
     headers: { "x-conversation-id": "tools-e" },
   });
   const body = await res.json();
-  assert.deepEqual(body.x_acp2api.ignored, ["tool_choice"]);
+  assert.equal(res.status, 400);
+  assert.equal(body.error.code, "unsupported_parameter");
 });
 
 test("a streaming completion that stops for a tool emits the call and finishes cleanly", async (t) => {
@@ -2195,7 +2762,7 @@ test("a streaming completion that stops for a tool emits the call and finishes c
       model: "fake",
       messages: [{ role: "user", content: 'USETOOL read_file {"path":"x"}' }],
       tools: TOOLS,
-      tool_choice: "required",
+      tool_choice: "auto",
       stream: true,
     }),
     headers: { "x-conversation-id": "tools-stream" },
@@ -2215,12 +2782,8 @@ test("a streaming completion that stops for a tool emits the call and finishes c
   }]);
   const terminal = chunks.at(-1);
   assert.equal(terminal.choices[0].finish_reason, "tool_calls");
-  assert.deepEqual(terminal.x_acp2api, { ignored: ["tool_choice"] });
-  assert.deepEqual(
-    terminal.choices[0].delta.provider_specific_fields.x_acp2api,
-    terminal.x_acp2api,
-    "the tool-call handover uses the same annotation mirror as an ordinary finish",
-  );
+  assert.equal(terminal.x_acp2api, undefined, "supported tool_choice:auto is not reported as ignored");
+  assert.equal(terminal.choices[0].delta.provider_specific_fields, undefined);
 });
 
 test("a streaming turn resumed from a tool result finishes as a normal stream", async (t) => {

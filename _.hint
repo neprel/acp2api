@@ -16,12 +16,17 @@ signal a caller ever gets.
 JavaScript, not TypeScript: the ACP ecosystem is npm-first, and a build step buys
 nothing at this size. Tests are `node --test`; there is no test framework.
 
-# dep Four packages, and a reason for each
+# dep Runtime stays small; contract tooling stays development-only
 
 Required: `@agentclientprotocol/sdk` (the protocol, zero transitive deps) and `yaml`
 (config). Optional: the adapters `@agentclientprotocol/claude-agent-acp` and
 `@agentclientprotocol/codex-acp` — only `general` agents work without them, and
 `@openai/codex` is a large download nobody using `general` should pay for.
+
+Development-only contract verification uses pinned `openai` (official SDK wire
+tests), `typescript` (HINT's JavaScript parser), and `@openhint/cli` (the reproducible
+spec gate). None may be imported by shipped runtime code or promoted to a runtime
+dependency.
 
 They are **dependencies, not global installs**, so their versions cannot drift with
 whatever `claude`/`codex` happens to be on PATH. `claude-agent-acp` bundles
@@ -76,9 +81,11 @@ differ enough to need different handling:
 
 `tools` is handled separately from both groups. The default `server.tools: mcp`
 serves caller functions through a per-conversation MCP bench and can return
-`tool_calls`; `server.tools: off` drops and reports them as ignored. `tool_choice`
-remains ignored because ACP cannot force the agent's selection. The classifier /
-serving boundary is recorded in
+`tool_calls`; `server.tools: off` drops and reports them as ignored. `tool_choice:
+auto` permits that surface and `none` disables caller-owned tools for the turn,
+including stale cached calls. `required` and named choices are refused because ACP
+cannot guarantee them; `strict: true` is refused because an MCP input schema is not
+constrained generation. The classifier / serving boundary is recorded in
 [src/params.js.hint#tools_ignored](src/params.js.hint).
 
 Unknown fields count as style: OpenAI adds parameters faster than any bridge tracks
@@ -87,10 +94,11 @@ them, and failing on an unrecognised name would age badly.
 Ignored is never silent — logged once per (model, parameter), never per request, and
 echoed as `x_acp2api.ignored` on the response.
 
-`max_tokens` and `stop` are honoured **for real**, by watching the output and
-cancelling the turn. They are the only two of that family that are decidable from
-the output alone. Token counts are ~4 chars/token: there is no tokenizer and cannot
-be a correct one, since the agent picks the model.
+`max_tokens` / `max_output_tokens` and `stop` are approximate visible-text limits,
+implemented by watching output and cancelling the turn. They do not constrain
+reasoning, subscription spend, or the agent's internal requests. Token counts use
+~4 characters per token: there is no tokenizer and cannot be a correct one, since
+the agent picks the model.
 
 # bad Do not accumulate after the limit fires {#cut_drain}
 

@@ -4,9 +4,13 @@
 # run if they disagree, because the alternative is a v1.7.1 release carrying 1.7.0
 # and a registry that can never be corrected: npm versions are immutable.
 #
-# Nothing is published that has not passed the suite on this exact commit. That is
-# not ceremony either: this package spawns coding agents that hold live logins, and
-# a broken publish is not a rollback, it is a deprecate-and-bump.
+# This workflow does not wait for ci.yml. The release order is therefore an
+# operator-enforced precondition: commit and push first, wait for every CI job to
+# pass on that exact SHA, and only then create and push the version tag on the same
+# SHA. Never send the release tag with the first push. This job repeats the release
+# subset after the tag arrives, but it is not a substitute for the full CI matrix.
+# That is not ceremony: this package spawns coding agents that hold live logins,
+# and a broken publish is not a rollback, it is a deprecate-and-bump.
 name: release
 
 on:
@@ -39,7 +43,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # @openhint/cli is a pinned release gate and requires Node 24. The
+          # runtime itself is still exercised on both supported majors in CI.
+          node-version: "24"
           cache: npm
           registry-url: https://registry.npmjs.org
 
@@ -62,8 +68,11 @@ jobs:
           fi
           echo "releasing $version"
 
-      - run: npm test
+      - run: make test
+      - run: make sdk-test
       - run: make check
+      - run: make spec
+      - run: make pack-install-smoke
 
       # Two ways to be allowed to publish, and the job takes whichever is set up.
       #

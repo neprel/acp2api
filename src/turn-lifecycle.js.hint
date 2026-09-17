@@ -1,0 +1,15 @@
+# module Shared HTTP turn lifecycle
+
+Owns the single claim-adjacent request lifecycle used by Chat and Responses:
+deadline, disconnect observation, pending-turn abort adoption, failure dispatch,
+timer cleanup and guarded release.
+
+# invariant Release always runs
+
+The handler-specific release callback runs from `finally` on success, failure,
+streaming return and tool handover. Timeout and disconnect remain separate flags.
+
+Disconnect detection listens to `ServerResponse.close` before `writableEnded`, plus
+`IncomingMessage.aborted` for an interrupted upload. Do not use
+`IncomingMessage.close`: on supported Node versions it also fires after an ordinary
+fully-read request and is not proof that the response peer disappeared.

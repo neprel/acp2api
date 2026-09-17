@@ -7,6 +7,14 @@ does it complete `initialize` and `session/new`, and does a real turn come back
 through this bridge. Everything below is measured, on Linux x86_64, against one
 local OpenAI-compatible endpoint. Nothing is inferred from a README.
 
+These are three distinct verification levels: (1) `initialize` handshake, (2)
+`session/new` setup, which may stop at login/configuration, and (3) a completed
+prompt turn. Only the first table reached level 3 in that dated environment. A
+successful handshake does not prove login, model availability, tool behavior or a
+completed turn today. The bundled reference versions at the time were
+`claude-agent-acp` 0.66.0 and `codex-acp` 1.1.14; run `acp2api --doctor` against
+the versions and account available to the deployed process.
+
 **Verified end to end** — a real turn, the agent's own file tools, an MCP server
 this bridge handed to `session/new`, streaming with the trace separated into
 `reasoning_content`, and prefix continuity. All five:
@@ -25,9 +33,11 @@ servers, but cannot read a file. And goose fans out — one tool-heavy turn put 
 concurrent requests on the model server, which is unremarkable against a hosted API
 and can be too much for a small local one.
 
-**Signs in, then works.** The handshake is clean and `session/new` is refused until
-the CLI's own account is signed in. None of this is a bridge problem: run the CLI's
-login once, in the same container, and it behaves like any other agent.
+**Reached a login gate; not turn-verified.** The handshake was clean and
+`session/new` was refused until the CLI's own account was signed in. That proves
+neither that a current login succeeds nor that a prompt completes. Perform login
+with the CLI itself, in the same environment, then run doctor and an explicitly
+authorized live smoke test.
 
 | agent | what it wants |
 | --- | --- |

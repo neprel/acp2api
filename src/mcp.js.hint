@@ -53,6 +53,19 @@ id to a closed conversation or resurrect a turn whose pending state was cleared.
 Do not build a second registry in the HTTP or session layer: it would drift from
 `resolve`, which is the authority on whether the call still exists.
 
+# invariant A bench keeps one canonical tool surface {#stable_tools}
+
+`toolFingerprint` converts Chat or Responses function definitions to MCP form,
+sorts tool names and object keys recursively, and identifies the surface fixed at
+session creation. `setTools` accepts semantically identical definitions but throws
+400 `tool_set_changed` for a changed name or schema. Reordering definitions or JSON
+keys is not a change.
+
+`setEnabled(false)` implements `tool_choice: none` per turn without destroying
+that fixed surface: `tools/list` returns an empty list and `tools/call` rejects even
+a name the agent cached earlier. `setEnabled(true)` restores `auto` for a later
+turn. This switch affects caller-owned tools only, never configured agent-owned MCP.
+
 # invariant The path token is the MCP credential {#no_key}
 
 The agent is a child of this process, reached over loopback. There is no API key on
@@ -102,6 +115,8 @@ answer could not have come from anywhere but the caller's result.
 - every way a pending turn ends removes its handed-over call ids from lookup
 - a tool result for a call nobody is waiting on is refused, not run as a new turn
 - server.tools off keeps the old behaviour: no MCP server is attached
+- tool_choice none disables discovery and stale cached calls, and auto re-enables them
+- a changed tool fingerprint is rejected while semantic reordering is accepted
 - the MCP endpoint is reachable with only its path token
 
 The fixture acts as a real MCP client over HTTP for these — `USETOOL` in

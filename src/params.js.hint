@@ -29,17 +29,24 @@ When something becomes implementable, move its name from `REFUSED`/`IGNORED` int
 the name behind. A parameter honoured in `server.js` but still listed as ignored
 reports a lie to the caller in `x_acp2api.ignored`.
 
-# decision Caller tools are classified first, then `server.tools` decides whether they are served {#tools_ignored}
+# decision Caller tools have one policy shared by Chat and Responses {#tools_ignored}
 
-The parameter classifier has no server configuration, so it initially treats
-`tools` as ignorable while preserving the definitions for the server. With the
-default `server.tools: mcp`, the server removes `tools` from `ignored_params`,
-exposes the definitions through a per-conversation MCP bench, and can return
-`tool_calls` for the caller to satisfy. With `server.tools: off`, it drops and
-reports `tools` as ignored.
+`normalizeToolPolicy` validates definitions before any prompt turn. Only function
+tools are accepted. Unknown/hosted/custom types, malformed nested definitions,
+duplicate names and `strict: true` are 400 errors; an MCP `inputSchema` is not a
+strict constrained-generation guarantee.
 
-`tool_choice` always remains ignored because ACP cannot force the agent's
-selection, and the legacy `functions` / `function_call` forms remain ignored.
+`tool_choice: auto` is supported. `none` disables discovery and rejects even a
+stale cached call for that turn. `required` and a named function choice are 400
+`unsupported_parameter` until the bridge can guarantee them. With
+`server.tools: off`, non-empty caller definitions are dropped and reported as
+`tools` in the same public annotation for Chat and Responses. The legacy
+`functions` / `function_call` forms remain ignored.
+
+Tool definitions are fixed for a conversation because MCP has no list-changed
+channel here. Omission on a later request retains the cached list; an explicitly
+different fingerprint is rejected before prompting.
+
 Do not describe caller tools as the agent's statically configured `mcpServers`;
 those are a separate, agent-owned tool surface.
 
@@ -60,35 +67,57 @@ are indistinguishable from absent and so are not worth a 400.
 `{ignored: string[], refused: [{key, why}]}` — `ignored` sorted, so the value echoed
 back to callers and asserted in tests is stable.
 
-# func report {#report}
+# func normalizeToolPolicy {#tool_policy}
 
-A method of `ParamReporter`.
+## arg body
+The raw Chat or Responses request containing `tools` and `tool_choice`.
 
-## arg model
-The agent name, so the log line says which model the caller was aiming at.
-
-## arg ignored
-Names from `classify`.
+## arg shape
+`chat` for nested function definitions; `responses` for flat definitions.
 
 ## result
-The same array, for echoing as `x_acp2api.ignored`.
+`{choice, tools, toolsProvided}`. `choice` is `auto` or `none`; `tools` is empty
+under `none`; `toolsProvided` distinguishes omission from an explicit list.
 
-## error unsupported_parameter
-Thrown only when the mode is `error`. Status 400.
+It throws a plain error with status 400 and code `unsupported_parameter` for
+`required`, named choice, unsupported types, and `strict: true`; malformed choices
+and definitions use code `invalid_request_error`.
 
-## invariant One log line per (model, parameter), for the process lifetime
-Not per request. A client looping with `temperature` would otherwise produce one
-line per call forever, and the interesting event is the first one.
+# func ignoredNestedKeys {#nested_keys}
+
+## arg value
+The already type-validated object parameter, or null.
+
+## arg prefix
+The public top-level parameter name used to form dotted annotation paths.
+
+## arg supported
+A Set of nested keys actually honoured by the caller.
+
+## result
+A sorted list of unsupported dotted paths. Accepting a nested field is never silent;
+callers merge these names into the ordinary ignored-parameter annotation.
+
+# invariant ParamReporter is stable and bounded {#report}
+
+`ParamReporter.report(model, ignored)` returns the same names for the public
+annotation. In `error` mode it throws status 400 `unsupported_parameter`; in
+`ignore` mode it is silent. Warning mode logs one line per `(model, parameter)` for
+the process lifetime, not per request. A client looping with `temperature` would
+otherwise produce one line per call forever.
 
 # test params
 
 - style parameters (`temperature`, `top_p`, `seed`) are ignored, never refused
-- `tools` is preserved for the server's configured serving policy while the
-  classifier initially marks it ignored; `tool_choice` and old `functions` /
-  `function_call` remain ignored
+- `tools`, `tool_choice: auto|none`, and Chat `reasoning_effort` are emulated, not ignored
+- `required`, named choice, `strict: true`, unsupported types, malformed nested
+  definitions and duplicate names are rejected before a prompt turn
+- valid nested JSON Schema under function `parameters` is preserved unchanged
+- old `functions` / `function_call` remain ignored
 - what remains contract-changing (`response_format`, `audio`, `modalities`) is still refused
 - `n: 1` and `n: null` pass; `n: 3` is refused
 - an unknown future field is ignored rather than refused
+- unknown fields inside supported objects are reported as stable dotted paths
 - native and emulated names appear in neither list
 - the reporter logs each (model, parameter) pair exactly once across repeated calls
 - mode `ignore` logs nothing; mode `error` throws with status 400 and the right code

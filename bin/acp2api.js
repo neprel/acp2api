@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { parseArgs } from "node:util";
 import { ConfigError, loadConfig } from "../src/config.js";
 import { createServer as createHttpServer } from "node:http";
@@ -10,9 +11,17 @@ import { Agent } from "../src/agent.js";
 const USAGE = `acp2api -- OpenAI-compatible HTTP server over ACP coding agents
 
   acp2api --config <file>     path to the YAML config (env: ACP2API_CONFIG)
+  acp2api --version           print the installed package version
+  acp2api --init <file>       create a minimal config; never overwrites
   acp2api --check             validate the config and exit
   acp2api --probe <agent>     print the agent's live ACP options; sends no prompt
+  acp2api --doctor [--json]   check every agent without sending a prompt
+  acp2api --help
 `;
+
+const require = createRequire(import.meta.url);
+const { version } = require("../package.json");
+const INITIAL_CONFIG = `# Minimal acp2api configuration. The CLI must already be logged in.\nserver:\n  cwd: ./work\nagents:\n  - name: claude\n    type: claude\n`;
 
 const log = (level, message) => {
   const line = `${new Date().toISOString()} ${level.toUpperCase()} ${message}`;
@@ -24,8 +33,12 @@ try {
   ({ values: opts } = parseArgs({
     options: {
       config: { type: "string", short: "c" },
+      version: { type: "boolean", short: "v" },
+      init: { type: "string" },
       check: { type: "boolean" },
       probe: { type: "string" },
+      doctor: { type: "boolean" },
+      json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   }));
@@ -39,6 +52,23 @@ if (opts.help) {
   process.exit(0);
 }
 
+if (opts.version) {
+  console.log(version);
+  process.exit(0);
+}
+
+if (opts.init) {
+  try {
+    writeFileSync(opts.init, INITIAL_CONFIG, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    console.log(`created ${opts.init}`);
+    process.exit(0);
+  } catch (error) {
+    if (error.code === "EEXIST") console.error(`init error: ${opts.init} already exists`);
+    else console.error(`init error: ${error.message}`);
+    process.exit(2);
+  }
+}
+
 const file = opts.config ?? process.env.ACP2API_CONFIG;
 if (!file) {
   console.error(`no config given\n\n${USAGE}`);
@@ -49,7 +79,16 @@ let config;
 try {
   config = loadConfig(file);
 } catch (e) {
-  console.error(e instanceof ConfigError ? `config error: ${e.message}` : e);
+  if (opts.doctor && opts.json) {
+    console.log(JSON.stringify({
+      ok: false,
+      config: file,
+      agents: [],
+      issues: [{ code: e instanceof ConfigError ? "config_invalid" : "could_not_verify", message: e.message ?? String(e) }],
+    }, null, 2));
+  } else {
+    console.error(e instanceof ConfigError ? `config error: ${e.message}` : e);
+  }
   process.exit(2);
 }
 
@@ -68,7 +107,78 @@ function ensureWorkspaces() {
   }
 }
 
-ensureWorkspaces();
+try {
+  ensureWorkspaces();
+} catch (error) {
+  if (opts.doctor) {
+    const report = {
+      ok: false,
+      config: file,
+      agents: [],
+      issues: [{ code: "workspace_unavailable", message: error.message }],
+    };
+    if (opts.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(`failed: workspace_unavailable: ${error.message}`);
+    process.exit(2);
+  }
+  throw error;
+}
+
+function doctorError(error) {
+  const message = error?.message ?? String(error);
+  if (error?.status === 401 || error?.code === "auth_required" || /auth(?:entication)? required|not logged in|login required/i.test(message)) {
+    return { code: "login_required", message };
+  }
+  if (/\bENOENT\b|command not found|spawn failed/i.test(message)) return { code: "cli_not_installed", message };
+  if (error?.code === "unsupported_option") return { code: "model_unavailable", message };
+  if (error?.code === "unsupported_capability") return { code: "no_mcp_transport", message };
+  return { code: "could_not_verify", message };
+}
+
+function inspectProbe(spec, probe) {
+  const issues = [];
+  for (const mcp of spec.mcpServers) {
+    if (mcp.type !== "http" && mcp.type !== "sse") continue;
+    if (!probe.capabilities.mcpCapabilities?.[mcp.type]) {
+      issues.push({ code: "no_mcp_transport", message: `MCP server "${mcp.name}" needs ${mcp.type}` });
+    }
+  }
+  return issues;
+}
+
+if (opts.doctor) {
+  const report = { ok: true, config: file, agents: [] };
+  for (const spec of config.agents) {
+    let spawnError = null;
+    const agent = new Agent(spec, config.server, (level, message) => {
+      if (level === "error") spawnError = message;
+    });
+    try {
+      // Unlike --probe, doctor validates the configured transition itself. Model
+      // selection may add or remove later selectors, so the session/new snapshot
+      // cannot prove that the final production settings are usable.
+      const probe = await agent.probe({ configure: true });
+      const issues = inspectProbe(spec, probe);
+      report.agents.push({ agent: spec.name, ok: issues.length === 0, issues, ...probe });
+      if (issues.length) report.ok = false;
+    } catch (error) {
+      report.ok = false;
+      report.agents.push({ agent: spec.name, ok: false, issues: [doctorError(spawnError ? new Error(spawnError) : error)] });
+    } finally {
+      await agent.close();
+    }
+  }
+  if (opts.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`config: ok (${config.agents.length} agent(s))`);
+    for (const agent of report.agents) {
+      console.log(`${agent.ok ? "ok" : "failed"}: ${agent.agent}`);
+      for (const issue of agent.issues) console.log(`  ${issue.code}: ${issue.message}`);
+    }
+  }
+  process.exit(report.ok ? 0 : 2);
+}
 
 if (opts.probe) {
   const spec = config.agents.find((agent) => agent.name === opts.probe);

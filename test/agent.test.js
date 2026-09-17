@@ -77,6 +77,65 @@ test("model and reasoning are applied by category, not by option id", async (t) 
   assert.equal(turn.reasoning, "thinking(high)");
 });
 
+test("a null per-turn reasoning override restores the session baseline", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  const session = await agent.openSession();
+  try {
+    const high = await agent.turn(session, [{ type: "text", text: "one" }], { overrides: { reasoning: "high" } });
+    const reset = await agent.turn(session, [{ type: "text", text: "two" }], { overrides: { reasoning: null } });
+    assert.equal(high.reasoning, "thinking(high)");
+    assert.equal(reset.reasoning, "thinking(low)");
+  } finally {
+    await agent.closeSession(session);
+  }
+});
+
+test("a null override tolerates a configured model removing the reasoning selector", async (t) => {
+  const agent = makeAgent({ agent: { model: "lite" } });
+  t.after(() => agent.close());
+  const session = await agent.openSession();
+  try {
+    const turn = await agent.turn(session, [{ type: "text", text: "hello" }], {
+      overrides: { reasoning: null },
+    });
+    assert.equal(turn.text, "[lite] hello");
+  } finally {
+    await agent.closeSession(session);
+  }
+});
+
+test("reasoning reset uses the final baseline after raw model-dependent options", async (t) => {
+  const agent = makeAgent({ agent: { model: "smart", options: { effort: "high" } } });
+  t.after(() => agent.close());
+  let session = await agent.openSession();
+  try {
+    const low = await agent.turn(session, [{ type: "text", text: "one" }], { overrides: { reasoning: "low" } });
+    const { id, resumeContext } = session;
+    await agent.closeSession(session);
+    session = await agent.resumeSession(id, resumeContext);
+    const reset = await agent.turn(session, [{ type: "text", text: "two" }], { overrides: { reasoning: null } });
+    assert.equal(low.reasoning, "thinking(low)");
+    assert.equal(reset.reasoning, "thinking(high)");
+  } finally {
+    await agent.closeSession(session);
+  }
+});
+
+test("a raw model option may remove reasoning before a null turn override", async (t) => {
+  const agent = makeAgent({ agent: { options: { model: "lite" } } });
+  t.after(() => agent.close());
+  const session = await agent.openSession();
+  try {
+    const turn = await agent.turn(session, [{ type: "text", text: "hello" }], {
+      overrides: { reasoning: null },
+    });
+    assert.equal(turn.text, "[lite] hello");
+  } finally {
+    await agent.closeSession(session);
+  }
+});
+
 test("options already at their exact current values send no set RPCs", async (t) => {
   const dir = await temporary(t);
   const capture = join(dir, "sets");
@@ -324,7 +383,6 @@ test("mcpServers from config reach session/new in ACP's own shape", async (t) =>
   const agent = makeAgent({
     agent: {
       mcpServers: [
-        { name: "http-one", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } },
         { name: "stdio-one", command: "/bin/true", env: { K: "v" } },
       ],
     },
@@ -332,14 +390,59 @@ test("mcpServers from config reach session/new in ACP's own shape", async (t) =>
   t.after(() => agent.close());
 
   assert.deepEqual(JSON.parse((await agent.prompt([{ type: "text", text: "ECHOMCP" }])).text), [
-    { type: "http", name: "http-one", url: "http://127.0.0.1:9/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
     { name: "stdio-one", command: "/bin/true", args: [], env: [{ name: "K", value: "v" }] },
   ]);
 });
 
+test("an MCP transport the agent did not advertise is rejected before session setup", async (t) => {
+  const agent = makeAgent({
+    agent: { mcpServers: [{ name: "network-tools", type: "sse", url: "http://127.0.0.1:9/sse" }] },
+  });
+  t.after(() => agent.close());
+  await assert.rejects(agent.prompt([{ type: "text", text: "must not run" }]), (error) => {
+    assert.equal(error.status, 400);
+    assert.equal(error.code, "unsupported_capability");
+    assert.match(error.message, /fake.*MCP sse capability.*network-tools/);
+    return true;
+  });
+});
+
+test("resumeContext preserves the exact cwd and full MCP declaration", async (t) => {
+  const configured = { name: "stdio-one", command: "/bin/true", args: [], env: [] };
+  const caller = { type: "http", name: "caller-tools", url: "http://127.0.0.1:9/mcp", headers: [] };
+  const agent = makeAgent({ agent: { mcpServers: [configured] } });
+  t.after(() => agent.close());
+  const opened = await agent.openSession({ mcpServers: [caller] });
+  assert.deepEqual(opened.resumeContext, {
+    cwd: agent.spec.cwd,
+    mcpServers: [configured, caller],
+    baselineReasoning: "low",
+  });
+  await agent.closeSession(opened);
+
+  const resumed = await agent.resumeSession(opened.id, opened.resumeContext);
+  assert.ok(resumed);
+  try {
+    const echoed = JSON.parse((await agent.turn(resumed, [{ type: "text", text: "ECHOMCP" }])).text);
+    assert.deepEqual(echoed, [configured, caller]);
+  } finally {
+    await agent.closeSession(resumed);
+  }
+});
+
+test("prompt content requiring an unadvertised ACP capability is rejected before prompt", async (t) => {
+  const agent = makeAgent();
+  t.after(() => agent.close());
+  await assert.rejects(
+    agent.prompt([{ type: "audio", data: "AA==", mimeType: "audio/wav" }]),
+    (error) => error.status === 400
+      && error.code === "unsupported_capability"
+      && /fake.*prompt audio capability/.test(error.message),
+  );
+});
+
 test("a warm fork carries the same configured MCP declaration as a cold session", async (t) => {
   const mcpServers = [
-    { name: "http-one", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } },
     { name: "stdio-one", command: "/bin/true", env: { K: "v" } },
   ];
   const cold = makeAgent({ agent: { mcpServers } });
@@ -349,7 +452,7 @@ test("a warm fork carries the same configured MCP declaration as a cold session"
   const coldMcp = JSON.parse((await cold.prompt([{ type: "text", text: "ECHOMCP" }])).text);
   const forkMcp = JSON.parse((await warm.prompt([{ type: "text", text: "ECHOMCP" }])).text);
   assert.deepEqual(forkMcp, coldMcp);
-  assert.equal(forkMcp.length, 2);
+  assert.equal(forkMcp.length, 1);
 });
 
 test("the first conversation after a child crash rebuilds and forks a warm base", async (t) => {

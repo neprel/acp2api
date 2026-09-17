@@ -33,14 +33,18 @@ config option. It is applied through `Agent.turn`'s `overrides` on every turn,
 including on a session that already exists — a caller may raise it for one hard
 question in the middle of a conversation and drop it again after.
 
-Chat completions cannot express this at all; do not try to add it there by inventing
-a field OpenAI does not have.
+Responses uses `reasoning.effort`; Chat uses its separate `reasoning_effort` field.
+Both map to the same ACP category, but their request spellings must not leak across
+the two public APIs.
 
 # func parseResponsesRequest {#parse}
 
 ## result
-`{model, blocks, instructions, previousResponseId, store, stream, reasoning,
-maxTokens, stop, ignored, tools, toolResults}`.
+`{model, blocks, inputBlocks, instructions, previousResponseId, store, stream,
+reasoning, maxTokens, stop, ignored, tools, toolChoice, toolsProvided,
+toolResults}`. `blocks` includes the instructions preamble for a new chain;
+`inputBlocks` contains only current input and is mandatory for continuations so
+unchanged instructions are not duplicated.
 
 ## rule store defaults to true
 OpenAI stores by default, and without retention `previous_response_id` could never
@@ -49,11 +53,12 @@ are actively served, the server rejects `store: false` with 400 `store_required`
 the agent may suspend inside a call, and retaining the response id is the only
 honest way for a later `function_call_output` request to reach that turn.
 
-## error unsupported_parameter
-`tool_choice`, `text` (structured output), `include`, `truncation` — the same
-style/contract split as chat completions, under this API's names. `tools` is read:
-the server may expose the caller's functions to the ACP agent through MCP. See
-[_.hint#param_policy](../_.hint).
+## rule unsupported_parameter errors
+`text` (structured output), `include`, `truncation`, `tool_choice: required` or a
+named choice, non-function tools, and `strict: true` — the same style/contract
+split as chat completions, under this API's names — throw `RequestError` with HTTP
+400 and code `unsupported_parameter`. `tool_choice: auto` is served; `none`
+disables caller tools for the turn. See [_.hint#param_policy](../_.hint).
 
 On a continuation, declaring tools is accepted only when the conversation already
 owns a tool bench. Adding tools to an unbenched retained session is 400: MCP servers
@@ -64,8 +69,11 @@ are fixed at `session/new`, and silently reopening would lose Responses context.
 ## rule status comes from the ACP stop reason, and incompleteness is stated
 `max_tokens` becomes `status: "incomplete"` with
 `incomplete_details.reason: "max_output_tokens"`, never a `completed` response
-holding a truncated answer. Reasoning becomes its own `reasoning` output item ahead
-of the message, matching where OpenAI puts it.
+holding a truncated answer. `refusal` becomes incomplete/content_filter and
+`cancelled` uses the official cancelled status. When no exact OpenAI mapping exists,
+the valid nearest enum is used and `x_acp2api.stop_reason` preserves the ACP value.
+Reasoning becomes its own `reasoning` output item ahead of the message, matching
+where OpenAI puts it.
 
 The response object carries the same append-only `x_acp2api` facts as Chat. Context
 and cost remain absent when the agent did not report them. In a stream the object
@@ -86,6 +94,10 @@ scattered through a request handler. Switching between reasoning and message tex
 closes the open item first — the two are separate output items, not one interleaved
 stream.
 
+`finalize(response)` closes the open item and returns a new canonical response
+snapshot. The caller must finalize before response-store admission and byte
+accounting. Terminal emitters never mutate that snapshot or their input object.
+
 Each data frame also carries `event: <payload.type>`; the terminal `[DONE]` sentinel
 remains data-only. A post-header failure uses `event: error` with the standard error
 envelope. Chat completions deliberately remains data-only.
@@ -95,23 +107,67 @@ envelope. Chat completions deliberately remains data-only.
 `renameUsage` consumes [openai.js.hint#canonical_usage](./openai.js.hint) and changes
 field names only. Cache arithmetic and totals must never be reimplemented here.
 
+# decision Responses conversations are linear, not snapshots
+
+Only the current tip may be continued. After A -> B, continuing A is 409
+`stale_previous_response`; an unknown or irrecoverable id is 404 `not_found`.
+Arbitrary branching cannot alias an old id to the current ACP session because that
+session already includes later turns.
+
+Instructions are a text preamble, not an ACP system role. An identical explicit
+value may continue without being sent a second time; changing, adding, or removing
+it is 400 `unsupported_parameter`. The protocol reference is
+https://developers.openai.com/api/reference/cli/resources/responses/methods/create.
+
+# rule Responses stream items have one canonical lifecycle
+
+Initial `response.created` and `response.in_progress` objects have status
+`in_progress` and no output items. Reasoning summary events use `summary_index` and
+`response.reasoning_summary_part.added/done`, unlike message content events.
+Interleaved message/reasoning/message runs need distinct item identities and a
+terminal output array consistent with emitted indexes. Initial response events
+must describe an in-progress response. Function calls always emit item added,
+arguments delta/done, and item done even when ACP supplies one complete argument
+string. These rules follow
+https://developers.openai.com/api/reference/resources/responses/streaming-events
+and must also be exercised through an official SDK accumulator; a local SSE parser
+alone is not compatibility evidence.
+
+# rule Responses input is validated before ACP rendering
+
+`input_text` and returned `output_text` become text. `input_image` accepts only a
+base64 `data:` URI and becomes an ACP image. `input_file.file_data` accepts the same
+inline data URI contract as Chat and becomes an ACP embedded resource. Remote URLs
+and `file_id` are rejected, not fetched or dropped. Unsupported reasoning,
+item-reference, encrypted, and computer items are explicit 400 errors. Roles and
+nested text fields must have their declared string types; malformed content never
+becomes an empty prompt. Unsupported keys within `reasoning` are reported as dotted
+paths in `x_acp2api.ignored`, never silently discarded.
+
 # test responses
 
-- `input` accepts a bare string, `{role, content}` messages, and `input_text` parts
+- `input` accepts a bare string, `{role, content}` messages, `input_text`, returned
+  `output_text`, data-URI `input_image`, and inline `input_file.file_data` parts
+- inline files require the agent's ACP `embeddedContext` capability; `file_id` and
+  remote `file_url` are rejected
 - `instructions` become an unlabelled system preamble
 - unsupported input item types are rejected rather than silently dropped
 - `previous_response_id`, `reasoning.effort`, `max_output_tokens`, `store` are mapped
 - `tools` and trailing `function_call_output` items are mapped; `text` is 400;
   `temperature` is ignored and reported
-- stop reasons map to `status`, with `incomplete_details` when truncated
+- stop reasons map only to official status/detail enums; lossy mappings preserve
+  the ACP reason in `x_acp2api.stop_reason`
 - reasoning appears as its own output item before the message
 - context and cost annotations are present only when reported, including on the terminal streamed response object
 - a conversation continues in the **same** ACP session, provable by its session id
-- a chain continues from any response in it, not only the tip
+- only the latest response in a chain continues; an older known id is 409 stale
 - an unknown `previous_response_id` is 404; a mismatched model is 400
 - `store: false` answers and retains nothing
 - `store: false` with served tools is 400 `store_required`
 - tools on an unbenched continuation are 400 without damaging the stored chain
 - new input with no tool outputs gets 409 while the tool response is pending; after
   unattended settlement releases it, new input continues the same ACP session
-- event lines match payload types; the stream is densely sequenced, correctly nested, and ends in `[DONE]`
+- event lines match payload types; the stream is densely sequenced and correctly
+  nested; reasoning indexes, interleaved item IDs, function-call events, and the
+  terminal output array agree
+- stream finalization precedes response byte accounting and mutates no admitted object

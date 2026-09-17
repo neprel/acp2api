@@ -24,8 +24,13 @@ private HTTP API: the CLI uses the login it already has, and nothing else.
 
 ## Quick start
 
+Prerequisites: Node.js 22 or newer and an ACP-capable coding CLI already signed in
+as the same OS user that will run acp2api. The bundled Claude/Codex adapters use
+those CLIs' existing login; no vendor API key is copied into this config.
+
 ```sh
 npm install -g acp2api
+acp2api --init ./acp2api.yaml
 ```
 
 ```yaml
@@ -33,21 +38,21 @@ npm install -g acp2api
 server:
   cwd: ./work                # the agents' workspace, and their fs boundary
 agents:
-  - name: claude-opus        # <- the model id clients ask for
+  - name: claude             # <- the model id clients ask for
     type: claude
-    model: opus
-  - name: codex
-    type: codex
 ```
 
 ```sh
+acp2api --config acp2api.yaml --doctor
 acp2api --config acp2api.yaml
 curl localhost:10021/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"claude-opus","messages":[{"role":"user","content":"what is in this repo?"}]}'
+  -d '{"model":"claude","messages":[{"role":"user","content":"what is in this repo?"}]}'
 ```
 
-That is a working install. There is **no authentication**: acp2api listens on
-loopback and authorization belongs to whatever router sits in front.
+Edit the generated agent name/type if needed, then start it. `--init` requires an
+explicit path and never overwrites a file. There is **no HTTP authentication**:
+acp2api listens on loopback and authorization belongs to whatever router sits in
+front.
 
 ## What it gives you
 
@@ -61,7 +66,7 @@ exercises it, in [the guide](docs/guide.md).
 | [**Conversations, not cold starts**](docs/guide.md#continuity-a-stateless-caller-becomes-a-conversation) | replaying a transcript per message throws away everything the agent had learned; incoming histories match live sessions by prefix |
 | [**Naming a conversation**](docs/guide.md#naming-a-conversation-when-inferring-it-cannot-work) | one `x-conversation-id` header keeps one agent session per chat thread, for callers with no growing prefix to match |
 | [**Steering a running turn**](docs/guide.md#saying-something-while-the-turn-is-still-running) | deliver a correction INTO a turn that has nineteen minutes left |
-| [**Parking, not forgetting**](docs/guide.md#going-quiet-does-not-lose-the-work) | an idle thread gives back its process and keeps its memory (`session/resume`) |
+| [**Parking, not forgetting**](docs/guide.md#going-quiet-does-not-lose-the-work) | an idle thread closes its ACP session for later `session/resume`; the shared agent process remains reusable |
 | [**Warm starts**](docs/guide.md#starting-warm-instead-of-cold) | one warm-up forked per conversation instead of a re-orientation per thread |
 | [**Watching the work**](docs/guide.md#watching-a-turn-happen) | tool calls, diffs and plans on `reasoning_content`, so a long turn stops looking like a hang |
 | [**Running commands yourself**](docs/guide.md#running-the-agents-commands-yourself) | ACP `terminal`: execution in your process, with your bounds |
@@ -72,9 +77,10 @@ exercises it, in [the guide](docs/guide.md).
 
 ## Which agents work
 
-Measured, not inferred: all **38 registry agents** were installed and driven on
-2026-08-14 — full results in [docs/agents.md](docs/agents.md). Verified end to
-end (real turn, own file tools, MCP, streaming, continuity):
+The dated survey in [docs/agents.md](docs/agents.md) separates three different
+facts: ACP handshake, session setup (including login), and a completed live turn.
+The following agents completed the survey's end-to-end scenario in its recorded
+environment; that is not a promise that current releases or your login still do:
 
 | agent | run as |
 | --- | --- |
@@ -103,16 +109,24 @@ in [`acp2api.example.yaml`](acp2api.example.yaml). The essentials:
 
 ```sh
 acp2api --config acp2api.yaml --check   # validate and exit
+acp2api --config acp2api.yaml --doctor  # setup every agent, no prompt/login change
+acp2api --config acp2api.yaml --doctor --json
 acp2api --config acp2api.yaml --probe claude-opus  # live models/options, no prompt
 ```
 
-Agent model lists move independently of acp2api. When a configured value stops
-working, `--probe` is the supported way to print that agent's current option ids,
-categories, types, named values, and capability highlights. It performs only ACP
-startup and session setup; it never sends a prompt or spends a turn.
+Agent model lists move independently of acp2api. `--doctor` applies the configured
+model first and then validates the resulting reasoning, mode and raw-option set,
+so model-dependent selectors are checked in their final configuration. `--probe`
+prints one agent's initial option ids, categories, types, named values and
+capability highlights without applying the config. Neither command sends a prompt,
+performs warm-up or changes login.
 
 Routes: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (SSE with
 `stream: true`), `POST/GET/DELETE /v1/responses`.
+
+See the exact supported/emulated/ignored/refused surface in the
+[compatibility matrix](docs/compatibility.md), and runnable official-SDK examples
+for [JavaScript](examples/openai-sdk.mjs) and [Python](examples/openai_sdk.py).
 
 ## Running in a container
 
@@ -133,9 +147,22 @@ docker run --rm -it \
   'npm install -g --include=optional /tmp/acp2api.tgz && exec acp2api --config /etc/acp2api.yaml'
 ```
 
-The container config must use `server.host: 0.0.0.0` so Docker can reach the
-listener and `server.cwd: /workspace` so the agent sees the mounted files. The
-host-side `127.0.0.1` binding above preserves the bridge's no-auth local posture.
+The container config must name the published authority explicitly while keeping
+Host validation enabled:
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 10021
+  allowedHosts: ["localhost:10021", "127.0.0.1:10021"]
+  cwd: /workspace
+```
+
+`0.0.0.0` lets Docker reach the listener; it does not automatically trust the
+host-side name in an incoming `Host` header. `allowedHosts` above permits the two
+loopback URLs normally used with this exact `-p 127.0.0.1:10021:10021` mapping
+without disabling the DNS-rebinding guard. The host-side loopback binding preserves
+the bridge's no-auth local posture.
 Mount the corresponding login directory for another adapter. If a configured
 model name has moved, run the same image with `--probe <agent-name>` appended;
 the probe prints the live option values without sending a prompt.
@@ -175,6 +202,9 @@ fails on drift).
 - [Agent Client Protocol](https://agentclientprotocol.com) — the protocol
 - [typescript-sdk](https://github.com/agentclientprotocol/typescript-sdk) · [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) · [codex-acp](https://github.com/agentclientprotocol/codex-acp)
 - [the guide](docs/guide.md) — every feature, with the request that exercises it
+- [compatibility matrix](docs/compatibility.md) — precise supported subset
+- [operations](docs/operations.md) — exposure, state, cleanup and retry hazards
+- [migration notes](docs/migration.md) — intentional behavior changes
 - [which agents work](docs/agents.md) — the measured 38-agent survey
 
 ## License

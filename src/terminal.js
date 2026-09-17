@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { isAbsolute, relative, resolve } from "node:path";
+import { constants, lstatSync, realpathSync } from "node:fs";
+import { mkdir, open } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 /**
  * Commands the agent runs, executed here instead of inside it.
@@ -20,10 +22,107 @@ import { isAbsolute, relative, resolve } from "node:path";
  * take back than a file write.
  */
 
-/** True when `child` is inside `root` -- the same containment `fs/*` uses. */
+/** True when an already-resolved `child` is lexically inside canonical `root`. */
 function within(root, child) {
-  const rel = relative(root, resolve(root, child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  const rel = relative(root, child);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * Fail-closed path resolution shared by ACP fs callbacks and terminal cwd.
+ *
+ * Every symlink component is refused, including broken links and links that point
+ * back inside. This is path validation, not a filesystem sandbox: Node has no
+ * portable openat-style API, so a hostile local process can still race an
+ * intermediate component. Final file opens additionally use O_NOFOLLOW.
+ */
+export class WorkspacePaths {
+  constructor(cwd) {
+    try {
+      this.configuredCwd = resolve(cwd);
+      this.cwd = realpathSync(cwd);
+    } catch (error) {
+      throw new Error(`workspace is not accessible: ${cwd}: ${error.message}`);
+    }
+  }
+
+  resolve(path, { allowMissing = false, directory = false } = {}) {
+    if (typeof path !== "string" || path.length === 0) throw new Error("workspace path must be a non-empty string");
+    if (path.split(/[\\/]/).includes("..")) throw new Error(`path traversal is not allowed: ${path}`);
+
+    let target;
+    if (isAbsolute(path)) {
+      // ACP paths are absolute. The configured spelling may itself resolve to a
+      // canonical spelling (notably /var -> /private/var on macOS), so map an
+      // in-root request onto the canonical root before inspecting components.
+      const root = within(this.cwd, path) ? this.cwd : this.configuredCwd;
+      if (!within(root, path)) throw new Error(`path outside workspace: ${path}`);
+      target = resolve(this.cwd, relative(root, path));
+    } else {
+      target = resolve(this.cwd, path);
+    }
+    if (!within(this.cwd, target)) throw new Error(`path outside workspace: ${path}`);
+    const rel = relative(this.cwd, target);
+    const parts = rel === "" ? [] : rel.split(sep);
+
+    let current = this.cwd;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part || part === ".") continue;
+      current = resolve(current, part);
+      let stat;
+      try {
+        stat = lstatSync(current);
+      } catch (error) {
+        if (error.code === "ENOENT" && allowMissing) return target;
+        throw new Error(`workspace path is not accessible: ${path}: ${error.message}`);
+      }
+      if (stat.isSymbolicLink()) throw new Error(`symbolic links are not allowed in workspace paths: ${path}`);
+      if (i < parts.length - 1 && !stat.isDirectory()) {
+        throw new Error(`workspace path parent is not a directory: ${path}`);
+      }
+      if (i === parts.length - 1 && directory && !stat.isDirectory()) {
+        throw new Error(`workspace path is not a directory: ${path}`);
+      }
+    }
+
+    let canonical;
+    try {
+      canonical = realpathSync(target);
+    } catch (error) {
+      if (error.code === "ENOENT" && allowMissing) return target;
+      throw new Error(`workspace path is not accessible: ${path}: ${error.message}`);
+    }
+    if (!within(this.cwd, canonical)) throw new Error(`path outside workspace: ${path}`);
+    return canonical;
+  }
+
+  async readTextFile(path) {
+    const target = this.resolve(path);
+    const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      return await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async writeTextFile(path, content) {
+    let target = this.resolve(path, { allowMissing: true });
+    await mkdir(dirname(target), { recursive: true });
+    this.resolve(dirname(target), { directory: true });
+    target = this.resolve(path, { allowMissing: true });
+    const handle = await open(
+      target,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+      0o666,
+    );
+    try {
+      await handle.writeFile(content, "utf8");
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 /**
@@ -132,7 +231,8 @@ export class Terminals {
    * @param {number} opts.timeoutMs wall-clock bound on a single command
    */
   constructor({ cwd, max = 8, outputByteLimit = 1_048_576, timeoutMs = 1_800_000, log = () => {} } = {}) {
-    this.cwd = cwd;
+    this.paths = new WorkspacePaths(cwd);
+    this.cwd = this.paths.cwd;
     this.max = max;
     this.outputByteLimit = outputByteLimit;
     this.timeoutMs = timeoutMs;
@@ -148,8 +248,7 @@ export class Terminals {
     if (running >= this.max) {
       throw new Error(`too many terminals open (${this.max}); release one first`);
     }
-    const dir = cwd ? resolve(this.cwd, cwd) : this.cwd;
-    if (!within(this.cwd, dir)) throw new Error(`cwd outside workspace: ${cwd}`);
+    const dir = this.paths.resolve(cwd || ".", { directory: true });
 
     const child = spawn(command, args, {
       cwd: dir,

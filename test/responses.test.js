@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Agent } from "../src/agent.js";
 import { normalizeConfig } from "../src/config.js";
 import { createServer } from "../src/server.js";
-import { parseResponsesRequest, responseObject, toInputBlocks } from "../src/responses.js";
+import { parseResponsesRequest, responseObject, ResponseStream, toInputBlocks } from "../src/responses.js";
 import { SessionStore } from "../src/sessions.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -84,10 +84,81 @@ test("input accepts a bare string, messages, and typed input_text parts", () => 
   // A call this server made and its answer are part of the record, not something
   // to say to the agent again -- it is still sitting inside that call.
   assert.deepEqual(
-    toInputBlocks([{ role: "user", content: "hi" }, { type: "function_call" }, { type: "function_call_output" }]),
+    toInputBlocks([
+      { role: "user", content: "hi" },
+      { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "ok" },
+    ]),
     [{ type: "text", text: "hi" }],
   );
   assert.throws(() => toInputBlocks([{ type: "computer_call" }]), /are not supported/);
+});
+
+test("inline images/files and returned output_text are normalized to ACP blocks", () => {
+  assert.deepEqual(
+    toInputBlocks([{ role: "user", content: [
+      { type: "input_text", text: "look" },
+      { type: "input_image", image_url: "data:image/png;base64,YQ==" },
+    ] }]),
+    [{ type: "text", text: "look" }, { type: "image", mimeType: "image/png", data: "YQ==" }],
+  );
+  assert.deepEqual(
+    toInputBlocks([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "prior" }] }]),
+    [{ type: "text", text: "Assistant: prior" }],
+  );
+  assert.deepEqual(
+    toInputBlocks([{ role: "user", content: [
+      { type: "input_text", text: "read" },
+      { type: "input_file", filename: "a.txt", file_data: "data:text/plain;base64,aGk=" },
+    ] }]),
+    [
+      { type: "text", text: "read" },
+      { type: "resource", resource: { uri: "file:///a.txt", mimeType: "text/plain", text: "hi" } },
+    ],
+  );
+  assert.throws(
+    () => toInputBlocks([{ role: "user", content: [{ type: "input_image", image_url: "https://example.com/x.png" }] }]),
+    /base64 data: URI/,
+  );
+  assert.throws(
+    () => toInputBlocks([{ role: "user", content: [{ type: "input_image", file_id: "file_1" }] }]),
+    /file_id/,
+  );
+  assert.throws(
+    () => toInputBlocks([{ role: "user", content: [{ type: "input_file", file_url: "https://example.com/a.txt" }] }]),
+    /not fetched/,
+  );
+  for (const type of ["reasoning", "item_reference", "encrypted_content"]) {
+    assert.throws(() => toInputBlocks([{ type }]), new RegExp(`type "${type}"`));
+  }
+});
+
+test("a Responses inline file is rejected when the agent lacks embeddedContext", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp2api-no-resource-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const fixture = join(dir, "fake-agent.mjs");
+  const source = (await readFile(FIXTURE, "utf8"))
+    .replace('"@agentclientprotocol/sdk"', JSON.stringify(import.meta.resolve("@agentclientprotocol/sdk")))
+    .replace(
+      "promptCapabilities: { image: true, embeddedContext: true }",
+      "promptCapabilities: { image: true, embeddedContext: false }",
+    );
+  await writeFile(fixture, source);
+  const config = normalizeConfig({
+    server: { host: "127.0.0.1", cwd: here },
+    agents: [{ name: "no-resource", type: "general", command: process.execPath, args: [fixture] }],
+  }, { baseDir: here, env: {} });
+  const agent = new Agent(config.agents[0], config.server, () => {});
+  t.after(() => agent.close());
+  const { blocks } = parseResponsesRequest({
+    model: "no-resource",
+    input: [{ role: "user", content: [
+      { type: "input_file", filename: "a.txt", file_data: "data:text/plain;base64,aGk=" },
+    ] }],
+  });
+  await assert.rejects(agent.prompt(blocks), (error) => error.status === 400
+    && error.code === "unsupported_capability"
+    && /no-resource.*embeddedContext/.test(error.message));
 });
 
 test("parseResponsesRequest maps the fields ACP can carry", () => {
@@ -102,8 +173,10 @@ test("parseResponsesRequest maps the fields ACP can carry", () => {
   });
   assert.equal(r.model, "m");
   assert.equal(r.instructions, "sys");
+  assert.deepEqual(r.blocks, [{ type: "text", text: "sys\n\nhi" }]);
+  assert.deepEqual(r.inputBlocks, [{ type: "text", text: "hi" }]);
   assert.equal(r.previousResponseId, "resp_1");
-  // The one genuinely per-request agent setting -- chat completions has no field for it.
+  // Both APIs expose the override, under different public spellings.
   assert.equal(r.reasoning, "high");
   assert.equal(r.maxTokens, 50);
   assert.equal(r.stream, true);
@@ -112,14 +185,43 @@ test("parseResponsesRequest maps the fields ACP can carry", () => {
   assert.equal(parseResponsesRequest({ model: "m", input: "hi", store: false }).store, false);
 });
 
+test("Responses nested parameters are classified instead of silently disappearing", () => {
+  const parsed = parseResponsesRequest({
+    model: "m",
+    input: "hi",
+    reasoning: { effort: "high", summary: "auto", future_option: true },
+  });
+  assert.equal(parsed.reasoning, "high");
+  assert.deepEqual(parsed.ignored, ["reasoning.future_option", "reasoning.summary"]);
+});
+
 test("text.format is refused; style parameters are ignored; tools are read", () => {
   // `tools` used to be refused here on the grounds that an ACP agent cannot return
   // a tool call. It can now -- served as an MCP server, reported as a
   // `function_call` output item -- so the parameter is read rather than rejected.
-  assert.deepEqual(parseResponsesRequest({ model: "m", input: "hi", tools: [{ type: "function" }] }).tools.length, 1);
+  assert.deepEqual(
+    parseResponsesRequest({ model: "m", input: "hi", tools: [{ type: "function", name: "f" }] }).tools.length,
+    1,
+  );
   assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", text: {} }), /structured output/);
   assert.deepEqual(parseResponsesRequest({ model: "m", input: "hi", temperature: 0 }).ignored, ["temperature"]);
   assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", max_output_tokens: 0 }), /positive integer/);
+  assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", stream: "yes" }), /boolean/);
+  assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", instructions: 1 }), /instructions/);
+  assert.throws(() => parseResponsesRequest({ model: "m", input: "hi", tools: {} }), /array/);
+  assert.equal(parseResponsesRequest({ model: "m", input: "hi", tools: TOOLS }).toolChoice, "auto");
+  assert.deepEqual(
+    parseResponsesRequest({ model: "m", input: "hi", tools: TOOLS, tool_choice: "none" }).tools,
+    [],
+  );
+  assert.throws(
+    () => parseResponsesRequest({ model: "m", input: "hi", tools: TOOLS, tool_choice: "required" }),
+    /cannot guarantee/,
+  );
+  assert.throws(
+    () => parseResponsesRequest({ model: "m", input: "hi", tools: [{ ...TOOLS[0], strict: true }] }),
+    /strict is not supported/,
+  );
 });
 
 test("responseObject maps stop reasons to status and incomplete_details", () => {
@@ -137,6 +239,80 @@ test("responseObject maps stop reasons to status and incomplete_details", () => 
   assert.equal(cut.output[0].type, "reasoning");
   assert.equal(cut.output[0].summary[0].text, "why");
   assert.equal(cut.output[1].type, "message");
+
+  const refusal = responseObject({ ...meta, text: "no", reasoning: "", stopReason: "refusal", usage: null });
+  assert.equal(refusal.status, "incomplete");
+  assert.deepEqual(refusal.incomplete_details, { reason: "content_filter" });
+
+  const cancelled = responseObject({ ...meta, text: "", reasoning: "", stopReason: "cancelled", usage: null });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.incomplete_details, null);
+
+  const lossy = responseObject({ ...meta, text: "", reasoning: "", stopReason: "max_turn_requests", usage: null });
+  assert.equal(lossy.status, "incomplete");
+  assert.equal(lossy.x_acp2api.stop_reason, "max_turn_requests");
+});
+
+test("ResponseStream uses canonical ordered items, reasoning indexes, and function-call events", () => {
+  const response = responseObject({
+    id: "resp_1", model: "m", created: 1, store: false, text: "ab", reasoning: "xy",
+    stopReason: "end_turn", usage: null,
+    calls: [{ id: "call_1", name: "lookup", arguments: '{"q":"x"}' }],
+  });
+  const events = [];
+  const stream = new ResponseStream((event) => events.push(event), { id: response.id, response });
+  stream.created();
+  stream.delta("reasoning", "x");
+  stream.delta("message", "a");
+  stream.delta("reasoning", "y");
+  stream.delta("message", "b");
+  const finalized = stream.finalize(response);
+  stream.completed(finalized);
+
+  assert.equal(events[0].response.status, "in_progress");
+  assert.deepEqual(events[0].response.output, []);
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index));
+  const added = events.filter((event) => event.type === "response.output_item.added");
+  assert.deepEqual(added.map((event) => event.output_index), [0, 1, 2, 3, 4]);
+  assert.equal(new Set(added.map((event) => event.item.id)).size, 5);
+
+  const summaryEvents = events.filter((event) => event.type.startsWith("response.reasoning_summary"));
+  assert.ok(summaryEvents.length > 0);
+  assert.ok(summaryEvents.every((event) => event.summary_index === 0));
+  assert.ok(summaryEvents.every((event) => !("content_index" in event)));
+  assert.equal(events.filter((event) => event.type === "response.function_call_arguments.delta").length, 1);
+  assert.equal(events.filter((event) => event.type === "response.function_call_arguments.done").length, 1);
+
+  const terminal = events.at(-1);
+  assert.equal(terminal.type, "response.completed");
+  assert.deepEqual(terminal.response.output.map((item) => item.id), added.map((event) => event.item.id));
+  assert.deepEqual(terminal.response.output.map((item) => item.type), [
+    "reasoning", "message", "reasoning", "message", "function_call",
+  ]);
+  assert.equal(terminal.response.output_text, "ab");
+});
+
+test("ResponseStream finalizes an immutable canonical object before byte accounting", () => {
+  const response = responseObject({
+    id: "resp_many", model: "m", created: 1, store: true, text: "", reasoning: "",
+    stopReason: "end_turn", usage: null,
+  });
+  const before = structuredClone(response);
+  const events = [];
+  const stream = new ResponseStream((event) => events.push(event), { id: response.id, response });
+  for (let i = 0; i < 20; i++) {
+    stream.delta("message", `m${i}`);
+    stream.delta("reasoning", `r${i}`);
+  }
+  const finalized = stream.finalize(response);
+  const admittedBytes = Buffer.byteLength(JSON.stringify(finalized));
+  stream.completed(finalized);
+
+  assert.deepEqual(response, before, "finalization must not mutate a previously measured object");
+  assert.equal(finalized.output.length, 40);
+  assert.ok(admittedBytes > Buffer.byteLength(JSON.stringify(response)) * 4);
+  assert.deepEqual(events.at(-1).response, finalized);
+  assert.equal(Buffer.byteLength(JSON.stringify(events.at(-1).response)), admittedBytes);
 });
 
 test("a response is created, stored, fetched and deleted", async (t) => {
@@ -227,12 +403,13 @@ test("two concurrent Responses continuations cannot prompt one session", async (
   assert.ok(!(await firstContinuation.json()).output_text.includes("must not run"));
 });
 
-test("a chain can be continued from any response in it, not only its tip", async (t) => {
+test("only the latest response in a linear chain can be continued", async (t) => {
   const call = await start(t);
   const first = await (await call("/v1/responses", post({ model: "fake", input: "one" }))).json();
   await call("/v1/responses", post({ model: "fake", input: "two", previous_response_id: first.id }));
   const branched = await call("/v1/responses", post({ model: "fake", input: "three", previous_response_id: first.id }));
-  assert.equal(branched.status, 200);
+  assert.equal(branched.status, 409);
+  assert.equal((await branched.json()).error.code, "stale_previous_response");
 });
 
 test("an unknown or expired previous_response_id is 404, and a mismatched model 400", async (t) => {
@@ -318,7 +495,11 @@ test("a streaming tool-enabled response timeout reports an error without complet
   const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
   assert.ok(events.some((e) => e.type === "response.output_text.delta" && /PARTIAL:s\d+/.test(e.delta)));
   assert.equal(frames.at(-2).event, "error");
-  assert.equal(events.at(-1).error.code, "timeout");
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).code, "timeout");
+  assert.equal(events.at(-1).param, null);
+  assert.equal(typeof events.at(-1).message, "string");
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index));
   assert.ok(events.every((e) => e.type !== "response.completed"));
 });
 
@@ -332,7 +513,11 @@ test("a Responses stream reports an agent failure after output as an SSE error",
   const events = frames.slice(0, -1).map((f) => JSON.parse(f.data));
   assert.ok(events.some((e) => e.type === "response.reasoning_summary_text.delta"));
   assert.equal(frames.at(-2).event, "error");
-  assert.equal(events.at(-1).error.code, "agent_error");
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).code, "agent_error");
+  assert.equal(events.at(-1).param, null);
+  assert.equal(typeof events.at(-1).message, "string");
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index));
   assert.ok(events.every((e) => e.type !== "response.completed"));
 });
 
@@ -351,13 +536,15 @@ test("the event stream is typed, ordered and terminated", async (t) => {
       "response.created",
       "response.in_progress",
       "response.output_item.added",
-      "response.content_part.added",
+      "response.reasoning_summary_part.added",
       "response.reasoning_summary_text.delta",
       "response.reasoning_summary_text.done",
-      "response.content_part.done",
+      "response.reasoning_summary_part.done",
       "response.output_item.done",
+      "response.content_part.added",
       "response.output_text.delta",
       "response.output_text.done",
+      "response.content_part.done",
       "response.completed",
     ],
   );
@@ -733,6 +920,23 @@ test("a streaming turn that stops for a tool ends with the call in the terminal 
   assert.equal(done.type, "response.completed");
   const fc = done.response.output.find((o) => o.type === "function_call");
   assert.equal(fc.name, "read_file");
+  const callAdded = events.find(
+    (event) => event.type === "response.output_item.added" && event.item.type === "function_call",
+  );
+  assert.ok(callAdded, "the function call has an output-item lifecycle");
+  assert.equal(callAdded.item.status, "in_progress");
+  assert.equal(
+    events.find((event) => event.type === "response.function_call_arguments.delta")?.item_id,
+    callAdded.item.id,
+  );
+  assert.equal(
+    events.find((event) => event.type === "response.function_call_arguments.done")?.arguments,
+    fc.arguments,
+  );
+  assert.equal(
+    events.find((event) => event.type === "response.output_item.done" && event.item.type === "function_call")?.item.id,
+    callAdded.item.id,
+  );
   // Sequence numbers are the contract for a consumer that tracks them.
   assert.deepEqual(events.map((e) => e.sequence_number), events.map((_, i) => i));
 });

@@ -1,6 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Tail, Terminals } from "../src/terminal.js";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+import { Tail, Terminals, WorkspacePaths } from "../src/terminal.js";
+
+async function workspace(t) {
+  const parent = await mkdtemp(join(tmpdir(), "acp2api-paths-"));
+  const root = join(parent, "workspace");
+  const outside = join(parent, "outside");
+  await mkdir(root);
+  await mkdir(outside);
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  return { parent, root, outside, paths: new WorkspacePaths(root) };
+}
 
 test("the tail keeps the END of the output, which is the part that says what happened", () => {
   const tail = new Tail(10);
@@ -59,6 +72,88 @@ test("a working directory outside the workspace is refused", () => {
   assert.throws(
     () => terms.create({ command: process.execPath, args: ["-e", "0"], cwd: "/" }),
     /outside workspace/,
+  );
+});
+
+test("ACP absolute paths inside the workspace are accepted", async (t) => {
+  const { root, paths } = await workspace(t);
+  const existing = join(root, "existing.txt");
+  await writeFile(existing, "from ACP");
+
+  assert.equal(paths.resolve(root, { directory: true }), paths.cwd);
+  assert.equal(paths.resolve(existing), join(paths.cwd, "existing.txt"));
+  assert.equal(await paths.readTextFile(existing), "from ACP");
+
+  const directory = join(root, "terminal-cwd");
+  await mkdir(directory);
+  const terms = new Terminals({ cwd: root });
+  const id = terms.create({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write(process.cwd())"],
+    cwd: directory,
+  });
+  await terms.waitForExit(id);
+  assert.equal(terms.output(id).output, join(paths.cwd, "terminal-cwd"));
+  terms.release(id);
+});
+
+test("workspace paths reject traversal and absolute paths outside the workspace", async (t) => {
+  const { root, outside, paths } = await workspace(t);
+  assert.throws(() => paths.resolve("../outside"), /traversal/);
+  assert.throws(() => paths.resolve(`${root}${sep}nested${sep}..${sep}file`, { allowMissing: true }), /traversal/);
+  assert.throws(() => paths.resolve(join(outside, "file"), { allowMissing: true }), /outside workspace/);
+  assert.equal(paths.resolve("..name", { allowMissing: true }), join(paths.cwd, "..name"));
+});
+
+test("workspace paths reject file, directory, and broken symlinks", async (t) => {
+  const { root, outside, paths } = await workspace(t);
+  await writeFile(join(outside, "secret"), "secret");
+  await symlink(join(outside, "secret"), join(root, "file-link"));
+  await symlink(outside, join(root, "dir-link"));
+  await symlink(join(outside, "missing"), join(root, "broken-link"));
+
+  for (const path of ["file-link", "dir-link/secret", "broken-link"]) {
+    assert.throws(() => paths.resolve(path, { allowMissing: true }), /symbolic links are not allowed/);
+    assert.throws(() => paths.resolve(join(root, path), { allowMissing: true }), /symbolic links are not allowed/);
+  }
+  await assert.rejects(paths.readTextFile("file-link"), /symbolic links are not allowed/);
+  await assert.rejects(paths.readTextFile(join(root, "file-link")), /symbolic links are not allowed/);
+  await assert.rejects(paths.writeTextFile("dir-link/new", "nope"), /symbolic links are not allowed/);
+  assert.equal(await readFile(join(outside, "secret"), "utf8"), "secret");
+});
+
+test("workspace writes validate existing parents and safely create new ones", async (t) => {
+  const { root, paths } = await workspace(t);
+  await mkdir(join(root, "existing"));
+  await paths.writeTextFile("existing/new/child.txt", "ok");
+  assert.equal(await paths.readTextFile("existing/new/child.txt"), "ok");
+
+  await writeFile(join(root, "not-a-directory"), "x");
+  await assert.rejects(paths.writeTextFile("not-a-directory/child", "nope"), /parent is not a directory/);
+});
+
+test("workspace writes create and overwrite files at the workspace root", async (t) => {
+  const { root, paths } = await workspace(t);
+  const relativeTarget = "new.txt";
+  const absoluteTarget = join(root, "absolute.txt");
+
+  await paths.writeTextFile(relativeTarget, "created");
+  assert.equal(await readFile(join(root, relativeTarget), "utf8"), "created");
+  await paths.writeTextFile(relativeTarget, "overwritten");
+  assert.equal(await paths.readTextFile(relativeTarget), "overwritten");
+
+  await paths.writeTextFile(absoluteTarget, "absolute");
+  assert.equal(await paths.readTextFile(absoluteTarget), "absolute");
+});
+
+test("terminal cwd rejects symlinked directories even when they point inside", async (t) => {
+  const { root } = await workspace(t);
+  await mkdir(join(root, "real"));
+  await symlink(join(root, "real"), join(root, "linked"));
+  const terms = new Terminals({ cwd: root });
+  assert.throws(
+    () => terms.create({ command: process.execPath, args: ["-e", "0"], cwd: "linked" }),
+    /symbolic links are not allowed/,
   );
 });
 

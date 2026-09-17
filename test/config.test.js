@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, expandEnv, loadConfig, normalizeConfig, resolvePreset } from "../src/config.js";
@@ -96,6 +96,16 @@ test("CORS is off by default and accepts an origin or an explicit wildcard", () 
   assert.throws(() => load({ ...minimal, server: { cors: 1 } }), /server\.cors/);
 });
 
+test("allowedHosts is an explicit list for proxy and Docker host names", () => {
+  assert.deepEqual(load(minimal).server.allowedHosts, []);
+  assert.deepEqual(
+    load({ ...minimal, server: { allowedHosts: ["proxy.example:443", "[::1]:10021"] } }).server.allowedHosts,
+    ["proxy.example:443", "[::1]:10021"],
+  );
+  assert.throws(() => load({ ...minimal, server: { allowedHosts: "proxy.example:443" } }), /allowedHosts/);
+  assert.throws(() => load({ ...minimal, server: { allowedHosts: [""] } }), /allowedHosts/);
+});
+
 test("${VAR} expands, ${VAR:-default} falls back, an unset bare VAR is fatal", () => {
   assert.equal(expandEnv("a-${X}-b", { X: "1" }), "a-1-b");
   assert.equal(expandEnv("${MISSING:-fallback}", {}), "fallback");
@@ -189,7 +199,7 @@ test("loadConfig reads YAML and reports the file in errors", () => {
   assert.equal(c.server.port, 1234);
   assert.equal(c.server.host, "secret");
   assert.equal(c.agents[0].model, "opus");
-  assert.equal(c.server.cwd, dir);
+  assert.equal(c.server.cwd, realpathSync(dir));
 
   writeFileSync(file, "agents: []\n");
   assert.throws(() => loadConfig(file, { env: {} }), new RegExp(file));
@@ -205,4 +215,46 @@ test("loadConfig presents an invalid limit pattern as a path-qualified ConfigErr
     (error) => error instanceof ConfigError && error.message.includes(file)
       && error.message.includes('invalid regex "[broken"'),
   );
+});
+
+test("loadConfig canonicalizes existing workspaces and the ancestor of a new workspace", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "acp2api-workspace-config-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const actual = join(dir, "actual");
+  const linked = join(dir, "linked");
+  mkdirSync(actual);
+  symlinkSync(actual, linked);
+  const file = join(dir, "config.yaml");
+  writeFileSync(file, `server:\n  cwd: ${JSON.stringify(linked)}\nagents:\n  - name: a\n    type: claude\n`);
+  const config = loadConfig(file, { env: {} });
+  assert.equal(config.server.cwd, realpathSync(actual));
+  assert.equal(config.agents[0].cwd, realpathSync(actual));
+
+  writeFileSync(file, "server:\n  cwd: missing\nagents:\n  - name: a\n    type: claude\n");
+  const missing = loadConfig(file, { env: {} });
+  assert.equal(missing.server.cwd, join(realpathSync(dir), "missing"));
+  assert.equal(missing.agents[0].cwd, join(realpathSync(dir), "missing"));
+
+  const broken = join(dir, "broken");
+  symlinkSync(join(dir, "does-not-exist"), broken);
+  writeFileSync(file, `server:\n  cwd: ${JSON.stringify(broken)}\nagents:\n  - name: a\n    type: claude\n`);
+  assert.throws(() => loadConfig(file, { env: {} }), /broken symbolic link/);
+});
+
+test("response storage limits have finite defaults and validate overrides", () => {
+  const defaults = load(minimal).server;
+  assert.equal(defaults.maxConversations, 1_000);
+  assert.equal(defaults.maxResponses, 1_000);
+  assert.equal(defaults.maxResponseBytes, 64 * 1024 * 1024);
+  const configured = load({
+    ...minimal,
+    server: { maxConversations: "7", maxResponses: 8, maxResponseBytes: "4096" },
+  }).server;
+  assert.deepEqual(
+    [configured.maxConversations, configured.maxResponses, configured.maxResponseBytes],
+    [7, 8, 4096],
+  );
+  for (const key of ["maxConversations", "maxResponses", "maxResponseBytes"]) {
+    assert.throws(() => load({ ...minimal, server: { [key]: 0 } }), new RegExp(key));
+  }
 });

@@ -20,8 +20,9 @@ a VPN on purpose.
 Renders OpenAI `messages` into ACP content blocks.
 
 ## arg messages
-The OpenAI array. Rejected when empty, when a message lacks `role`, or when it
-contains only system messages.
+The OpenAI array. Rejected when empty, when a message lacks a supported role, when
+tool calls/results lack their required nested fields, or when it contains only
+system messages. Text parts accept `text`, `input_text`, and `output_text`.
 
 ## result
 `[{type: "text", text}, ...attachments]` — always exactly one text block first,
@@ -82,12 +83,18 @@ Streaming holds back the longest trailing prefix of every configured stop sequen
 The agent flushes it only if the turn ends without completing a match; emitting it
 immediately would leak part of a stop sequence that spans ACP chunks.
 
+When several stop strings match, the earliest position in the output wins rather
+than their array order. When a stop and approximate length cutoff compete, the
+earlier visible boundary wins. Length truncation operates on Unicode code points
+and never emits half of a surrogate pair.
+
 # data estimateTokens {#token_estimate}
 
-`Math.ceil(text.length / 4)`. Deliberately crude and documented as such: the agent
+`Math.ceil(Array.from(text).length / 4)`. Deliberately crude and documented as such: the agent
 picks the model, so no tokenizer here can be correct. `max_tokens` is a budget, not
-an accountant. Do not replace this with a real tokenizer without also deciding which
-model's tokenizer it is supposed to be.
+an accountant and does not control reasoning, spend, or internal inference calls.
+Do not replace this with a real tokenizer without also deciding which model's
+tokenizer it is supposed to be.
 
 # rule ACP usage is per SESSION; a response reports per TURN {#usage_is_cumulative}
 
@@ -145,7 +152,9 @@ passes while production is wrong again.
 `completion`, `chunk` and `usageChunk` emit exactly what OpenAI emits, plus
 `reasoning_content` and `x_acp2api` — both omitted entirely when empty rather than
 sent as `""` or `[]`. An unknown future ACP stop reason maps to `"stop"`, never to
-an invalid `finish_reason` that a strict client would reject.
+an invalid `finish_reason` that a strict client would reject. Lossy mappings,
+including ACP `cancelled` to Chat `stop`, preserve the original value as
+`x_acp2api.stop_reason`.
 
 `x_acp2api` is consumed by external tooling and is append-only: existing fields
 must never be renamed or moved. `context` is `{used, size, ratio}` only when the
@@ -178,15 +187,20 @@ an OpenAI SDK cannot assemble more than one streamed call deterministically.
 - a multi-turn history becomes a labelled transcript
 - content part arrays flatten; data-URI images become image blocks
 - `file`/`input_file` parts become resource blocks: text inline, binary as blob
-- `file_id` and remote `image_url` are refused rather than fetched
+- `file_id`, remote `file_url`, and remote `image_url` are refused rather than fetched
 - malformed requests (no messages, no role, system-only, no model) are rejected
 - an assistant turn with `tool_calls` renders the calls, and keeps its text if any
 - streamed tool-call entries are complete and indexed 0..n
 - a tool result is attributed to the tool, never to the user
-- `parseChatRequest` surfaces `stream`, `includeUsage`, `maxTokens`, `stop`, `ignored`
+- `parseChatRequest` validates nested stream/tool/history fields and surfaces
+  `stream`, `includeUsage`, `maxTokens`, `stop`, `ignored`, `reasoning`,
+  `toolChoice`, `toolsProvided`, validated `tools`, and trailing `toolResults`
 - `max_completion_tokens` wins over `max_tokens`; both validated as positive integers
-- `makeLimiter` returns null when unconstrained; holds split stop prefixes, cuts before a stop sequence; truncates on budget
-- stop reasons map to `finish_reason`, and an unknown one maps to `"stop"`
+- `makeLimiter` returns null when unconstrained; holds split stop prefixes, chooses
+  the earliest stop independent of array order, resolves stop/length overlap by
+  visible position, and truncates without splitting Unicode surrogate pairs
+- stop reasons map to `finish_reason`; lossy mappings preserve
+  `x_acp2api.stop_reason`, and an unknown one maps to `"stop"`
 - `reasoning_content` and `x_acp2api` are absent, not empty, when there is nothing to report
 - context and cost retain their raw values and appear on non-streaming and terminal streaming shapes only when reported
 - a Chat terminal chunk mirrors one complete annotation into `delta.provider_specific_fields`, with both placements absent together

@@ -1,0 +1,16 @@
+# module SSE transport
+
+Owns JSON SSE framing, delayed termination, stalled-socket coalescing, dense
+Responses sequence numbers and post-header errors for both HTTP APIs.
+
+# invariant Ordered bounded delivery
+
+Never pause the ACP producer. Only adjacent deltas with the same channel and, for
+Responses, the same item/index identity may merge. Structural, terminal, error and
+`[DONE]` frames remain separate and ordered; `endSse` waits for drain.
+
+# invariant Surface-specific errors
+
+Chat post-header errors use the REST envelope. Responses errors use the streaming
+Error event with top-level `type`, `code`, `message`, `param`, and dense
+`sequence_number`.

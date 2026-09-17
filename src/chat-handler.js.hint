@@ -1,0 +1,19 @@
+# module Chat handler boundary
+
+Owns the complete Chat route after routing: body parsing, normalization, parameter
+reporting, conversation selection, caller-tool suspension/resumption, ACP turn
+execution, response shaping and release. Shared sink/session accounting primitives
+come from `turn-runtime.js`; timer/disconnect ownership comes from
+`turn-lifecycle.js`. `server.js` must not duplicate this handler.
+
+# invariant Refuse before state
+
+Malformed or unsupported parameters and unknown models must fail before a
+conversation claim, tool bench, session admission or agent spawn.
+
+# invariant Chat resumes the session that was opened
+
+Every new Chat conversation stores `session.resumeContext`, including cwd, the
+complete MCP declaration and the reasoning baseline. Parking returns that exact
+context through key/prefix matching and resume uses it unchanged. A temporary
+reasoning override must never become the baseline of the restored session.

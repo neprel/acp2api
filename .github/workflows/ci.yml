@@ -46,7 +46,37 @@ jobs:
       # `npm ci` and not `npm install`: the lockfile is the point of a CI run.
       - run: npm ci
       - run: npm test
+      - run: make sdk-test
       - run: make check
+
+  # The pinned HINT verifier requires Node 24 even though the shipped runtime is
+  # supported (and tested above) on Node 22. Keep the contract gate explicit.
+  spec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: make spec
+
+  python-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: make python-sdk-test
 
   # What `npm publish` would actually upload. A `files` list that has drifted --
   # a new src/*.js that nobody added, an example config left behind -- produces a
@@ -62,15 +92,5 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - name: Pack, then check the tarball actually carries the server
-        run: |
-          npm pack --dry-run --json > pack.json
-          node --input-type=module -e '
-            import { readFileSync } from "node:fs";
-            const [{ files }] = JSON.parse(readFileSync("pack.json", "utf8"));
-            const shipped = new Set(files.map((f) => f.path));
-            const required = ["bin/acp2api.js", "src/server.js", "src/agent.js", "src/config.js"];
-            const missing = required.filter((f) => !shipped.has(f));
-            if (missing.length) throw new Error(`the package would ship without: ${missing.join(", ")}`);
-            console.log(`tarball carries ${shipped.size} files`);
-          '
+      - name: Install the tarball without optional adapters and start a general config
+        run: make pack-install-smoke

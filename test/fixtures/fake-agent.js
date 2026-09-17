@@ -20,6 +20,7 @@
  *   DELAY_RESUME -> makes this session's next resume pause briefly
  *   REFUSE      -> completes with stopReason "refusal"
  *   COUNT       -> streams word by word, so max_tokens and stop have somewhere to cut
+ *   INTERLEAVE  -> alternates reasoning and answer chunks to create many output items
  *   ECHOSESSION -> answers with its own session id (continuity, parking, resume)
  *   ECHOMCP     -> answers with the mcpServers it was given
  *   WORK        -> a plan, a diff and a failed tool (the progress renderer)
@@ -140,6 +141,11 @@ const app = acp
       agentCapabilities: {
         loadSession: false,
         sessionCapabilities: { close: {}, resume: {}, fork: {} },
+        // The fixture accepts these on the real wire below. Advertising them keeps
+        // capability enforcement honest instead of making integration tests rely
+        // on a capability the agent never claimed.
+        mcpCapabilities: { http: true },
+        promptCapabilities: { image: true, embeddedContext: true },
       },
       // Both shipped adapters advertise steering HERE, at the top level, and not
       // inside `agentCapabilities` -- looking in the wrong object is what once
@@ -235,6 +241,12 @@ const app = acp
     const state = sessions.get(params.sessionId);
     // An id this agent never issued, or one that was deleted, cannot come back.
     if (!state) throw new Error(`unknown session ${params.sessionId}`);
+    // Real adapters fingerprint cwd + the complete MCP declaration on resume.
+    // Enforce the same wire invariant so dropping a caller bench cannot hide
+    // behind this fixture's in-memory state.
+    if (JSON.stringify(params.mcpServers ?? []) !== JSON.stringify(state.mcp ?? [])) {
+      throw new Error(`mcp fingerprint changed for ${params.sessionId}`);
+    }
     if (state.delayResume) {
       state.delayResume = false;
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -570,6 +582,9 @@ const app = acp
         await new Promise((r) => state.abort.signal.addEventListener("abort", r, { once: true }));
         return { stopReason: "cancelled" };
       }
+      if (text.includes("DELAY_AFTER_TOOL")) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
       const got = called.result?.content?.[0]?.text ?? `ERROR:${called.error?.message}`;
       await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `RESULT:${got}` } });
       return { stopReason: "end_turn", usage: chargeTurn(state) };
@@ -590,6 +605,14 @@ const app = acp
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: 'submit_plan({"x":1})' },
       });
+      return { stopReason: "end_turn", usage: chargeTurn(state) };
+    }
+
+    if (text.includes("INTERLEAVE")) {
+      for (let i = 1; i <= 20; i++) {
+        await say({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `why${i} ` } });
+        await say({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `word${i} ` } });
+      }
       return { stopReason: "end_turn", usage: chargeTurn(state) };
     }
 

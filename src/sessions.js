@@ -7,9 +7,9 @@
  * conversation, so a continued turn sends **only the new input** -- less to send,
  * and the agent's own memory of the turn rather than our rendering of it.
  *
- * The unit of retention is a CONVERSATION, not a response: a chain of responses
- * shares one ACP session, and every response id in the chain resolves to it. That is
- * why `previous_response_id` may point anywhere in the chain, not just at its tip.
+ * The unit of ACP retention is a CONVERSATION, while response bodies are retained
+ * independently. A chain shares one ACP session, but only its latest stored response
+ * may continue it: an older retained id is readable but stale, never a branch point.
  *
  * Every retained session is resident context in an agent process, so nothing here
  * may leak: parking and forgetting both close the ACP session, and so does shutdown.
@@ -25,6 +25,16 @@ import { createHash } from "node:crypto";
  * different tool results can share a `tool_call_id` across branches.
  */
 const digest = (parts) => createHash("sha256").update(JSON.stringify(parts)).digest("base64url").slice(0, 22);
+
+const freezeJson = (serialized) => {
+  const value = JSON.parse(serialized);
+  const freeze = (item) => {
+    if (!item || typeof item !== "object" || Object.isFrozen(item)) return item;
+    for (const child of Object.values(item)) freeze(child);
+    return Object.freeze(item);
+  };
+  return freeze(value);
+};
 
 const canonicalPart = (part) => {
   if (part?.type === "text") return { type: "text", text: part.text ?? "" };
@@ -90,6 +100,24 @@ const nextId = (prefix) => `${prefix}_${Date.now().toString(36)}${(counter++).to
 
 export const newResponseId = () => nextId("resp");
 
+export class SessionCapacityError extends Error {
+  constructor(message = "conversation storage is full") {
+    super(message);
+    this.name = "SessionCapacityError";
+    this.status = 503;
+    this.code = "session_capacity";
+  }
+}
+
+export class ResponseStorageError extends Error {
+  constructor(message = "response cannot be stored within the configured limits") {
+    super(message);
+    this.name = "ResponseStorageError";
+    this.status = 507;
+    this.code = "response_storage_full";
+  }
+}
+
 const RETIREMENT_REASONS = {
   context_fill: "context full",
   forgotten: "forgotten",
@@ -118,6 +146,12 @@ export class SessionStore {
   #responses = new Map(); // responseId -> {convId, response}
   #keys = new Map(); // `${agentName} ${callerKey}` -> convId
   #tombstones = []; // bounded retirement attribution for a later fresh Chat turn
+  #responseBytes = 0;
+  #cleanupTimer = null;
+  #cleanupPromise = null;
+  #closed = false;
+  #admissions = new Set();
+  #admissionTail = Promise.resolve();
 
   constructor({
     max = 100,
@@ -129,6 +163,9 @@ export class SessionStore {
     onClose = () => {},
     onPendingClear = () => {},
     tombstoneMax = 1_000,
+    maxConversations = 1_000,
+    maxResponses = 1_000,
+    maxResponseBytes = 64 * 1024 * 1024,
     // Optional. Held here rather than threaded through five call sites because this
     // store already owns the per-conversation baselines and the agent name, which
     // are exactly what a per-turn metric is made of. Null when metrics are off, and
@@ -151,6 +188,9 @@ export class SessionStore {
     // the next request. 0 disables the check entirely. See `#full`.
     this.maxContextFill = maxContextFill;
     this.tombstoneMax = tombstoneMax;
+    this.maxConversations = maxConversations;
+    this.maxResponses = maxResponses;
+    this.maxResponseBytes = maxResponseBytes;
     this.now = now;
     this.log = log;
   }
@@ -179,6 +219,7 @@ export class SessionStore {
     if (!conv || conv.pending !== pending || !pending.settled || pending.attached) return;
     this.#clearPending(convId, conv);
     conv.busy = false;
+    conv.owner = null;
     conv.lastUsed = this.now();
     const calls = pending.callIds?.length ? `; waiting for tool_call_id ${pending.callIds.join(", ")}` : "";
     this.log("info", `session ${convId} (${conv.agentName}) released: suspended turn settled unattended${calls}`);
@@ -208,8 +249,39 @@ export class SessionStore {
     return this.#conversations.size;
   }
 
+  get responseCount() {
+    return this.#responses.size;
+  }
+
+  get responseBytes() {
+    return this.#responseBytes;
+  }
+
+  #expired(conv) {
+    return conv.lastUsed + this.forgetTtlMs <= this.now();
+  }
+
   /** Starts a conversation around a freshly opened session. Returns its id. */
-  open(agentName, session, { systemId = null, prefix = [], key = null, bench = null, replayable = true } = {}) {
+  open(agentName, session, {
+    systemId = null,
+    prefix = [],
+    key = null,
+    bench = null,
+    replayable = true,
+    instructions = null,
+    resumeContext = null,
+    admissionId = null,
+  } = {}) {
+    if (this.#closed) throw new SessionCapacityError("session store is closed");
+    if (admissionId) {
+      if (!this.#admissions.delete(admissionId)) {
+        throw new SessionCapacityError("conversation admission is missing or has already been consumed");
+      }
+    } else if (this.#conversations.size + this.#admissions.size >= this.maxConversations) {
+      throw new SessionCapacityError(
+        `conversation storage is full (${this.maxConversations}); run cleanup before opening another conversation`,
+      );
+    }
     const convId = nextId("conv");
     this.#conversations.set(convId, {
       agentName,
@@ -242,6 +314,15 @@ export class SessionStore {
       // Responses has a proxy-proof previous_response_id and reports retirement as
       // 404. Only Chat resends enough identity to attribute a later fresh replay.
       replayable,
+      // Responses continuation identity. `instructions` is deliberately allowed
+      // to be null: omission does not inherit a previous value.
+      instructions,
+      // The exact caller-owned arguments used to open the ACP session. The server
+      // passes these unchanged to resumeSession; Agent adds its configured cwd and
+      // MCP baseline when it builds the complete resume fingerprint.
+      resumeContext,
+      latestResponseId: null,
+      owner: null,
     });
     // A key is installed only for a new conversation. Once installed, a request
     // that finds it busy is refused or steered; it never opens another conversation
@@ -284,6 +365,7 @@ export class SessionStore {
       if (claim) this.#keys.delete(`${agentName} ${key}`);
       return null;
     }
+    if (this.#expired(conv)) return null;
     // Mid-turn, and there are two defensible answers.
     //
     // `fork` -- despite the historical name, a named conversation now reports 409:
@@ -300,7 +382,16 @@ export class SessionStore {
       // a continuation of that turn rather than a second one.
       if (conv.pending) {
         if (claim) conv.lastUsed = this.now();
-        return { convId, session: conv.session, sessionId: conv.sessionId, bench: conv.bench, pending: conv.pending, prefix: conv.prefix, matched: conv.prefix.length };
+        return {
+          convId,
+          session: conv.session,
+          sessionId: conv.sessionId,
+          bench: conv.bench,
+          pending: conv.pending,
+          prefix: conv.prefix,
+          matched: conv.prefix.length,
+          resumeContext: conv.resumeContext,
+        };
       }
       if (claim) conv.lastUsed = this.now();
       return {
@@ -311,6 +402,7 @@ export class SessionStore {
         queue: whenBusy === "queue" && Boolean(conv.session),
         matched: conv.prefix.length,
         prefix: conv.prefix,
+        resumeContext: conv.resumeContext,
       };
     }
     // Out of room. The key still names this conversation, and the next `prune`
@@ -330,6 +422,7 @@ export class SessionStore {
       bench: conv.bench,
       matched: conv.prefix.length,
       prefix: conv.prefix,
+      resumeContext: conv.resumeContext,
     };
   }
 
@@ -355,6 +448,7 @@ export class SessionStore {
       pending: conv.pending,
       prefix: conv.prefix,
       matched: conv.prefix.length,
+      resumeContext: conv.resumeContext,
     };
   }
 
@@ -414,6 +508,7 @@ export class SessionStore {
       // would interleave two conversations inside the agent. A PENDING turn is
       // different: the matching history is how a headerless caller finds the
       // exact turn whose tool result it is carrying.
+      if (this.#expired(conv)) continue;
       if ((conv.busy && !conv.pending) || conv.agentName !== agentName || conv.systemId !== systemId) continue;
       if (this.#full(conv)) continue;
       // The standing preamble is part of identity: a changed system prompt is a
@@ -433,6 +528,7 @@ export class SessionStore {
       sessionId: best.conv.sessionId,
       bench: best.conv.bench,
       matched: best.matched,
+      resumeContext: best.conv.resumeContext,
       ...(best.conv.pending
         ? { pending: best.conv.pending, prefix: best.conv.prefix }
         : {}),
@@ -559,7 +655,7 @@ export class SessionStore {
   /** Marks a conversation as serving a turn, so no other request joins it. */
   claim(convId) {
     const conv = this.#conversations.get(convId);
-    if (!conv || conv.busy) return false;
+    if (!conv || this.#expired(conv) || conv.busy) return false;
     conv.busy = true;
     conv.lastUsed = this.now();
     return true;
@@ -568,45 +664,139 @@ export class SessionStore {
   /** Releases or restores busy state after ownership has already been decided. */
   setBusy(convId, busy) {
     const conv = this.#conversations.get(convId);
-    if (conv) conv.busy = busy;
+    if (conv) {
+      conv.busy = busy;
+      if (!busy) conv.owner = null;
+    }
   }
 
-  /** Resolves a response id to its conversation, or null. Refreshes its TTL. */
+  /** Resolves a response id for inspection. Old retained responses remain readable. */
   find(responseId) {
     const entry = this.#responses.get(responseId);
     if (!entry) return null;
     const conv = this.#conversations.get(entry.convId);
-    if (!conv) return null;
-    conv.lastUsed = this.now();
-    return { convId: entry.convId, ...conv };
+    if (!conv || this.#expired(conv)) return null;
+    const latest = conv.latestResponseId === responseId;
+    if (latest) conv.lastUsed = this.now();
+    return { convId: entry.convId, ...conv, latest };
   }
 
-  /** Resolves and synchronously claims a response's free conversation. */
+  /**
+   * Resolves and synchronously claims only the latest response in a chain.
+   *
+   * `continuation` is one of `claimed`, `busy`, or `stale`. Unknown, evicted and
+   * expired ids return null. A claim carries an opaque token; releaseResponseClaim
+   * refuses to release a later owner accidentally.
+   */
   claimResponse(responseId) {
     const entry = this.#responses.get(responseId);
     if (!entry) return null;
     const conv = this.#conversations.get(entry.convId);
-    if (!conv) return null;
+    if (!conv || this.#expired(conv)) return null;
+    if (conv.latestResponseId !== responseId) {
+      return { convId: entry.convId, ...conv, continuation: "stale", busy: conv.busy };
+    }
     conv.lastUsed = this.now();
-    if (conv.busy) return { convId: entry.convId, ...conv, busy: true };
+    if (conv.busy) {
+      if (conv.pending && !conv.pending.attached && !conv.owner) {
+        const claimId = nextId("claim");
+        conv.pending.attached = true;
+        conv.owner = claimId;
+        return { convId: entry.convId, ...conv, continuation: "claimed", claimId, busy: true };
+      }
+      return { convId: entry.convId, ...conv, continuation: "busy", busy: true };
+    }
+    const claimId = nextId("claim");
     conv.busy = true;
-    // Report the state that was claimed, not the store's new internal state: the
-    // caller uses `busy` to distinguish ownership from observing another owner.
-    return { convId: entry.convId, ...conv, busy: false };
+    conv.owner = claimId;
+    return { convId: entry.convId, ...conv, continuation: "claimed", claimId, busy: false };
+  }
+
+  /** Releases exactly the response continuation owner returned by claimResponse. */
+  releaseResponseClaim(convId, claimId) {
+    const conv = this.#conversations.get(convId);
+    if (!conv || !claimId || conv.owner !== claimId) return false;
+    conv.owner = null;
+    if (conv.pending) {
+      conv.pending.attached = false;
+      this.#releaseSettledPending(convId, conv.pending);
+    } else {
+      conv.busy = false;
+    }
+    return true;
   }
 
   /** The stored response body, for `GET /v1/responses/{id}`. */
   response(responseId) {
-    return this.#responses.get(responseId)?.response ?? null;
+    const entry = this.#responses.get(responseId);
+    return entry?.response ?? null;
   }
 
-  /** Records a completed response against its conversation. */
+  #dropResponse(responseId) {
+    const entry = this.#responses.get(responseId);
+    if (!entry) return false;
+    this.#responses.delete(responseId);
+    this.#responseBytes -= entry.bytes;
+    this.#conversations.get(entry.convId)?.responses.delete(responseId);
+    return true;
+  }
+
+  /** Records a completed response, evicting oldest non-tip snapshots if needed. */
   record(convId, responseId, response) {
     const conv = this.#conversations.get(convId);
-    if (!conv) return;
+    if (!conv) throw new ResponseStorageError("response conversation no longer exists");
+    let serialized;
+    try {
+      serialized = JSON.stringify(response);
+    } catch (error) {
+      throw new ResponseStorageError(`response is not serializable: ${error.message}`);
+    }
+    if (serialized === undefined) throw new ResponseStorageError("response is not JSON-serializable");
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes > this.maxResponseBytes || this.maxResponses < 1) {
+      throw new ResponseStorageError(
+        `response requires ${bytes} bytes but storage allows ${this.maxResponseBytes} bytes and ${this.maxResponses} responses`,
+      );
+    }
+
+    // The previous tip of this same chain becomes stale as part of this commit, so
+    // it is a valid eviction candidate. Tips of other conversations are protected:
+    // evicting one would leave a live ACP session with a false older branch point.
+    const candidates = [...this.#responses.entries()]
+      .filter(([id, entry]) => {
+        const owner = this.#conversations.get(entry.convId);
+        return entry.convId === convId || owner?.latestResponseId !== id;
+      })
+      .sort((a, b) => a[1].storedAt - b[1].storedAt || a[0].localeCompare(b[0]));
+    let projectedCount = this.#responses.size + (this.#responses.has(responseId) ? 0 : 1);
+    let projectedBytes = this.#responseBytes - (this.#responses.get(responseId)?.bytes ?? 0) + bytes;
+    const evict = [];
+    for (const [id, entry] of candidates) {
+      if (projectedCount <= this.maxResponses && projectedBytes <= this.maxResponseBytes) break;
+      if (id === responseId) continue;
+      evict.push(id);
+      projectedCount -= 1;
+      projectedBytes -= entry.bytes;
+    }
+    if (projectedCount > this.maxResponses || projectedBytes > this.maxResponseBytes) {
+      throw new ResponseStorageError("response storage is full of current conversation tips");
+    }
+
+    for (const id of evict) this.#dropResponse(id);
+    this.#dropResponse(responseId);
     conv.responses.add(responseId);
     conv.lastUsed = this.now();
-    this.#responses.set(responseId, { convId, response });
+    conv.latestResponseId = responseId;
+    // Store the exact JSON value whose bytes were admitted. Callers may still hold
+    // and mutate `response` (the SSE assembler used to do exactly that), so keeping
+    // its reference would make both the byte accounting and GET snapshot lie.
+    this.#responses.set(responseId, {
+      convId,
+      response: freezeJson(serialized),
+      bytes,
+      storedAt: this.now(),
+    });
+    this.#responseBytes += bytes;
   }
 
   /**
@@ -617,12 +807,92 @@ export class SessionStore {
   async forget(responseId, agents) {
     const entry = this.#responses.get(responseId);
     if (!entry) return false;
-    this.#responses.delete(responseId);
+    this.#dropResponse(responseId);
     const conv = this.#conversations.get(entry.convId);
     if (!conv) return true;
-    conv.responses.delete(responseId);
-    if (conv.responses.size === 0) await this.#close(entry.convId, "deleted", agents);
+    // Deleting the tip removes the only legal continuation point. Keep older
+    // snapshots readable, but close the ACP conversation they can no longer name.
+    if (conv.latestResponseId === responseId || conv.responses.size === 0) {
+      await this.#close(entry.convId, "deleted", agents, null, { preserveResponses: true });
+    }
     return true;
+  }
+
+  /** Ends an advanced `store:false` chain but preserves its older GET snapshots. */
+  async finishUnstored(convId, agents) {
+    const conv = this.#conversations.get(convId);
+    if (!conv) return false;
+    await this.#close(convId, "unstored response", agents, null, { preserveResponses: true });
+    return true;
+  }
+
+  /**
+   * Makes room for one new conversation, closing the least-recently-used idle
+   * record if necessary. If every slot is active the caller gets an admission
+   * error instead of silently exceeding the storage bound.
+   */
+  prepareOpen(agents) {
+    const previous = this.#admissionTail;
+    let unlock;
+    this.#admissionTail = new Promise((resolve) => { unlock = resolve; });
+    return previous.then(() => this.#prepareOpen(agents)).finally(unlock);
+  }
+
+  async #prepareOpen(agents) {
+    await this.cleanup(agents);
+    if (this.#closed) throw new SessionCapacityError("session store is closed");
+    if (this.maxConversations < 1) {
+      throw new SessionCapacityError("conversation storage is disabled (maxConversations is 0)");
+    }
+    if (this.#conversations.size + this.#admissions.size < this.maxConversations) {
+      const admissionId = nextId("admit");
+      this.#admissions.add(admissionId);
+      return admissionId;
+    }
+    const idle = [...this.#conversations.entries()]
+      .filter(([, conv]) => !conv.busy)
+      .sort((a, b) => a[1].lastUsed - b[1].lastUsed || a[0].localeCompare(b[0]));
+    if (idle.length === 0) {
+      throw new SessionCapacityError(
+        `conversation storage is full (${this.maxConversations}) and every conversation is active`,
+      );
+    }
+    await this.#close(idle[0][0], "conversation capacity", agents);
+    if (this.#closed) throw new SessionCapacityError("session store is closed");
+    const admissionId = nextId("admit");
+    this.#admissions.add(admissionId);
+    return admissionId;
+  }
+
+  /** Releases capacity reserved by prepareOpen when opening the ACP session fails. */
+  cancelOpen(admissionId) {
+    return this.#admissions.delete(admissionId);
+  }
+
+  /** Runs one non-overlapping cleanup pass; callers may await it deterministically. */
+  cleanup(agents) {
+    if (this.#cleanupPromise) return this.#cleanupPromise;
+    this.#cleanupPromise = this.prune(agents).finally(() => {
+      this.#cleanupPromise = null;
+    });
+    return this.#cleanupPromise;
+  }
+
+  /** Starts periodic cleanup. The unref'ed timer never keeps Node alive. */
+  startCleanup(agents, { intervalMs = Math.max(1_000, Math.min(this.ttlMs, 60_000)) } = {}) {
+    if (this.#cleanupTimer || this.#closed) return false;
+    this.#cleanupTimer = setInterval(() => {
+      this.cleanup(agents).catch((error) => this.log("error", `session cleanup failed: ${error.message}`));
+    }, intervalMs);
+    this.#cleanupTimer.unref?.();
+    return true;
+  }
+
+  /** Stops future cleanup passes. An already-running pass remains awaitable. */
+  async stopCleanup() {
+    if (this.#cleanupTimer) clearInterval(this.#cleanupTimer);
+    this.#cleanupTimer = null;
+    await this.#cleanupPromise;
   }
 
   /**
@@ -648,8 +918,8 @@ export class SessionStore {
       // Retired: it has stopped being offered, and resuming a session with no room
       // left in its context would only hit the same wall again.
       if (this.#full(conv)) await this.retire(convId, "context_fill", agents);
-      else if (conv.lastUsed < forgetCutoff) await this.retire(convId, "forgotten", agents);
-      else if (conv.lastUsed < idleCutoff) await this.park(convId, agents);
+      else if (conv.lastUsed <= forgetCutoff) await this.retire(convId, "forgotten", agents);
+      else if (conv.lastUsed <= idleCutoff) await this.park(convId, agents);
     }
     // The cap is a bound on RESIDENT sessions -- the expensive thing -- so parked
     // conversations, which hold no process, do not count towards it.
@@ -715,25 +985,36 @@ export class SessionStore {
    */
   revive(convId, session) {
     const conv = this.#conversations.get(convId);
-    if (!conv || !session) return;
+    if (!conv || !session || this.#expired(conv)) return false;
     conv.session = session;
     conv.sessionId = session.id;
     conv.parkedAt = null;
     conv.lastUsed = this.now();
     this.#reportLive(conv.agentName);
+    return true;
   }
 
   /** Ends every conversation. Shutdown depends on this reaping the child processes. */
   async closeAll(agents) {
+    this.#closed = true;
+    await this.#admissionTail;
+    await this.stopCleanup();
     for (const convId of [...this.#conversations.keys()]) await this.#close(convId, "shutdown", agents);
+    // Includes orphaned GET-only snapshots preserved after store:false or deleting
+    // a tip. The store is terminal after shutdown, so retaining them serves nobody.
+    this.#responses.clear();
+    this.#responseBytes = 0;
+    this.#admissions.clear();
   }
 
-  async #close(convId, why, agents, retirementReason = null) {
+  async #close(convId, why, agents, retirementReason = null, { preserveResponses = false } = {}) {
     const conv = this.#conversations.get(convId);
     if (!conv) return;
     this.#clearPending(convId, conv);
     this.#conversations.delete(convId);
-    for (const id of conv.responses) this.#responses.delete(id);
+    if (!preserveResponses) {
+      for (const id of [...conv.responses]) this.#dropResponse(id);
+    }
     // Only if it still points here: a key rebound to a newer session by `open`
     // must not be dropped when the one it used to name is reaped.
     const keyed = conv.key ? `${conv.agentName} ${conv.key}` : null;

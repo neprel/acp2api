@@ -69,7 +69,15 @@ export const REFUSED = {
 };
 
 /** Honoured for real, by emulation rather than by passing them down. */
-export const EMULATED = new Set(["max_tokens", "max_completion_tokens", "stop", "stream_options"]);
+export const EMULATED = new Set([
+  "max_tokens",
+  "max_completion_tokens",
+  "stop",
+  "stream_options",
+  "tools",
+  "tool_choice",
+  "reasoning_effort",
+]);
 
 /** Fields this server implements natively. */
 const NATIVE = new Set(["model", "messages", "stream"]);
@@ -91,7 +99,112 @@ export function classify(body) {
     if (key in REFUSED) refused.push({ key, why: REFUSED[key] });
     else ignored.push(key);
   }
+  if (body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options)) {
+    for (const key of Object.keys(body.stream_options)) {
+      if (key !== "include_usage") ignored.push(`stream_options.${key}`);
+    }
+  }
   return { ignored: ignored.sort(), refused };
+}
+
+/**
+ * Names unsupported keys inside an otherwise-supported object parameter.
+ *
+ * Top-level classification cannot see `reasoning.summary` or future siblings.
+ * Callers use the returned dotted paths in the same ignored annotation as
+ * top-level style parameters, so accepting a new nested field is never silent.
+ */
+export function ignoredNestedKeys(value, prefix, supported) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value)
+    .filter((key) => !supported.has(key))
+    .map((key) => `${prefix}.${key}`)
+    .sort();
+}
+
+const parameterError = (message, code = "invalid_request_error") => {
+  const error = new Error(message);
+  error.status = 400;
+  error.code = code;
+  return error;
+};
+
+/**
+ * Validates caller tools and resolves the tool policy shared by both OpenAI APIs.
+ * `shape` is `chat` for nested `{function:{...}}` definitions and `responses` for
+ * the Responses API's flat function-tool shape.
+ */
+export function normalizeToolPolicy(body, shape = "chat") {
+  if (body.tools != null && !Array.isArray(body.tools)) {
+    throw parameterError("`tools` must be an array");
+  }
+  const tools = body.tools ?? [];
+  const names = new Set();
+  for (let index = 0; index < tools.length; index++) {
+    const tool = tools[index];
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+      throw parameterError(`tools[${index}] must be an object`);
+    }
+    if (tool.type !== "function") {
+      throw parameterError(
+        `tools[${index}].type \"${tool.type ?? "missing"}\" is not supported; only function tools are supported`,
+        "unsupported_parameter",
+      );
+    }
+    const toolKeys = shape === "responses"
+      ? new Set(["type", "name", "description", "parameters", "strict"])
+      : new Set(["type", "function"]);
+    const unknownToolKey = Object.keys(tool).find((key) => !toolKeys.has(key));
+    if (unknownToolKey) throw parameterError(`tools[${index}].${unknownToolKey} is not supported`);
+    const fn = shape === "responses" ? tool : tool.function;
+    if (!fn || typeof fn !== "object" || Array.isArray(fn)) {
+      throw parameterError(`tools[${index}] needs a function definition`);
+    }
+    if (shape === "chat") {
+      const unknownFunctionKey = Object.keys(fn).find(
+        (key) => !["name", "description", "parameters", "strict"].includes(key),
+      );
+      if (unknownFunctionKey) {
+        throw parameterError(`tools[${index}].function.${unknownFunctionKey} is not supported`);
+      }
+    }
+    if (typeof fn.name !== "string" || fn.name.length === 0) {
+      throw parameterError(`tools[${index}] needs a non-empty function name`);
+    }
+    if (names.has(fn.name)) throw parameterError(`duplicate tool name: ${fn.name}`);
+    names.add(fn.name);
+    if (fn.description != null && typeof fn.description !== "string") {
+      throw parameterError(`tools[${index}].description must be a string`);
+    }
+    if (fn.parameters != null && (!fn.parameters || typeof fn.parameters !== "object" || Array.isArray(fn.parameters))) {
+      throw parameterError(`tools[${index}].parameters must be an object`);
+    }
+    if (fn.strict === true) {
+      throw parameterError(
+        `tools[${index}].strict is not supported: ACP cannot guarantee constrained tool arguments`,
+        "unsupported_parameter",
+      );
+    }
+    if (fn.strict != null && typeof fn.strict !== "boolean") {
+      throw parameterError(`tools[${index}].strict must be a boolean`);
+    }
+  }
+
+  const choice = body.tool_choice ?? "auto";
+  if (choice === "required" || (choice && typeof choice === "object")) {
+    throw parameterError(
+      "`tool_choice` is not supported: ACP cannot guarantee that a function is called or select a named function",
+      "unsupported_parameter",
+    );
+  }
+  if (choice !== "auto" && choice !== "none") {
+    throw parameterError('`tool_choice` must be "auto", "none", "required", or a named function choice');
+  }
+  return {
+    choice,
+    tools: choice === "none" ? [] : tools,
+    toolsProvided: Object.hasOwn(body, "tools"),
+  };
 }
 
 /**

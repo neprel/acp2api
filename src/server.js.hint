@@ -7,11 +7,14 @@ success are in [_.hint#silent_success](../_.hint).
 
 # scope What this module owns
 
-In: routing, body limits, CORS, SSE framing, the timeout and
-client-disconnect distinction, and turning errors into OpenAI-shaped bodies.
+In: server composition, routing, MCP ingress, CORS, retained-store wiring, shutdown,
+and turning route-level errors into OpenAI-shaped bodies.
 
-Out: ACP, agent lifecycle, and translation. It calls `parseChatRequest`,
-`Agent.openSession`/`turn` and the session store, and does no shape work of its own.
+Out: ACP, agent lifecycle, translation, ingress validation, request normalization,
+SSE transport, request-bound timeout/disconnect lifecycle, and Chat/Responses turn
+execution. Those live in `agent.js`, `openai.js`/`responses.js`,
+`http-ingress.js`, the two `*-handler.js` modules, `sse.js`,
+`turn-lifecycle.js`, and `turn-runtime.js` respectively.
 
 # ui Routes
 
@@ -40,7 +43,7 @@ What remains is placement. `host` binds loopback by default and the CLI says so 
 startup when it does not — where to listen is the operator's decision, but what is
 behind the port is an agent that runs commands.
 
-# func handleCompletion {#handle}
+# decision Chat requests delegate to the extracted handler {#handle}
 
 ## flow
 1. Read and parse the body under `MAX_BODY_BYTES`.
@@ -214,10 +217,11 @@ from a short answer.
 Once headers are out the status is spent: mid-stream truncation is reported as
 `finish_reason: "length"`, the closest honest value left.
 
-A failure after headers is never a bare close. It emits the standard error envelope
-as an SSE frame, then `[DONE]`; Responses additionally names every frame with
-`event: <payload.type>` and names failures `event: error`. Pre-stream failures keep
-their clean HTTP status because `start()` has not committed headers yet.
+A failure after headers is never a bare close. Chat emits the standard REST error
+envelope as an SSE frame; Responses emits its streaming Error event with top-level
+`type`, `code`, `message`, `param`, and dense `sequence_number`. Both then emit
+`[DONE]`. Pre-stream failures keep their clean HTTP status because `start()` has
+not committed headers yet.
 
 # decision Coalesce a stalled stream; do not stall the turn {#sse_backpressure}
 
@@ -276,7 +280,19 @@ is attached before routing, so success and error responses agree, and `OPTIONS`
 preflight ends with 204. `true` means the operator deliberately chose `*`; it is
 never the default because this unauthenticated server controls coding agents.
 
-# func handleResponse {#handle_response}
+# rule Browser and media-type checks happen before routing work {#http_ingress}
+
+Every request must carry a Host matching the actual listener (or an explicitly
+allowed host). A browser Origin is accepted only when it is same-origin or matches
+the explicit CORS policy; opaque `Origin: null` is cross-origin unless the operator
+chose the wildcard. These checks do not authenticate callers and never trust
+`X-Forwarded-*`.
+
+Chat Completions and Responses POST bodies require `application/json`; UTF-8
+charset parameters are accepted. A wrong media type is 415. Host, Origin and
+media type are rejected before parsing a model request or opening an agent.
+
+# decision Responses requests delegate to the extracted handler {#handle_response}
 
 Differs from `handleCompletion` in one structural way: **the session outlives the
 request**. A new conversation opens one; `previous_response_id` continues an
@@ -286,10 +302,37 @@ existing one.
 A session belongs to one child process, so continuing with a different `model` is a
 400 rather than a silent restart on the other agent.
 
+## invariant Responses chains are linear and resume failures are terminal
+
+Only a conversation's latest stored response id can continue it. An older readable
+snapshot is 409 `stale_previous_response`; an unknown, evicted, expired, deleted or
+unresumable id is 404 `not_found`. A failed `session/resume` never falls through to
+a cold `session/new`, because Responses does not resend the earlier input.
+
+The synchronous claim from `claimResponse` is released only by its opaque claim
+token. Validation after a claim (model and instructions included) must release that
+same token before throwing; it must never clear a different concurrent owner.
+
+## invariant Responses instructions are a once-only text preamble
+
+Instructions are sent with the first ACP prompt. A continuation must explicitly
+send the same string (including the meaningful `null` for no instructions), and
+only its input blocks go to ACP. Adding, removing or changing instructions returns
+400 `unsupported_parameter`; omission is not inheritance.
+
 ## invariant A failed first turn leaves nothing behind
 If the turn fails before producing a response, the conversation it opened is
 discarded. No response id would ever point at it, so it could never be closed
-otherwise — and it is a live login. The same applies to `store: false`.
+otherwise — and it is a live login. A successful `store: false` turn advances the
+ACP state and then closes the entire chain: the new response is neither GET-able
+nor continuable, old stored snapshots remain GET-able but are no longer branch
+points. A failed storage commit takes the same fail-closed path.
+
+After a prompt or tool result advances an existing Responses session, any failure,
+timeout or disconnect ends its continuation chain while preserving earlier GET
+snapshots. A validation error before advancement releases the claim and leaves the
+tip usable. No successful response id may name a session state that includes a
+failed turn.
 
 ## invariant Responses tool turns keep the same escape hatches
 A `previous_response_id` naming a suspended tool turn resumes it only when the new
@@ -305,6 +348,11 @@ session can reconstruct the conversation honestly. Responses sends only new inpu
 lose all earlier context while echoing `previous_response_id` as if it continued.
 Served tools with `store: false` remain a 400 `store_required`, because a tool call
 necessarily crosses requests and needs a retained continuation for its result.
+
+Every supplied call id is validated against the suspended turn before any result is
+resolved. Unknown or duplicate ids are 400. A result mixed with new message input is
+also 400 before advancement; silently dropping either half is forbidden. A tool
+output without a matching suspended continuation is never rendered as a prompt.
 
 # invariant Closing the server closes every agent
 Agents are child processes holding authenticated sessions. The `close` handler on
@@ -322,7 +370,8 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - a quota failure is 429 **even on a streaming request** — the header-deferral test
 - an unrelated failure is 502; an unknown model is 404 naming what is available
 - `temperature` returns 200 and reports itself in `x_acp2api.ignored`
-- a tool-sending client is answered through its MCP bench; `tool_choice` remains ignored
+- a tool-sending client is answered through its MCP bench; `tool_choice:auto` works,
+  `none` disables the bench for that turn, and stronger guarantees are rejected
 - answer text that imitates a declared caller tool call produces one warning and
   `x_acp2api.suspected_text_tool_call`, but is never rewritten into a tool call
 - proxy-mutated Chat tool history resumes by live `tool_call_id`; cross-model and
@@ -335,6 +384,9 @@ than killed — and `bin/acp2api.js` relies on exactly that.
 - a failed turn leaves no session to be continued
 - a timeout is 504, not a truncated 200
 - malformed bodies are 400 with an OpenAI-shaped error; unknown routes are 404
+- foreign Origin, wrong Host and non-JSON inference bodies are rejected before spawn
+- Responses rejects stale ids with 409, failed resume with 404, instruction changes
+  with 400, and `store:false` leaves no false continuation tip
 - post-header failures produce an error frame and `[DONE]`; Responses event names match payload types
 - CORS is absent by default; enabled CORS answers preflight and marks actual responses
 - closing the server closes every agent

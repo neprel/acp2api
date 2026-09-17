@@ -17,7 +17,7 @@ declaration, the prompt turn, cancellation, and mapping ACP failures to HTTP sta
 Out: HTTP, OpenAI shapes, and any knowledge of what the caller asked for. `prompt`
 receives ACP content blocks and a `limit` callback; it never sees a request body.
 
-# func openSession {#open_session}
+# rule openSession lifecycle contract {#open_session}
 
 Opens an ACP session, declares the agent's MCP servers, and applies the agent's own
 model/reasoning/options. Separate from `prompt` because the Responses API keeps a
@@ -26,12 +26,14 @@ session alive across requests; see
 
 ## result
 `{id, options, agent}` plus internal metadata: `mcp` records caller-added servers
-on cold/resumed paths, while `running`, `closed`, and `dead` describe lifecycle.
+on cold/resumed paths, `resumeContext` records the exact `{cwd, mcpServers}` sent
+at session creation for later fingerprint-identical resume, while `running`,
+`closed`, and `dead` describe lifecycle.
 `options` is tracked on the session rather than
 re-read from `session/new`, whose snapshot goes stale the moment an option is set —
 a later turn reconfigures against the live set.
 
-# func turn {#turn}
+# rule turn lifecycle contract {#turn}
 
 One turn inside an existing session. `overrides` re-applies config options first,
 which is how a per-request `reasoning.effort` is honoured mid-conversation.
@@ -40,25 +42,22 @@ which is how a per-request `reasoning.effort` is honoured mid-conversation.
 On a retained session the signal belongs to one request while the session serves
 many, so a leaked listener cancels somebody else's turn.
 
-# func prompt {#prompt}
+# rule prompt lifecycle contract {#prompt}
 
 One prompt turn on a fresh session: `openSession` + `turn` + `closeSession`. It is
 the stateless convenience path used by the agent-level tests; HTTP surfaces own
 their conversation lifecycle through `openSession` and `turn` directly.
 
-## arg blocks
-ACP `ContentBlock[]`, already translated.
-
-## arg options.signal
-Aborting it cancels the ACP turn. Removing the listener in `finally` is mandatory:
-the signal outlives the turn and a leaked listener cancels the *next* one.
-
-## arg options.onEvent
+The `blocks` argument is ACP `ContentBlock[]`, already translated.
+The `options.signal` argument cancels the ACP turn. Removing its listener in
+`finally` is mandatory: the signal outlives the turn and a leaked listener cancels
+the *next* one.
+The `options.onEvent` argument receives
 `{type: "text" | "reasoning" | "tool_call", ...}`, called as the agent streams and
 always before this resolves.
 
-## arg options.limit
-See [openai.js.hint#limiter](./openai.js.hint). Optional.
+The optional `options.limit` argument follows
+[openai.js.hint#limiter](./openai.js.hint).
 
 ## result
 `{text, reasoning, stopReason, usage}`. `stopReason` is the limiter's verdict when
@@ -74,7 +73,9 @@ The only error type leaving this module. Always carries `status` and `code`:
 1. Connect (memoized) — spawn, `initialize`, remember capabilities.
 2. Build the session, declaring the agent's MCP servers.
 3. Apply model, then reasoning, then mode, then raw options — re-reading the option
-   set after every `session/set_config_option`. For Claude only, mode uses the clean
+   set after every `session/set_config_option`. Capture the session reasoning baseline
+   only from this final option set, and retain it in `resumeContext`; a model or raw
+   option may remove the selector after `session/new`. For Claude only, mode uses the clean
    `session/set_mode` method instead; Codex and general agents keep the config-option path.
 4. Prompt; consume updates, consulting `limit` after each text chunk.
 5. On cut: cancel, then drain to the stop message without accumulating.
@@ -94,16 +95,18 @@ sequence. `turn` emits only the safe prefix, carries the hold across ACP chunks,
 and flushes it when an uncut turn ends. This belongs at the single `onEvent` source,
 not separately in chat, Responses, and their tool-resume paths.
 
-# func probe {#probe}
+# rule probe lifecycle contract {#probe}
 
 Opens one unconfigured cold session through the same memoized connection,
 `#bounded` deadlines and session builder as an ordinary request. Returns the live
 config option ids/categories/types/current values/named values and the initialize response's
 steering, session and MCP capability highlights, then closes the session.
 
-It must never apply configured options, fork/warm a base, or call
-`session/prompt`. A probe diagnoses the agent vocabulary without changing it or
-spending a subscription turn.
+The default `probe()` call must never apply configured options, fork/warm a base,
+or call `session/prompt`: it diagnoses the initial agent vocabulary without changing
+it or spending a subscription turn. Doctor may explicitly request configuration in
+that disposable cold session; this uses the production option sequence and reports
+the final option surface, but still never warms or prompts.
 
 # invariant tool_call updates are progress, never content {#tool_calls_are_progress}
 
@@ -331,6 +334,35 @@ verdict and null usage, but its session is dead. If the HTTP request timer
 caused cancellation, the HTTP lifecycle still owns the public 504; the child RPC
 deadline only guarantees its drain cannot leave the conversation busy forever.
 
+# rule ACP capabilities are gates, not informational metadata {#capability_gates}
+
+After initialize, configured and caller-added HTTP/SSE MCP transports are accepted
+only when the agent advertises the matching `mcpCapabilities.http` / `.sse` flag.
+Stdio is ACP's baseline transport and has no capability flag to require. Refuse an
+unsupported transport with `AgentError(400, "unsupported_capability")`, naming the
+agent, transport and MCP server, before `session/new`, fork or resume.
+
+Before `session/prompt`, reject image, audio and embedded resource blocks unless
+the corresponding `promptCapabilities.image`, `.audio` or `.embeddedContext` is
+true. Text and resource links remain baseline ACP content. Capability refusal must
+not spend a prompt turn.
+
+`preflightTurn` performs these capability checks plus request-option validation
+without changing options or sending `session/prompt`. HTTP handlers use it before
+declaring retained history advanced. `turn` repeats the same synchronous checks as
+its public safety boundary, then applies validated overrides and starts the prompt.
+
+# invariant Per-turn reasoning overrides reset to the session baseline {#reasoning_reset}
+
+Each new session captures its final `thought_level` value after configured model,
+reasoning, mode and raw options have all been applied. The value travels in
+`resumeContext`, so parking or a child respawn cannot redefine the baseline from a
+transient per-turn override. A missing final selector has a null baseline and reset
+is a no-op. A turn whose overrides object explicitly contains
+`reasoning: null` restores that baseline through the ordinary category-based
+option path. Omission means no override operation. This prevents one request's
+effort from leaking into the next retained-session turn.
+
 # bad Never widen the 429 net to catch an unfamiliar error
 
 An unrecognised failure stays 502. A router that reads 429 spends its next provider;
@@ -350,6 +382,8 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 
 - a turn streams reasoning, tool calls and text in order, and reports usage
 - model and reasoning are selected by category, not by option id
+- an explicit null reasoning override restores the session baseline after a
+  prior per-turn override
 - a Claude model whose derived environment matches sends no config RPC; an
   operator-forced mismatch sends one and logs the transcript hazard
 - raw `options` address an id directly, including booleans
@@ -361,6 +395,8 @@ phrasings belong in `server.limitPatterns` (config), not in this file.
 - aborting the signal cancels the turn in the agent
 - `max_tokens` and `stop` cut the turn, and nothing past the cut is emitted or accumulated
 - `mcpServers` reach `session/new` in ACP's array shape
+- unsupported HTTP/SSE MCP transports and prompt image/resource content fail with
+  a named 400 before session setup or prompt; stdio needs no invented flag
 - the child is reused across turns; after `close()` a further prompt is 503
 - an unspawnable command is 503, not a crash
 - a probe reports live options/capabilities and sends neither configuration nor a prompt

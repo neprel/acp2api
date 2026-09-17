@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classify, ParamReporter } from "../src/params.js";
+import { classify, ignoredNestedKeys, normalizeToolPolicy, ParamReporter } from "../src/params.js";
 import { estimateTokens, makeLimiter, parseChatRequest } from "../src/openai.js";
 
 const base = { model: "m", messages: [{ role: "user", content: "hi" }] };
@@ -13,13 +13,68 @@ test("style-only parameters are ignored, not refused", () => {
   assert.deepEqual(refused, []);
 });
 
-test("tool definitions are accepted and ignored, not refused", () => {
-  // Reversed in 1.2.0. An ACP agent has its own tools and can be handed the
-  // caller's through mcpServers, so it acts instead of asking -- and for a client
-  // whose only model IS an ACP agent, refusing left it with no brain at all.
-  const { ignored, refused } = classify({ ...base, tools: [{ type: "function" }], tool_choice: "auto" });
+test("tool definitions and supported choices are classified as emulated", () => {
+  const { ignored, refused } = classify({ ...base, tools: [], tool_choice: "auto" });
   assert.deepEqual(refused, []);
-  assert.deepEqual(ignored, ["tool_choice", "tools"]);
+  assert.deepEqual(ignored, []);
+});
+
+test("tool policy supports auto and none but refuses guarantees it cannot provide", () => {
+  const tool = {
+    type: "function",
+    function: {
+      name: "lookup",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", minLength: 1 } },
+        required: ["query"],
+      },
+    },
+  };
+  assert.deepEqual(normalizeToolPolicy({ tools: [tool], tool_choice: "auto" }).tools, [tool]);
+  assert.deepEqual(normalizeToolPolicy({ tools: [tool], tool_choice: "none" }).tools, []);
+  for (const tool_choice of ["required", { type: "function", function: { name: "lookup" } }]) {
+    assert.throws(() => normalizeToolPolicy({ tools: [tool], tool_choice }), (error) => {
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "unsupported_parameter");
+      return true;
+    });
+  }
+});
+
+test("tool policy refuses strict, hosted, malformed, and duplicate tools", () => {
+  const bad = [
+    [{ type: "web_search_preview" }],
+    [{ type: "function", function: { name: "" } }],
+    [{ type: "function", function: { name: "x", parameters: [] } }],
+    [{ type: "function", function: { name: "x", strict: true } }],
+    [{ type: "function", function: { name: "x", future: true } }],
+    [{ type: "function", function: { name: "x", parameters: {}, future: true } }],
+    [
+      { type: "function", function: { name: "x" } },
+      { type: "function", function: { name: "x" } },
+    ],
+  ];
+  for (const tools of bad) assert.throws(() => normalizeToolPolicy({ tools }), /tool|duplicate|strict/i);
+  assert.throws(() => normalizeToolPolicy({ tools: {} }), /must be an array/);
+});
+
+test("Responses tool JSON Schema keeps nested parameters intact", () => {
+  const tool = {
+    type: "function",
+    name: "lookup",
+    strict: false,
+    parameters: {
+      type: "object",
+      properties: {
+        filters: {
+          type: "object",
+          properties: { tags: { type: "array", items: { type: "string" } } },
+        },
+      },
+    },
+  };
+  assert.deepEqual(normalizeToolPolicy({ tools: [tool] }, "responses").tools, [tool]);
 });
 
 test("parameters that would still change the meaning are refused", () => {
@@ -40,8 +95,25 @@ test("unknown future parameters are ignored rather than refused", () => {
   assert.deepEqual(classify({ ...base, some_2027_field: true }).ignored, ["some_2027_field"]);
 });
 
+test("unknown nested parameters are reported with stable dotted paths", () => {
+  assert.deepEqual(
+    ignoredNestedKeys({ summary: "auto", effort: "high", future: true }, "reasoning", new Set(["effort"])),
+    ["reasoning.future", "reasoning.summary"],
+  );
+  assert.deepEqual(ignoredNestedKeys(null, "reasoning", new Set()), []);
+});
+
 test("natively handled and emulated parameters are neither ignored nor refused", () => {
-  const c = classify({ ...base, stream: true, max_tokens: 10, stop: ["x"], stream_options: {} });
+  const c = classify({
+    ...base,
+    stream: true,
+    max_tokens: 10,
+    stop: ["x"],
+    stream_options: {},
+    reasoning_effort: "high",
+    tools: [],
+    tool_choice: "none",
+  });
   assert.deepEqual(c.ignored, []);
   assert.deepEqual(c.refused, []);
 });
@@ -70,24 +142,37 @@ test("mode ignore is silent, mode error rejects", () => {
   });
 });
 
-test("parseChatRequest refuses what is left, and reports tools as ignored", () => {
+test("parseChatRequest refuses what is left and normalizes tool policy", () => {
   assert.throws(() => parseChatRequest({ ...base, response_format: {} }), (e) => {
     assert.equal(e.status, 400);
     assert.match(e.message, /`response_format` is not supported/);
     return true;
   });
-  assert.deepEqual(parseChatRequest({ ...base, tools: [] }).ignored, ["tools"]);
+  assert.deepEqual(parseChatRequest({ ...base, tools: [], tool_choice: "none" }).ignored, []);
+  assert.deepEqual(parseChatRequest({ ...base, tools: [], tool_choice: "none" }).tools, []);
 });
 
 test("parseChatRequest surfaces the emulated knobs and validates them", () => {
-  const r = parseChatRequest({ ...base, max_tokens: 5, stop: "END", stream_options: { include_usage: true } });
+  const r = parseChatRequest({
+    ...base,
+    max_tokens: 5,
+    stop: "END",
+    stream_options: { include_usage: true, future_option: 1 },
+    reasoning_effort: "high",
+  });
   assert.equal(r.maxTokens, 5);
   assert.deepEqual(r.stop, ["END"]);
   assert.equal(r.includeUsage, true);
+  assert.equal(r.reasoning, "high");
+  assert.deepEqual(r.ignored, ["stream_options.future_option"]);
   // max_completion_tokens is the current spelling and wins over the legacy one.
   assert.equal(parseChatRequest({ ...base, max_tokens: 5, max_completion_tokens: 9 }).maxTokens, 9);
   assert.throws(() => parseChatRequest({ ...base, max_tokens: 0 }), /positive integer/);
   assert.throws(() => parseChatRequest({ ...base, stop: [""] }), /non-empty string/);
+  assert.throws(() => parseChatRequest({ ...base, stream: "true" }), /must be a boolean/);
+  assert.throws(() => parseChatRequest({ ...base, stream_options: [] }), /must be an object/);
+  assert.throws(() => parseChatRequest({ ...base, stream_options: { include_usage: 1 } }), /must be a boolean/);
+  assert.throws(() => parseChatRequest({ ...base, reasoning_effort: 3 }), /non-empty string/);
 });
 
 test("no limiter is built when nothing needs limiting", () => {
@@ -101,12 +186,30 @@ test("a stop sequence cuts the text and excludes itself", () => {
   assert.deepEqual(limit("keep this STOP drop this"), { stopReason: "end_turn", text: "keep this " });
 });
 
+test("the earliest stop in the text wins, independent of array order", () => {
+  const limit = makeLimiter({ maxTokens: null, stop: ["END", "STOP"] });
+  assert.deepEqual(limit("abcSTOP xyzEND"), { stopReason: "end_turn", text: "abc" });
+});
+
+test("the earlier of a stop and the visible length cutoff wins", () => {
+  const limit = makeLimiter({ maxTokens: 2, stop: ["STOP"] });
+  assert.deepEqual(limit("123STOP999"), { stopReason: "end_turn", text: "123" });
+  assert.deepEqual(limit("12345678STOP"), { stopReason: "max_tokens", text: "12345678" });
+});
+
 test("max_tokens truncates and reports length", () => {
   const limit = makeLimiter({ maxTokens: 2, stop: [] });
   assert.equal(limit("12345678"), null); // exactly 2 tokens by the estimate
   const cut = limit("123456789");
   assert.equal(cut.stopReason, "max_tokens");
   assert.equal(cut.text.length, 8);
+});
+
+test("max_tokens never splits a Unicode surrogate pair", () => {
+  const limit = makeLimiter({ maxTokens: 1, stop: [] });
+  const cut = limit("😀😀😀😀😀");
+  assert.deepEqual(cut, { stopReason: "max_tokens", text: "😀😀😀😀" });
+  assert.equal(cut.text.includes("\uFFFD"), false);
 });
 
 test("the token estimate is documented as approximate, and monotonic", () => {

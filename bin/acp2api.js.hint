@@ -5,8 +5,9 @@ config error must never first appear as a failed request.
 
 # scope What this module owns
 
-In: argument parsing, loading the config, `--check`, creating the workspace,
-logging, listening, and shutdown.
+In: argument parsing, `--version`, safe config creation, loading the config,
+`--check`, production-path diagnostics, creating the workspace, logging, listening,
+and shutdown.
 
 Out: any request handling. This file wires and starts; it contains no behaviour that
 a test would need to reach through HTTP.
@@ -15,16 +16,20 @@ a test would need to reach through HTTP.
 
 ```
 acp2api --config <file>   # or ACP2API_CONFIG
+acp2api --version         # no config or child process
+acp2api --init <file>     # create, never overwrite
 acp2api --check           # validate and exit
 acp2api --probe <agent>   # live ACP options/capabilities, no prompt
+acp2api --doctor [--json] # diagnose every configured agent, no prompt
 acp2api --help
 ```
 
 ## rule Exit codes {#exit_codes}
 
-- `0` — `--help`, `--check` on a valid config, or a clean shutdown
+- `0` — `--help`, `--version`, successful `--init`, `--check`/`--doctor` on a
+  healthy config, or a clean shutdown
 - `2` — bad arguments, no config given, a `ConfigError`, a probe failure, or a
-  listener that cannot bind
+  doctor finding, an init refusal, or a listener that cannot bind
 
 A `ConfigError` prints as a single line. Anything else prints as-is, stack included:
 the first is the user's problem, the second is ours, and they should not look alike.
@@ -44,6 +49,24 @@ ACP connection and session-opening machinery. It sends `initialize` and
 session and MCP capability highlights, then closes cleanly. It never applies the
 configured model/options, runs warm-up, or sends `session/prompt`: discovering that
 a model list moved must not spend a subscription turn.
+
+# rule Init is explicit and non-destructive
+
+`--init <file>` creates a minimal YAML with no secret and no pinned model id. It
+uses exclusive creation and refuses an existing path; config is not loaded and no
+agent is spawned. There is no implicit destination or overwrite mode.
+
+# rule Doctor observes production setup without changing account state
+
+`--doctor` loads and normalizes the production config, creates configured
+workspaces, and uses the same bounded `Agent#probe` initialize + cold session/new
+path as `--probe` for every agent. In that disposable session it applies the
+production model, reasoning, mode, and raw options in production order so
+model-dependent option additions/removals are validated against the final surface.
+It never runs warm-up, sends a prompt, or invokes login. It checks configured
+options and network MCP transports, always closes the probe session/process,
+and exits 2 if any agent is unhealthy. `--json` emits one parseable document;
+human output names each stable issue class.
 
 # rule Listener errors are operator errors
 

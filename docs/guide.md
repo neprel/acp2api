@@ -118,9 +118,9 @@ what you are already doing" when that is what you mean.
 ## Going quiet does not lose the work
 
 A conversation nobody has continued past `sessionTtlMs` is **parked**, not ended:
-it closes its ACP session — freeing the child process and the login it holds — and
-keeps the session id. The next message restores it with `session/resume`, and the
-agent still has every file it read and every plan it made.
+it closes that ACP session and keeps the session id. The shared lazy agent child may
+remain alive for other conversations. The next message attempts `session/resume`
+with the original cwd and complete MCP set.
 
 ```
 fake: session conv_msp… parked: sess_01H…
@@ -129,9 +129,10 @@ fake: resumed sess_01H… [mattermost:channel:c8f3…]
 
 So the bounds mean what they should: `maxSessions` caps resident sessions,
 `sessionTtlMs` decides when to give one back, and `forgetTtlMs` — a day by default
-— is what finally forgets a conversation. An agent that cannot resume is not a
-problem: the revive fails and the caller gets a fresh session with its history
-replayed, which is what would have happened anyway.
+— is what finally forgets a conversation. Resume is fail-closed: if the agent no
+longer has the id, continuation fails rather than silently opening an empty session
+that lost the conversation. Start a new conversation explicitly when losing state
+is acceptable.
 
 Two other things end a session. `maxContextFill` retires one that has used up its
 context window, because the alternative is the agent's own compaction and then a
@@ -213,14 +214,14 @@ Send `tools` the way you always would, and they reach the agent:
 
 ```jsonc
 POST /v1/chat/completions
-x-conversation-id: thread-9ab1        // required: the turn outlives this request
+x-conversation-id: thread-9ab1        // recommended stable conversation identity
 
 { "model": "claude-opus",
   "messages": [{"role": "user", "content": "What are the 2026 company holidays?"}],
   "tools": [{"type": "function", "function": {"name": "company_holiday", "parameters": {…}}}] }
 ```
 
-You get back exactly what OpenAI would give you:
+You get back the supported OpenAI-shaped tool-call subset:
 
 ```jsonc
 {"choices": [{"finish_reason": "tool_calls",
@@ -246,9 +247,9 @@ waiting on a paid subscription forever.
 
 `/v1/responses` does the same thing in its own spelling: the call arrives as a
 `function_call` output item with a `call_id`, and you answer it with a
-`function_call_output` item on the next request. Streaming works on both, with one
-honest limit — the call is delivered whole in the terminal event rather than as a
-delta sequence, because the turn produced it whole.
+`function_call_output` item on the next request. Streaming works on both. Responses
+emits item-added, argument delta/done and item-done events even when ACP supplied
+the arguments in one piece.
 
 If an agent has these tools but finishes by printing call-shaped text such as
 `submit_plan({"x":1})`, acp2api leaves that answer exactly as written and adds
@@ -303,12 +304,14 @@ So parameters are split by **what breaks if we proceed**, not by what is support
 
 | | behaviour |
 | --- | --- |
-| `model`, `messages`, `stream` | native |
+| `model`, `messages`, `stream`, `reasoning_effort` | native when the agent advertises the matching option |
 | `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (token counts are approximate; there is no tokenizer here) |
 | `stream_options.include_usage` | native |
 | `temperature`, `top_p`, `seed`, penalties, `logprobs`, unknown fields | **accepted and ignored.** Every client library sends `temperature` unasked; failing on it would reject nearly every real request over a difference the caller cannot perceive |
 | `tools` | **served by default.** The bridge exposes caller tools through a per-conversation MCP server and can return `tool_calls`; set `server.tools: off` to drop them and report `tools` in `ignored_params`. See [Your tools in the agent's hands](#your-tools-in-the-agents-hands) |
-| `tool_choice` | **accepted and ignored.** The ACP agent chooses whether to call a served tool |
+| `tool_choice: "auto"` | supported; the ACP agent chooses whether to call a served tool |
+| `tool_choice: "none"` | supported; caller tools are withheld for that turn |
+| `tool_choice: "required"` / named, `strict: true` | **400.** ACP cannot guarantee selection or constrained arguments |
 | `functions`, `function_call` | **accepted and ignored.** Use `tools` for caller-served functions |
 | `response_format`, `n > 1`, `audio` | **400.** Nothing gives the caller its guarantee back |
 
@@ -435,27 +438,35 @@ than approximate:
 
 | OpenAI | ACP |
 | --- | --- |
-| `previous_response_id` | a retained session — the agent's own memory of the turn |
-| `instructions` | system preamble |
+| `previous_response_id` | the latest retained session tip — the agent's own memory of the turn |
+| `instructions` | an explicitly limited text-preamble emulation |
 | `reasoning: {effort}` | the `thought_level` config option, **per request** |
 | `max_output_tokens` | the same output-watching cut as `max_tokens` |
-| `store: false` | close the session with the turn |
+| `store: false` | return the result without creating a continuation point |
 
 ```sh
 curl localhost:10021/v1/responses \
+  -H 'content-type: application/json' \
   -d '{"model":"claude-opus","input":"My favourite number is 41. Reply: noted"}'
 # {"id":"resp_...","output_text":"noted", ...}
 
 curl localhost:10021/v1/responses \
+  -H 'content-type: application/json' \
   -d '{"model":"claude-opus","input":"What was my number?","previous_response_id":"resp_..."}'
 # "41"
 ```
 
-The second request sends **only the new input**. Chat completions has to resend the
+The second request sends **only the new input** and must name the latest successful
+stored response. A known older id gets `409 stale_previous_response`; an unknown or
+unrecoverable id gets 404. Chat completions has to resend the
 whole history each time and the agent reads it as one flattened transcript; here the
 agent already holds it. `reasoning.effort` can likewise be raised for one hard
-question mid-conversation and dropped again — chat completions has no field for that
-at all.
+question mid-conversation and dropped again. Chat uses `reasoning_effort`.
+
+`instructions` are not a native ACP system-role channel: acp2api places them in the
+initial text. An explicitly identical value may continue, but adding, changing or
+removing it after the first response is refused because old text cannot be erased
+from the agent's history. Start a new chain to change instructions.
 
 Retained conversations hold live ACP sessions inside the agent process, so resident
 sessions are bounded by `server.maxSessions` (parked by last *use*, so an actively
@@ -469,6 +480,7 @@ There is no authentication: acp2api is a local bridge, and authorization is the
 job of the router in front of it. It binds loopback by default and warns at startup
 if `server.host` makes it reachable elsewhere.
 
-Agent *thinking* is streamed and returned as `reasoning_content` alongside
-`content` — the non-standard-but-universal field vLLM, DeepSeek and OpenRouter all
-use.
+Agent thinking and progress can be surfaced separately from answer text. Treat
+these as compatibility extensions and operational trace, not as a guarantee of an
+OpenAI reasoning summary or access to raw hidden thoughts. See the exact surface in
+[compatibility.md](compatibility.md).

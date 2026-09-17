@@ -114,7 +114,7 @@ test("a tool result is attributed to the tool, never to the user", () => {
 test("an assistant turn with both text and calls keeps both", () => {
   const [block] = toPromptBlocks([
     { role: "user", content: "go" },
-    { role: "assistant", content: "reading it now", tool_calls: [{ id: "c", function: { name: "ls" } }] },
+    { role: "assistant", content: "reading it now", tool_calls: [{ id: "c", type: "function", function: { name: "ls", arguments: "{}" } }] },
   ]);
   assert.match(block.text, /Assistant: reading it now\n\[calls ls\] \{\}/);
 });
@@ -150,6 +150,13 @@ test("file_id is refused rather than silently dropped", () => {
   );
 });
 
+test("remote file URLs are refused rather than fetched", () => {
+  assert.throws(
+    () => toPromptBlocks([{ role: "user", content: [{ type: "input_file", file_url: "https://example.com/a.txt" }] }]),
+    /remote file_url is not fetched/,
+  );
+});
+
 test("a remote image URL is refused rather than fetched", () => {
   assert.throws(
     () => toPromptBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] }]),
@@ -163,6 +170,22 @@ test("malformed requests are rejected", () => {
   assert.throws(() => toPromptBlocks([{ content: "no role" }]), /role/);
   assert.throws(() => parseChatRequest({ messages: [{ role: "user", content: "x" }] }), /`model` is required/);
   assert.throws(() => parseChatRequest("nope"), /JSON object/);
+  assert.throws(() => toPromptBlocks([{ role: "alien", content: "x" }]), /unsupported message role/);
+  assert.throws(
+    () => toPromptBlocks([{ role: "assistant", content: null, tool_calls: [{ id: "c", function: { name: "f" } }] }]),
+    /complete function call/,
+  );
+  assert.throws(() => toPromptBlocks([{ role: "tool", content: "x" }]), /tool_call_id/);
+  assert.throws(() => toPromptBlocks([{ role: "user", content: null }]), /need content/);
+  assert.throws(() => toPromptBlocks([{ role: "assistant", content: null }]), /content or tool_calls/);
+  assert.throws(
+    () => toPromptBlocks([{ role: "user", content: "x", tool_calls: [] }]),
+    /array on an assistant/,
+  );
+  assert.throws(
+    () => toPromptBlocks([{ role: "user", content: [{ type: "text", text: 3 }] }]),
+    /string `text`/,
+  );
 });
 
 test("parseChatRequest surfaces the stream flag", () => {
@@ -183,6 +206,9 @@ test("completion maps stop reasons and carries reasoning separately", () => {
   assert.equal(completion({ ...meta, text: "", stopReason: "refusal" }).choices[0].finish_reason, "content_filter");
   // An unknown future stop reason must not produce an invalid finish_reason.
   assert.equal(completion({ ...meta, text: "", stopReason: "something_new" }).choices[0].finish_reason, "stop");
+  assert.equal(completion({ ...meta, text: "", stopReason: "something_new" }).x_acp2api.stop_reason, "something_new");
+  assert.equal(completion({ ...meta, text: "", stopReason: "cancelled" }).x_acp2api.stop_reason, "cancelled");
+  assert.ok(!completion({ ...meta, text: "", stopReason: "refusal" }).x_acp2api);
   // No reasoning means no field at all, not an empty string.
   assert.ok(!("reasoning_content" in completion({ ...meta, text: "x", reasoning: "", stopReason: "end_turn" }).choices[0].message));
 });
@@ -285,4 +311,13 @@ test("chunk is a well-formed streaming delta", () => {
   const c = chunk({ id: "c1", model: "m", created: 7, delta: { content: "a" } });
   assert.equal(c.object, "chat.completion.chunk");
   assert.deepEqual(c.choices[0], { index: 0, delta: { content: "a" }, finish_reason: null });
+
+  const cancelled = chunk({
+    id: "c1", model: "m", created: 7, delta: {}, finishReason: "stop", stopReason: "cancelled",
+  });
+  assert.equal(cancelled.x_acp2api.stop_reason, "cancelled");
+  assert.equal(
+    cancelled.choices[0].delta.provider_specific_fields.x_acp2api.stop_reason,
+    "cancelled",
+  );
 });

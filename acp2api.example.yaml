@@ -1,6 +1,9 @@
 # acp2api -- one OpenAI model id per ACP agent.
 #
-# Copy, edit, then:  acp2api --config acp2api.yaml --check
+# Start a new file with: acp2api --init ./acp2api.yaml
+# For this fully annotated file: copy, edit, then run `--check` and `--doctor`.
+# Doctor performs initialize/session setup and applies the configured options in a
+# disposable session, without a prompt, warm-up or login change.
 #
 # ${VAR} and ${VAR:-default} expand from the environment, so nothing secret has to
 # be written here. A set-but-empty ${VAR} stays empty; `:-` uses its default for an
@@ -16,6 +19,13 @@ server:
   # this port: an agent that runs commands and writes files.
   host: 127.0.0.1
   port: 10021
+
+  # Extra Host authorities accepted in addition to the listener address. Include
+  # the port when clients send one. This keeps the DNS-rebinding check enabled for
+  # a reverse proxy or Docker publish, whose client-visible Host differs from the
+  # container socket. For `-p 127.0.0.1:10021:10021` with `host: 0.0.0.0`:
+  # allowedHosts: ["localhost:10021", "127.0.0.1:10021"]
+  allowedHosts: []
 
   # Browser access is off by default. This server has no authentication, so enable
   # it only for an origin you trust. Use true only when every origin is intended.
@@ -45,8 +55,10 @@ server:
   # metricsAddr: 0.0.0.0:10022
   # Bracket IPv6 addresses, for example: "[::1]:10022".
 
-  # Workspace handed to every ACP session, and the boundary for fs/read_text_file
-  # and fs/write_text_file. Relative paths resolve against this file.
+  # Workspace handed to every ACP session, and the boundary for bridge-owned
+  # fs/read_text_file, fs/write_text_file and terminal cwd handling. Relative paths
+  # resolve against this file. This is NOT an OS sandbox for the spawned CLI; use a
+  # dedicated user/container/VM when the workload is adversarial.
   cwd: ./work
 
   # Nobody is at a keyboard to answer session/request_permission, so it is answered
@@ -137,12 +149,21 @@ server:
   # the TTL gives back the sessions nobody has come back to.
   #
   # Neither of them FORGETS anything any more. Past the TTL a conversation is
-  # PARKED: it closes its ACP session -- freeing the login and the memory -- and
-  # keeps the id, so the next message restores it with `session/resume` and the
-  # agent still holds every file it had read and every plan it had made. The cap
+  # PARKED: it closes that ACP session and keeps the id, so the next message tries
+  # `session/resume` with the original cwd and MCP set. The shared child process may
+  # remain alive for other conversations. A failed resume fails closed instead of
+  # silently opening an empty session that lost history. The cap
   # counts resident sessions only; a parked conversation costs one map entry.
   maxSessions: 100
   sessionTtlMs: 3600000
+
+  # In-memory Responses retention is bounded separately from resident ACP
+  # sessions. These caps cover conversation metadata, count of stored response
+  # objects, and their combined serialized size. Old inactive data is evicted
+  # first; active/pending conversations are not interrupted to make room.
+  maxConversations: 1000
+  maxResponses: 1000
+  maxResponseBytes: 67108864 # 64 MiB
 
   # When a conversation stops being one at all, and the next message genuinely
   # starts over. Generous on purpose -- a thread picked up the next morning should

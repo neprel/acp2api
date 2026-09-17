@@ -1,0 +1,39 @@
+# module Responses handler boundary
+
+Owns the complete Responses route after routing: body parsing, normalization,
+previous-response ownership, caller-tool validation/suspension, ACP turn execution,
+canonical stream finalization, storage admission, response shaping and release.
+Shared sink/session accounting primitives come from `turn-runtime.js`; timer and
+disconnect ownership comes from `turn-lifecycle.js`. `server.js` must not duplicate
+this handler.
+
+# invariant Refuse before continuation claim
+
+Malformed or unsupported parameters and unknown models must fail without claiming
+or refreshing any retained Responses conversation.
+
+# invariant Advancement invalidates an unsuccessful continuation
+
+Once a prompt is sent or a matching tool result is resolved, a failure, timeout or
+disconnect closes the chain while preserving prior GET snapshots. Pre-turn
+validation leaves the claimed tip usable. Unknown, duplicate, standalone or mixed
+tool outputs fail before result resolution or prompt spawn.
+
+`Agent.preflightTurn` validates prompt capabilities and request-level options before
+the handler marks the turn advanced. A recoverable 400 therefore releases the
+claim without closing the chain; failure after the subsequent `agent.turn` call is
+treated as an attempted ACP turn and invalidates it.
+
+# invariant One HTTP owner per pending Responses turn
+
+Claiming a suspended Responses continuation atomically marks its pending turn
+attached and returns an opaque claim token. A concurrent result request receives
+409 `conversation_busy` before calling `ToolBridge.resolve`; it may neither detach
+the first owner nor invalidate that owner's conversation. Releasing the token
+keeps a still-pending conversation busy while making it adoptable again.
+
+# invariant Streaming finalizes before storage
+
+`ResponseStream.finalize` produces the canonical immutable response before
+`SessionStore.record` performs byte admission. The completed SSE event and GET use
+that same finalized value; no stream step may mutate it after accounting.

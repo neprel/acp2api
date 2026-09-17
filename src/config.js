@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 /**
@@ -68,6 +68,10 @@ const SERVER_SCHEMA = {
   // Browser access is an exposure decision on a server with no authentication.
   // False is off, true permits every origin, and a string permits that one origin.
   cors: { default: false, type: "cors" },
+  // Host headers accepted in addition to the configured listener/local socket.
+  // Entries include a port when the incoming Host does (for example a reverse
+  // proxy's public name); X-Forwarded-Host is deliberately not consulted.
+  allowedHosts: { default: () => [], type: "nonEmptyStringList" },
   // Prometheus metrics, on an address of their own: "off", or "host:port".
   //
   // A SECOND listener rather than a route on the API port, for two reasons. The API
@@ -116,6 +120,10 @@ const SERVER_SCHEMA = {
   // the agent process, so both bounds matter: the cap limits live sessions and the
   // TTL gives back those nobody returns to.
   maxSessions: { default: 100, type: "positiveInt" },
+  // Stored Responses state is a separate budget from resident ACP sessions.
+  maxConversations: { default: 1_000, type: "positiveInt" },
+  maxResponses: { default: 1_000, type: "positiveInt" },
+  maxResponseBytes: { default: 64 * 1024 * 1024, type: "positiveInt" },
   sessionTtlMs: { default: 3_600_000, type: "positiveInt" },
   // When a conversation stops being a conversation at all.
   //
@@ -393,6 +401,10 @@ const FIELD_TYPES = {
   nonEmptyList: { valid: (v) => Array.isArray(v) && v.length > 0, expected: "a non-empty list" },
   mappingOrList: { valid: (v) => isMapping(v) || Array.isArray(v), expected: "a mapping or list" },
   stringList: { valid: (v) => Array.isArray(v) && v.every((item) => typeof item === "string"), expected: "a list of strings" },
+  nonEmptyStringList: {
+    valid: (v) => Array.isArray(v) && v.every((item) => typeof item === "string" && item.length > 0),
+    expected: "a list of non-empty strings",
+  },
   boolean: { coerce: asBoolean, valid: (v) => typeof v === "boolean", expected: "true or false" },
   cors: {
     coerce: asBoolean,
@@ -603,7 +615,39 @@ export function loadConfig(file, { env = process.env } = {}) {
     throw new ConfigError(`cannot read config ${path}: ${e.message}`);
   }
   try {
-    return normalizeConfig(raw, { baseDir: dirname(path), env });
+    const config = normalizeConfig(raw, { baseDir: dirname(path), env });
+    const canonical = (cwd, at) => {
+      const missing = [];
+      let existing = cwd;
+      while (true) {
+        try {
+          return resolve(realpathSync(existing), ...missing.reverse());
+        } catch (error) {
+          if (error.code !== "ENOENT") {
+            throw new ConfigError(`${at} workspace is not accessible at ${cwd}: ${error.message}`);
+          }
+          try {
+            if (lstatSync(existing).isSymbolicLink()) {
+              throw new ConfigError(`${at} workspace contains a broken symbolic link at ${existing}`);
+            }
+          } catch (statError) {
+            if (statError instanceof ConfigError) throw statError;
+            if (statError.code !== "ENOENT") {
+              throw new ConfigError(`${at} workspace is not accessible at ${cwd}: ${statError.message}`);
+            }
+          }
+          const parent = dirname(existing);
+          if (parent === existing) throw new ConfigError(`${at} workspace has no accessible parent at ${cwd}`);
+          missing.push(basename(existing));
+          existing = parent;
+        }
+      }
+    };
+    config.server.cwd = canonical(config.server.cwd, "server.cwd");
+    for (let i = 0; i < config.agents.length; i++) {
+      config.agents[i].cwd = canonical(config.agents[i].cwd, `agents[${i}].cwd`);
+    }
+    return config;
   } catch (e) {
     throw e instanceof ConfigError ? new ConfigError(`${path}: ${e.message}`) : e;
   }

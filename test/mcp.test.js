@@ -1,9 +1,68 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ToolBridge } from "../src/mcp.js";
+import { ToolBridge, toMcpTool, toolFingerprint } from "../src/mcp.js";
 import { SessionStore } from "../src/sessions.js";
 
 const TOOLS = [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }];
+
+test("only validated function tools are converted to MCP", () => {
+  assert.deepEqual(toMcpTool(TOOLS[0]), {
+    name: "read_file",
+    description: "",
+    inputSchema: { type: "object" },
+  });
+  assert.deepEqual(toMcpTool({ type: "function", name: "flat" }), {
+    name: "flat",
+    description: "",
+    inputSchema: { type: "object", properties: {} },
+  });
+  assert.throws(() => toMcpTool({ type: "custom", name: "unsafe" }), /invalid OpenAI function tool/);
+});
+
+test("a conversation rejects changes to its cached tool list", () => {
+  const bridge = new ToolBridge();
+  const token = bridge.open(TOOLS);
+  bridge.setTools(token, structuredClone(TOOLS));
+  assert.throws(
+    () => bridge.setTools(token, [{ type: "function", function: { name: "write_file" } }]),
+    (error) => error.status === 400 && error.code === "tool_set_changed",
+  );
+  bridge.close(token);
+});
+
+test("tool fingerprints ignore object-key and tool order but retain schema changes", () => {
+  const a = [
+    { type: "function", function: { name: "b", parameters: { type: "object", properties: { x: { type: "string" } } } } },
+    { type: "function", function: { name: "a" } },
+  ];
+  const b = [
+    { function: { name: "a" }, type: "function" },
+    { function: { parameters: { properties: { x: { type: "string" } }, type: "object" }, name: "b" }, type: "function" },
+  ];
+  assert.equal(toolFingerprint(a), toolFingerprint(b));
+  b[1].function.parameters.properties.x.type = "number";
+  assert.notEqual(toolFingerprint(a), toolFingerprint(b));
+});
+
+test("tool_choice none disables both discovery and stale cached calls, and auto re-enables them", async () => {
+  const bridge = new ToolBridge();
+  const token = bridge.open(TOOLS);
+  bridge.setEnabled(token, false);
+  assert.deepEqual(
+    await bridge.handle(token, { jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    { jsonrpc: "2.0", id: 1, result: { tools: [] } },
+  );
+  const refused = await bridge.handle(token, {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: { name: "read_file", arguments: {} },
+  });
+  assert.equal(refused.error.code, -32602);
+  bridge.setEnabled(token, true);
+  assert.equal((await bridge.handle(token, { jsonrpc: "2.0", id: 3, method: "tools/list" })).result.tools.length, 1);
+  bridge.close(token);
+});
 
 async function parked(bridge, token, convId) {
   const response = bridge.handle(token, {

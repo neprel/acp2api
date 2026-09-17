@@ -1,6 +1,6 @@
 {
   "name": "acp2api",
-  "version": "1.15.1",
+  "version": "1.16.0",
   "description": "OpenAI-compatible HTTP server over ACP agents. Use Claude Code, Codex, opencode or any ACP CLI from anything that speaks the OpenAI API but does not speak ACP yet.",
   "keywords": [
     "acp",
@@ -35,6 +35,8 @@
   "files": [
     "bin/*.js",
     "src/*.js",
+    "docs/*.md",
+    "examples/*",
     "acp2api.example.yaml"
   ],
   "engines": {
@@ -45,7 +47,8 @@
   },
   "scripts": {
     "start": "node bin/acp2api.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "test:sdk": "node --test test/sdk/sdk.test.js"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
@@ -54,5 +57,10 @@
   "optionalDependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.66.0",
     "@agentclientprotocol/codex-acp": "1.1.14"
+  },
+  "devDependencies": {
+    "@openhint/cli": "1.5.2",
+    "openai": "7.17.0",
+    "typescript": "6.0.3"
   }
 }

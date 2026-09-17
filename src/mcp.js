@@ -60,6 +60,8 @@ class Bench {
     this.timeoutMs = timeoutMs;
     /** OpenAI tool definitions, as last declared by the caller. */
     this.tools = [];
+    /** Whether caller-owned tools may be discovered or called this turn. */
+    this.enabled = true;
     /** callId -> {name, args, settle, timer, reported, convId} */
     this.pending = new Map();
     /** Woken when a call parks, so the HTTP layer can stop waiting for the turn. */
@@ -97,7 +99,21 @@ export class ToolBridge {
    */
   setTools(token, tools) {
     const bench = this.#benches.get(token);
-    if (bench && Array.isArray(tools)) bench.tools = tools;
+    if (!bench || !Array.isArray(tools)) return;
+    const before = toolFingerprint(bench.tools);
+    const after = toolFingerprint(tools);
+    if (before !== after) {
+      const error = new Error("caller tools cannot change during a conversation; start a new conversation");
+      error.status = 400;
+      error.code = "tool_set_changed";
+      throw error;
+    }
+  }
+
+  /** Enables `auto` or enforces `none` without discarding the session's fixed list. */
+  setEnabled(token, enabled) {
+    const bench = this.#benches.get(token);
+    if (bench) bench.enabled = enabled === true;
   }
 
   /** Names of the caller tools this bench currently offers. */
@@ -219,12 +235,12 @@ export class ToolBridge {
     }
 
     if (method === "tools/list") {
-      return rpcResult(id, { tools: bench.tools.map(toMcpTool).filter(Boolean) });
+      return rpcResult(id, { tools: bench.enabled ? bench.tools.map(toMcpTool) : [] });
     }
 
     if (method === "tools/call") {
       const name = params?.name;
-      if (typeof name !== "string" || !bench.tools.some((t) => toMcpTool(t)?.name === name)) {
+      if (!bench.enabled || typeof name !== "string" || !bench.tools.some((t) => toMcpTool(t).name === name)) {
         return rpcError(id, INVALID_PARAMS, `no such tool: ${name}`);
       }
       return rpcResult(id, await this.#park(token, bench, name, params?.arguments ?? {}));
@@ -270,8 +286,13 @@ const argsToJson = (args) => {
  * tool this can serve (`type: "custom"`, a hosted tool, anything unrecognised).
  */
 export function toMcpTool(tool) {
-  const fn = tool?.function ?? (tool?.name ? tool : null);
-  if (!fn || typeof fn.name !== "string" || fn.name === "") return null;
+  const fn = tool?.function ?? (tool?.type === "function" ? tool : null);
+  if (!fn || tool?.type !== "function" || typeof fn.name !== "string" || fn.name === "") {
+    const error = new TypeError("invalid OpenAI function tool");
+    error.status = 400;
+    error.code = "invalid_request_error";
+    throw error;
+  }
   return {
     name: fn.name,
     description: fn.description ?? "",
@@ -280,3 +301,19 @@ export function toMcpTool(tool) {
     inputSchema: fn.parameters ?? { type: "object", properties: {} },
   };
 }
+
+/** Stable identity for the caller-owned tool surface fixed at session creation. */
+export function toolFingerprint(tools) {
+  return JSON.stringify(
+    tools
+      .map(toMcpTool)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(stableValue),
+  );
+}
+
+const stableValue = (value) => {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+};

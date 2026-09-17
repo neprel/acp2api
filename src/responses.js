@@ -4,12 +4,13 @@
  * This is the better fit of the two OpenAI surfaces, and not by a little: the
  * Responses API is stateful and so is ACP. `previous_response_id` maps onto a
  * retained session, `instructions` onto a system preamble, and `reasoning.effort`
- * straight onto the `thought_level` config option -- a per-request knob chat
- * completions cannot express at all, because it has no field for it.
+ * straight onto the `thought_level` config option. Chat exposes the same ACP
+ * override under its own `reasoning_effort` spelling.
  *
  * Pure translation, like openai.js: no I/O, no clock beyond what callers pass in.
  */
 import { acp2apiAnnotation, RequestError, toPromptBlocks, toUsage } from "./openai.js";
+import { ignoredNestedKeys, normalizeToolPolicy } from "./params.js";
 
 /** Parameters that arrive under different names here than in chat completions. */
 const NATIVE = new Set([
@@ -22,6 +23,7 @@ const NATIVE = new Set([
   "reasoning",
   "max_output_tokens",
   "tools",
+  "tool_choice",
 ]);
 
 const REFUSED = {
@@ -35,9 +37,11 @@ const STATUS = {
   end_turn: ["completed", null],
   max_tokens: ["incomplete", "max_output_tokens"],
   max_turn_requests: ["incomplete", "max_output_tokens"],
-  refusal: ["completed", null],
-  cancelled: ["incomplete", "cancelled"],
+  refusal: ["incomplete", "content_filter"],
+  cancelled: ["cancelled", null],
 };
+
+const EXACT_RESPONSE_STOP_REASONS = new Set(["end_turn", "max_tokens", "refusal", "cancelled"]);
 
 /**
  * Renders `input` into ACP content blocks.
@@ -48,6 +52,9 @@ const STATUS = {
  * Replaying it would make the agent read its own past twice.
  */
 export function toInputBlocks(input, instructions) {
+  if (instructions != null && typeof instructions !== "string") {
+    throw new RequestError("`instructions` must be a string or null");
+  }
   const messages =
     typeof input === "string"
       ? [{ role: "user", content: input }]
@@ -67,24 +74,85 @@ function normalizeItem(item) {
   if (!item || typeof item !== "object") throw new RequestError("each input item must be an object");
   // A call this server made, echoed back by the caller. It is part of the record
   // rather than something to say again -- the agent is still inside that call.
-  if (item.type === "function_call") return null;
+  if (item.type === "function_call") {
+    if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) {
+      throw new RequestError("a function_call input item needs non-empty `call_id` and `name`");
+    }
+    if (typeof item.arguments !== "string") throw new RequestError("function_call `arguments` must be a string");
+    return null;
+  }
   // The ANSWER to one. Read separately by `toolOutputsIn`; rendering it as a
   // message would tell the agent a person had pasted the result.
-  if (item.type === "function_call_output") return null;
+  if (item.type === "function_call_output") {
+    if (typeof item.call_id !== "string" || !item.call_id) {
+      throw new RequestError("a function_call_output input item needs a non-empty `call_id`");
+    }
+    if (!("output" in item)) throw new RequestError("a function_call_output input item needs `output`");
+    return null;
+  }
   if (item.type && item.type !== "message") {
     throw new RequestError(`input items of type "${item.type}" are not supported; send messages`);
   }
-  const content = Array.isArray(item.content)
-    ? item.content.map((p) => (p?.type === "input_text" ? { type: "text", text: p.text } : p))
-    : item.content;
-  return { role: item.role ?? "user", content };
+  const role = item.role ?? "user";
+  if (!["user", "assistant", "system", "developer"].includes(role)) {
+    throw new RequestError(`input message role "${role}" is not supported`);
+  }
+  if (typeof item.content !== "string" && !Array.isArray(item.content)) {
+    throw new RequestError("input message `content` must be a string or an array of parts");
+  }
+  const content = Array.isArray(item.content) ? item.content.map(normalizeContentPart) : item.content;
+  return { role, content };
+}
+
+/** Maps the supported Responses content vocabulary onto openai.js' ACP renderer. */
+function normalizeContentPart(part) {
+  if (!part || typeof part !== "object") throw new RequestError("each input content part must be an object");
+  if (part.type === "input_text" || part.type === "output_text") {
+    if (typeof part.text !== "string") throw new RequestError(`${part.type} \`text\` must be a string`);
+    return { type: "text", text: part.text };
+  }
+  if (part.type === "input_image") {
+    if (part.file_id != null) {
+      throw new RequestError("input_image file_id refers to an OpenAI-hosted file; send a base64 data: URI instead");
+    }
+    if (typeof part.image_url !== "string" || !/^data:[^;,]+;base64,.+$/s.test(part.image_url)) {
+      throw new RequestError("input_image image_url must be a base64 data: URI");
+    }
+    return { type: "image_url", image_url: { url: part.image_url } };
+  }
+  if (part.type === "input_file") {
+    if (part.file_id != null) {
+      throw new RequestError("input_file file_id refers to an OpenAI-hosted file; send file_data instead");
+    }
+    if (part.file_url != null) {
+      throw new RequestError("remote input_file file_url is not fetched; send file_data instead");
+    }
+    return {
+      type: "input_file",
+      file_data: part.file_data,
+      ...(part.filename != null ? { filename: part.filename } : {}),
+    };
+  }
+  throw new RequestError(`unsupported input content part type: ${part.type}`);
 }
 
 export function parseResponsesRequest(body) {
   if (!body || typeof body !== "object") throw new RequestError("request body must be a JSON object");
   if (typeof body.model !== "string" || body.model === "") throw new RequestError("`model` is required");
+  if (body.stream != null && typeof body.stream !== "boolean") throw new RequestError("`stream` must be a boolean");
+  if (body.store != null && typeof body.store !== "boolean") throw new RequestError("`store` must be a boolean");
+  if (body.previous_response_id != null && (typeof body.previous_response_id !== "string" || !body.previous_response_id)) {
+    throw new RequestError("`previous_response_id` must be a non-empty string or null");
+  }
+  if (body.reasoning != null && (typeof body.reasoning !== "object" || Array.isArray(body.reasoning))) {
+    throw new RequestError("`reasoning` must be an object");
+  }
+  if (body.reasoning?.effort != null && typeof body.reasoning.effort !== "string") {
+    throw new RequestError("`reasoning.effort` must be a string or null");
+  }
+  if (body.tools != null && !Array.isArray(body.tools)) throw new RequestError("`tools` must be an array");
 
-  const ignored = [];
+  const ignored = ignoredNestedKeys(body.reasoning, "reasoning", new Set(["effort"]));
   const refused = [];
   for (const key of Object.keys(body)) {
     if (NATIVE.has(key)) continue;
@@ -104,9 +172,22 @@ export function parseResponsesRequest(body) {
     throw new RequestError("`max_output_tokens` must be a positive integer");
   }
 
+  const inputBlocks = toInputBlocks(body.input);
+  let toolPolicy;
+  try {
+    toolPolicy = normalizeToolPolicy(body, "responses");
+  } catch (error) {
+    throw error instanceof RequestError
+      ? error
+      : new RequestError(error.message, error.status ?? 400, error.code ?? "invalid_request_error");
+  }
+
   return {
     model: body.model,
+    // `blocks` is for a new chain; a continuation uses `inputBlocks` so unchanged
+    // instructions are not reinserted into the stateful ACP history.
     blocks: toInputBlocks(body.input, body.instructions),
+    inputBlocks,
     instructions: body.instructions ?? null,
     previousResponseId: body.previous_response_id ?? null,
     // OpenAI stores by default, and so do we: without retention
@@ -121,7 +202,9 @@ export function parseResponsesRequest(body) {
     // The caller's own tools, and the answers it has sent back for calls this
     // server handed it. Same feature as on chat completions, different spelling:
     // Responses names a call `function_call` and its answer `function_call_output`.
-    tools: Array.isArray(body.tools) ? body.tools : [],
+    tools: toolPolicy.tools,
+    toolChoice: toolPolicy.choice,
+    toolsProvided: toolPolicy.toolsProvided,
     toolResults: toolOutputsIn(body.input),
   };
 }
@@ -146,34 +229,7 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
     created_at: created,
     status,
     model,
-    output: [
-      ...(reasoning
-        ? [{ id: `${id}-rs`, type: "reasoning", summary: [{ type: "summary_text", text: reasoning }] }]
-        : []),
-      // A turn that stopped to ask for a tool still says whatever it said before
-      // asking, so the message item is emitted only when there is one.
-      ...(text || !calls?.length
-        ? [
-            {
-              id: `${id}-msg`,
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text, annotations: [] }],
-            },
-          ]
-        : []),
-      // `function_call`, not `tool_calls`: the same event, spelled the way this API
-      // spells it. `call_id` is what the caller sends back on the next request.
-      ...(calls ?? []).map((c) => ({
-        id: `${id}-fc-${c.id}`,
-        type: "function_call",
-        status: "completed",
-        call_id: c.id,
-        name: c.name,
-        arguments: c.arguments,
-      })),
-    ],
+    output: canonicalOutputItems({ id, text, reasoning, calls }),
     output_text: text,
     instructions: instructions ?? null,
     previous_response_id: previousResponseId ?? null,
@@ -181,9 +237,45 @@ export function responseObject({ id, model, created, text, reasoning, stopReason
     incomplete_details: incomplete ? { reason: incomplete } : null,
     error: null,
     usage: renameUsage(usage),
-    ...acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session }),
+    ...acp2apiAnnotation({
+      ignored,
+      suspectedTextToolCall,
+      context,
+      cost,
+      session,
+      stopReason: EXACT_RESPONSE_STOP_REASONS.has(stopReason) ? null : stopReason,
+    }),
   };
 }
+
+/** The non-streamed ordering and item factories are also used by ResponseStream. */
+function canonicalOutputItems({ id, text = "", reasoning = "", calls = [] }) {
+  const items = [];
+  if (reasoning) items.push(reasoningItem(itemId(id, "reasoning", items.length), reasoning));
+  if (text || calls.length === 0) items.push(messageItem(itemId(id, "message", items.length), text));
+  for (const call of calls) items.push(functionCallItem(itemId(id, "function_call", items.length), call));
+  return items;
+}
+
+const itemId = (responseId, kind, outputIndex) =>
+  `${responseId}-${kind === "reasoning" ? "rs" : kind === "message" ? "msg" : "fc"}-${outputIndex}`;
+
+const reasoningItem = (id, text) => ({ id, type: "reasoning", summary: [{ type: "summary_text", text }] });
+const messageItem = (id, text, status = "completed") => ({
+  id,
+  type: "message",
+  status,
+  role: "assistant",
+  content: status === "in_progress" ? [] : [{ type: "output_text", text, annotations: [] }],
+});
+const functionCallItem = (id, call, status = "completed") => ({
+  id,
+  type: "function_call",
+  status,
+  call_id: call.call_id ?? call.id,
+  name: call.name,
+  arguments: status === "in_progress" ? "" : call.arguments,
+});
 
 /** Responses uses different field names; all arithmetic stays in `toUsage`. */
 function renameUsage(usage) {
@@ -209,7 +301,8 @@ function renameUsage(usage) {
 export class ResponseStream {
   #seq = 0;
   #index = 0;
-  #open = null; // {kind: "reasoning"|"message", index}
+  #open = null;
+  #items = [];
 
   constructor(write, { id, response }) {
     this.write = write;
@@ -222,78 +315,117 @@ export class ResponseStream {
   }
 
   created() {
-    this.#emit("response.created", { response: this.response });
-    this.#emit("response.in_progress", { response: this.response });
+    const initial = {
+      ...this.response,
+      status: "in_progress",
+      output: [],
+      output_text: "",
+      incomplete_details: null,
+      error: null,
+      usage: null,
+    };
+    this.#emit("response.created", { response: initial });
+    this.#emit("response.in_progress", { response: initial });
   }
 
   /** Opens the right item on demand, closing a different one first. */
   delta(kind, text) {
     if (this.#open?.kind !== kind) {
       this.#closeItem();
-      this.#open = { kind, index: this.#index++, text: "" };
+      const index = this.#index++;
+      this.#open = { kind, index, id: itemId(this.id, kind, index), text: "" };
       const item =
         kind === "reasoning"
-          ? { id: `${this.id}-rs`, type: "reasoning", summary: [] }
-          : { id: `${this.id}-msg`, type: "message", status: "in_progress", role: "assistant", content: [] };
+          ? { id: this.#open.id, type: "reasoning", summary: [] }
+          : messageItem(this.#open.id, "", "in_progress");
       this.#emit("response.output_item.added", { output_index: this.#open.index, item });
-      this.#emit("response.content_part.added", {
+      this.#emit(kind === "reasoning" ? "response.reasoning_summary_part.added" : "response.content_part.added", {
         item_id: item.id,
         output_index: this.#open.index,
-        content_index: 0,
+        ...(kind === "reasoning" ? { summary_index: 0 } : { content_index: 0 }),
         part: kind === "reasoning" ? { type: "summary_text", text: "" } : { type: "output_text", text: "", annotations: [] },
       });
     }
     this.#open.text += text;
     this.#emit(kind === "reasoning" ? "response.reasoning_summary_text.delta" : "response.output_text.delta", {
-      item_id: `${this.id}-${kind === "reasoning" ? "rs" : "msg"}`,
+      item_id: this.#open.id,
       output_index: this.#open.index,
-      content_index: 0,
+      ...(kind === "reasoning" ? { summary_index: 0 } : { content_index: 0 }),
       delta: text,
     });
   }
 
   #closeItem() {
     if (!this.#open) return;
-    const { kind, index, text } = this.#open;
-    const itemId = `${this.id}-${kind === "reasoning" ? "rs" : "msg"}`;
+    const { kind, index, id, text } = this.#open;
     this.#emit(kind === "reasoning" ? "response.reasoning_summary_text.done" : "response.output_text.done", {
-      item_id: itemId,
+      item_id: id,
       output_index: index,
-      content_index: 0,
+      ...(kind === "reasoning" ? { summary_index: 0 } : { content_index: 0 }),
       text,
     });
-    this.#emit("response.content_part.done", {
-      item_id: itemId,
+    this.#emit(kind === "reasoning" ? "response.reasoning_summary_part.done" : "response.content_part.done", {
+      item_id: id,
       output_index: index,
-      content_index: 0,
-      part:
-        kind === "reasoning"
-          ? { type: "summary_text", text }
-          : { type: "output_text", text, annotations: [] },
+      ...(kind === "reasoning" ? { summary_index: 0 } : { content_index: 0 }),
+      part: kind === "reasoning" ? { type: "summary_text", text } : { type: "output_text", text, annotations: [] },
     });
-    this.#emit("response.output_item.done", {
-      output_index: index,
-      item:
-        kind === "reasoning"
-          ? { id: itemId, type: "reasoning", summary: [{ type: "summary_text", text }] }
-          : {
-              id: itemId,
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text, annotations: [] }],
-            },
-    });
+    const item = kind === "reasoning" ? reasoningItem(id, text) : messageItem(id, text);
+    this.#emit("response.output_item.done", { output_index: index, item });
+    this.#items.push(item);
     this.#open = null;
   }
 
-  completed(response) {
+  /** Emits a complete function call even when ACP supplied its arguments at once. */
+  functionCall(call) {
     this.#closeItem();
+    const index = this.#index++;
+    const id = itemId(this.id, "function_call", index);
+    this.#emit("response.output_item.added", {
+      output_index: index,
+      item: functionCallItem(id, call, "in_progress"),
+    });
+    this.#emit("response.function_call_arguments.delta", {
+      item_id: id,
+      output_index: index,
+      delta: call.arguments,
+    });
+    this.#emit("response.function_call_arguments.done", {
+      item_id: id,
+      output_index: index,
+      arguments: call.arguments,
+    });
+    const item = functionCallItem(id, call);
+    this.#emit("response.output_item.done", { output_index: index, item });
+    this.#items.push(item);
+  }
+
+  finalize(response) {
+    this.#closeItem();
+    const calls = response.output.filter((item) => item.type === "function_call");
+    for (const call of calls) this.functionCall(call);
+    if (this.#items.length === 0) {
+      for (const item of response.output) {
+        if (item.type === "message") this.delta("message", item.content[0]?.text ?? "");
+        else if (item.type === "reasoning") this.delta("reasoning", item.summary[0]?.text ?? "");
+      }
+      this.#closeItem();
+    }
+    const output = this.#items.map((item) => structuredClone(item));
+    const outputText = output
+      .filter((item) => item.type === "message")
+      .flatMap((item) => item.content)
+      .filter((part) => part.type === "output_text")
+      .map((part) => part.text)
+      .join("");
+    return { ...structuredClone(response), output, output_text: outputText };
+  }
+
+  completed(response) {
     this.#emit(response.status === "incomplete" ? "response.incomplete" : "response.completed", { response });
   }
 
   failed(response) {
-    this.#closeItem();
     this.#emit("response.failed", { response });
   }
 }

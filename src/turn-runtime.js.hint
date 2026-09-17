@@ -1,0 +1,14 @@
+# module Shared turn runtime
+
+Owns the shape-neutral primitives used by both extracted HTTP handlers: caller-tool
+sink buffering and park races, MCP bench URL construction, dead-session watching,
+per-turn usage/cost settlement, continuation transcript remembering, timeout error
+construction, and stop-reason mapping. Handler modules import these exports;
+`server.js` only composes and routes.
+
+# invariant One state machine
+
+Chat and Responses may shape different response objects, but they share exactly one
+implementation of pending-turn buffering, usage baseline advancement, dead-session
+retirement and tool-call race ordering. Do not copy these primitives back into a
+handler or introduce a universal DI container.

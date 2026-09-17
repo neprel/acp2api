@@ -1,10 +1,8 @@
 import { spawn } from "node:child_process";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, relative, resolve, isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { Progress } from "./progress.js";
-import { Terminals } from "./terminal.js";
+import { Terminals, WorkspacePaths } from "./terminal.js";
 
 /**
  * The extension method for putting a prompt into a turn that is already running.
@@ -38,12 +36,6 @@ export function selectValues(options) {
   return (options ?? []).flatMap((o) => (Array.isArray(o?.options) ? o.options : [o]));
 }
 
-/** True when `child` is inside `root` -- the guard for every filesystem callback. */
-function within(root, child) {
-  const rel = relative(root, resolve(root, child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
 /**
  * One ACP agent: a long-lived child process speaking ACP over stdio, plus one
  * session per prompt turn.
@@ -70,6 +62,8 @@ export class Agent {
   // hand costs this map and one notification handler.
   #sinks = new Map();
   #terminals = null; // built on demand, only when the capability is on
+  #paths = null;
+  #agentCapabilities = {};
   // The warm session every new one is forked from: {session, warming, warmedAt}.
   // Null until something asks for a session, and only ever set when `warmup` is
   // configured. See #warmBase.
@@ -84,6 +78,7 @@ export class Agent {
     // the only place that sees a FAILED turn as well as a finished one -- and a
     // rate-limited turn is the single quota signal ACP offers for any agent.
     this.#metrics = metrics;
+    if (server.fs) this.#paths = new WorkspacePaths(spec.cwd);
     if (server.terminal) {
       this.#terminals = new Terminals({
         cwd: spec.cwd,
@@ -165,7 +160,6 @@ export class Agent {
 
   #clientApp() {
     const { permission, fs: fsEnabled } = this.#server;
-    const cwd = this.#spec.cwd;
     const app = acp
       .client({ name: "acp2api" })
       // One handler for every session on this agent, fanning out by id. An update
@@ -228,21 +222,26 @@ export class Agent {
     }
 
     if (!fsEnabled) return app;
+    const paths = this.#paths;
     return app
       .onRequest(acp.methods.client.fs.readTextFile, async ({ params }) => {
-        if (!within(cwd, params.path)) throw new Error(`path outside workspace: ${params.path}`);
-        const text = await readFile(resolve(cwd, params.path), "utf8");
-        if (params.line == null && params.limit == null) return { content: text };
-        const lines = text.split("\n");
-        const from = Math.max(0, (params.line ?? 1) - 1);
-        return { content: lines.slice(from, params.limit ? from + params.limit : undefined).join("\n") };
+        try {
+          const text = await paths.readTextFile(params.path);
+          if (params.line == null && params.limit == null) return { content: text };
+          const lines = text.split("\n");
+          const from = Math.max(0, (params.line ?? 1) - 1);
+          return { content: lines.slice(from, params.limit ? from + params.limit : undefined).join("\n") };
+        } catch (error) {
+          throw acp.RequestError.invalidParams(error?.message ?? String(error));
+        }
       })
       .onRequest(acp.methods.client.fs.writeTextFile, async ({ params }) => {
-        if (!within(cwd, params.path)) throw new Error(`path outside workspace: ${params.path}`);
-        const target = resolve(cwd, params.path);
-        await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, params.content, "utf8");
-        return {};
+        try {
+          await paths.writeTextFile(params.path, params.content);
+          return {};
+        } catch (error) {
+          throw acp.RequestError.invalidParams(error?.message ?? String(error));
+        }
       });
   }
 
@@ -272,6 +271,7 @@ export class Agent {
           this.#connection = null;
           this.#conn = null;
           this.#base = null;
+          this.#agentCapabilities = {};
         }
         if (!this.#closing) this.#log("warn", `${name}: agent exited (code=${code} signal=${signal})`);
       });
@@ -316,6 +316,7 @@ export class Agent {
           },
         },
       );
+      this.#agentCapabilities = init.agentCapabilities ?? {};
       this.#log("info", `${name}: ${init.agentInfo?.name ?? command} v${init.agentInfo?.version ?? "?"} ready`);
       return { child, connection, init };
     })().catch((e) => {
@@ -341,25 +342,11 @@ export class Agent {
     // Model first, then reasoning: choosing a model CHANGES the option set. Claude
     // drops the `effort` selector entirely once Haiku is selected, so an id looked
     // up before the model was applied would no longer exist by the time it is used.
-    const wanted = [
-      ...(wants.model ? [{ category: "model", value: wants.model }] : []),
-      ...(wants.reasoning ? [{ category: "thought_level", value: wants.reasoning }] : []),
-      // How much the agent may do without asking. This is the autonomy control that
-      // makes per-action permission prompts unnecessary: set the mode once, for the
-      // session, rather than answering the same question for every edit.
-      ...(wants.mode ? [{ category: "mode", value: wants.mode }] : []),
-      ...Object.entries(wants.options ?? {}).map(([id, value]) => ({ id, value })),
-    ];
+    const wanted = this.#requestedOptions(wants);
     if (wanted.length === 0) return;
 
     for (const want of wanted) {
-      const opt = want.id
-        ? opts.find((o) => o.id === want.id)
-        : opts.find((o) => o.category === want.category);
-      if (!opt) {
-        const what = want.id ? `config option "${want.id}"` : `${want.category} selector`;
-        throw new AgentError(`${this.name}: agent offers no ${what}`, 400, "unsupported_option");
-      }
+      const { option: opt, choice } = this.#resolveRequestedOption(opts, want);
       const { value } = want;
       // claude-agent-acp implements this RPC through a local slash command whose
       // result becomes transcript visible to the next turn. Do not issue it when
@@ -370,15 +357,6 @@ export class Agent {
       if (opt.type === "boolean") {
         Object.assign(payload, { type: "boolean", value: value === true || value === "true" });
       } else {
-        const offered = selectValues(opt.options);
-        const choice = offered.find((o) => o.value === String(value));
-        if (!choice) {
-          throw new AgentError(
-            `${this.name}: "${configId}" has no value "${value}"; offered: ${offered.map((o) => o.value).join(", ")}`,
-            400,
-            "unsupported_option",
-          );
-        }
         if (this.#spec.type === "claude" && want.category === "mode") {
           await this.#bounded(
             ctx.request(acp.methods.agent.session.setMode, { sessionId: session.id, modeId: choice.value }),
@@ -477,10 +455,108 @@ export class Agent {
     return [...this.#spec.mcpServers, ...(extra ?? [])];
   }
 
+  #assertMcpCapabilities(servers) {
+    const capabilities = this.#agentCapabilities.mcpCapabilities ?? {};
+    for (const server of servers) {
+      if ((server.type === "http" || server.type === "sse") && capabilities[server.type] !== true) {
+        throw new AgentError(
+          `${this.name}: agent does not advertise MCP ${server.type} capability required by server "${server.name}"`,
+          400,
+          "unsupported_capability",
+        );
+      }
+    }
+  }
+
+  #assertPromptCapabilities(blocks) {
+    const capabilities = this.#agentCapabilities.promptCapabilities ?? {};
+    for (const block of blocks) {
+      const capability = block.type === "image"
+        ? "image"
+        : block.type === "audio"
+          ? "audio"
+          : block.type === "resource"
+            ? "embeddedContext"
+            : null;
+      if (capability && capabilities[capability] !== true) {
+        throw new AgentError(
+          `${this.name}: agent does not advertise prompt ${capability} capability`,
+          400,
+          "unsupported_capability",
+        );
+      }
+    }
+  }
+
+  #baselineReasoning(options) {
+    return options.find((option) => option.category === "thought_level")?.currentValue ?? null;
+  }
+
+  #turnOverrides(session, overrides) {
+    if (!overrides) return null;
+    return Object.hasOwn(overrides, "reasoning") && overrides.reasoning === null
+      ? { ...overrides, reasoning: session.baselineReasoning }
+      : overrides;
+  }
+
+  #requestedOptions(wants) {
+    return [
+      ...(wants.model ? [{ category: "model", value: wants.model }] : []),
+      ...(wants.reasoning ? [{ category: "thought_level", value: wants.reasoning }] : []),
+      // How much the agent may do without asking. This is the autonomy control that
+      // makes per-action permission prompts unnecessary: set the mode once, for the
+      // session, rather than answering the same question for every edit.
+      ...(wants.mode ? [{ category: "mode", value: wants.mode }] : []),
+      ...Object.entries(wants.options ?? {}).map(([id, value]) => ({ id, value })),
+    ];
+  }
+
+  #resolveRequestedOption(options, want) {
+    const option = want.id
+      ? options.find((candidate) => candidate.id === want.id)
+      : options.find((candidate) => candidate.category === want.category);
+    if (!option) {
+      const what = want.id ? `config option "${want.id}"` : `${want.category} selector`;
+      throw new AgentError(`${this.name}: agent offers no ${what}`, 400, "unsupported_option");
+    }
+    if (option.type === "boolean" || option.currentValue === want.value) return { option, choice: null };
+    const offered = selectValues(option.options);
+    const choice = offered.find((candidate) => candidate.value === String(want.value));
+    if (!choice) {
+      throw new AgentError(
+        `${this.name}: "${option.id}" has no value "${want.value}"; offered: ${offered.map((o) => o.value).join(", ")}`,
+        400,
+        "unsupported_option",
+      );
+    }
+    return { option, choice };
+  }
+
+  #validateTurnOptions(session, wants) {
+    if (!wants) return;
+    for (const want of this.#requestedOptions(wants)) this.#resolveRequestedOption(session.options, want);
+  }
+
+  /** Validates a retained turn without sending session/prompt or changing options. */
+  preflightTurn(session, blocks, { signal, overrides = null } = {}) {
+    this.#assertPromptCapabilities(blocks);
+    if (session?.closed || session?.dead) {
+      throw new AgentError(`${this.name}: session ${session?.id ?? "?"} is no longer usable`, 502, "agent_error");
+    }
+    if (signal?.aborted) {
+      throw new AgentError(`${this.name}: cancelled before the turn started`, 499, "cancelled");
+    }
+    const wants = this.#turnOverrides(session, overrides);
+    this.#validateTurnOptions(session, wants);
+    return wants;
+  }
+
   /** `session/new` plus the agent's configured options. The cold path. */
   async #newSession(ctx, extraMcp, { configure = true } = {}) {
+    const allMcp = this.#mcpFor(extraMcp);
+    this.#assertMcpCapabilities(allMcp);
     const builder = ctx.buildSession(this.#spec.cwd);
-    for (const server of this.#mcpFor(extraMcp)) builder.withMcpServer(server);
+    for (const server of allMcp) builder.withMcpServer(server);
     // `toRequest()` rather than `start()`: starting returns an `ActiveSession` that
     // registers its own update handler, and this class routes updates itself so a
     // resumed session can be read the same way a new one is. The builder is still
@@ -490,7 +566,15 @@ export class Agent {
       this.#server.agentRpcTimeoutMs,
       "session/new did not answer",
     );
-    const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name, mcp: extraMcp ?? [] };
+    const options = res.configOptions ?? [];
+    const session = {
+      id: res.sessionId,
+      options,
+      agent: this.name,
+      mcp: extraMcp ?? [],
+      baselineReasoning: null,
+      resumeContext: null,
+    };
     if (configure) {
       try {
         await this.#applyOptions(ctx, session, this.#spec);
@@ -499,13 +583,19 @@ export class Agent {
         throw this.#classify(e);
       }
     }
+    session.baselineReasoning = this.#baselineReasoning(session.options);
+    session.resumeContext = {
+      cwd: this.#spec.cwd,
+      mcpServers: allMcp,
+      baselineReasoning: session.baselineReasoning,
+    };
     return session;
   }
 
-  /** Opens one unconfigured session and reports the ACP surface without prompting. */
-  async probe() {
+  /** Opens one cold inspection session and reports its ACP surface without prompting. */
+  async probe({ configure = false } = {}) {
     const { connection, init } = await Promise.resolve().then(() => this.#connect());
-    const session = await this.#newSession(connection.agent, undefined, { configure: false });
+    const session = await this.#newSession(connection.agent, undefined, { configure });
     try {
       return {
         agent: this.name,
@@ -551,8 +641,10 @@ export class Agent {
     if (this.#spec.warmup && init.agentCapabilities?.sessionCapabilities?.fork) {
       try {
         const base = await this.#warmBase(ctx);
+        const allMcp = this.#mcpFor();
+        this.#assertMcpCapabilities(allMcp);
         const builder = ctx.buildSession(this.#spec.cwd);
-        for (const server of this.#mcpFor()) builder.withMcpServer(server);
+        for (const server of allMcp) builder.withMcpServer(server);
         const { cwd, mcpServers } = builder.toRequest();
         const res = await this.#bounded(
           ctx.request(acp.methods.agent.session.fork, {
@@ -563,12 +655,21 @@ export class Agent {
           this.#server.agentRpcTimeoutMs,
           "session/fork did not answer",
         );
-        const session = { id: res.sessionId, options: res.configOptions ?? [], agent: this.name };
+        const options = res.configOptions ?? [];
+        const session = {
+          id: res.sessionId,
+          options,
+          agent: this.name,
+          baselineReasoning: null,
+          resumeContext: null,
+        };
         // Applied again rather than assumed inherited. A fork is a new session and
         // the protocol does not promise it carries the parent's selections; two
         // cheap local RPCs are a better bet than a thread silently running on the
         // wrong model.
         await this.#applyOptions(ctx, session, this.#spec);
+        session.baselineReasoning = this.#baselineReasoning(session.options);
+        session.resumeContext = { cwd, mcpServers, baselineReasoning: session.baselineReasoning };
         this.#log("info", `${this.name}: forked ${session.id} from warm base ${base.id}`);
         return session;
       } catch (e) {
@@ -594,13 +695,19 @@ export class Agent {
    * a conversation whose session cannot be restored is a cold conversation, not a
    * failed request.
    */
-  async resumeSession(sessionId, { mcpServers: extra } = {}) {
+  async resumeSession(sessionId, { cwd: storedCwd, mcpServers: suppliedMcp, baselineReasoning: storedBaseline } = {}) {
     if (!sessionId) return null;
     const conn = await Promise.resolve().then(() => this.#connect());
     if (!conn.init.agentCapabilities?.sessionCapabilities?.resume) return null;
     const ctx = conn.connection.agent;
-    const builder = ctx.buildSession(this.#spec.cwd);
-    for (const server of this.#mcpFor(extra)) builder.withMcpServer(server);
+    // A stored resumeContext carries the exact declaration used by session/new.
+    // Legacy callers pass only caller-added MCP servers and no cwd; preserve that
+    // API by prepending configured servers only in that shape.
+    const resumeCwd = storedCwd ?? this.#spec.cwd;
+    const allMcp = storedCwd == null ? this.#mcpFor(suppliedMcp) : (suppliedMcp ?? []);
+    this.#assertMcpCapabilities(allMcp);
+    const builder = ctx.buildSession(resumeCwd);
+    for (const server of allMcp) builder.withMcpServer(server);
     // Named apart from the parameter on purpose: this is the FULL list the builder
     // produced, agent's own plus the caller's, and it is what the agent compares
     // its fingerprint against. Reusing the name shadowed nothing and simply failed
@@ -615,11 +722,17 @@ export class Agent {
         this.#server.agentRpcTimeoutMs,
         "session/resume did not answer",
       );
+      const options = res?.configOptions ?? [];
+      const baselineReasoning = storedBaseline !== undefined
+        ? storedBaseline
+        : this.#baselineReasoning(options);
       return {
         id: res?.sessionId ?? sessionId,
-        options: res?.configOptions ?? [],
+        options,
         agent: this.name,
-        mcp: extra ?? [],
+        mcp: suppliedMcp ?? [],
+        baselineReasoning,
+        resumeContext: { cwd, mcpServers, baselineReasoning },
       };
     } catch (e) {
       if (e?.rpcTimeout) throw e;
@@ -675,9 +788,7 @@ export class Agent {
    * cannot express at all.
    */
   async turn(session, blocks, { signal, onEvent = () => {}, limit = null, overrides = null } = {}) {
-    if (session?.closed || session?.dead) {
-      throw new AgentError(`${this.name}: session ${session?.id ?? "?"} is no longer usable`, 502, "agent_error");
-    }
+    const wants = this.preflightTurn(session, blocks, { signal, overrides });
     // Already gone before the turn began -- the caller hung up while the session
     // was being opened, which on a cold agent is seconds.
     //
@@ -687,9 +798,6 @@ export class Agent {
     // run to the end with nobody waiting for it, and an agent whose turn only ends
     // when it is told would never end at all. Measured as a CI job sitting for
     // five minutes against a log that simply stopped.
-    if (signal?.aborted) {
-      throw new AgentError(`${this.name}: cancelled before the turn started`, 499, "cancelled");
-    }
     const { connection } = await Promise.resolve().then(() => this.#connect());
     const ctx = connection.agent;
 
@@ -715,7 +823,7 @@ export class Agent {
     let outcome = "ok";
 
     try {
-      if (overrides) await this.#applyOptions(ctx, session, overrides);
+      if (wants) await this.#applyOptions(ctx, session, wants);
 
       let text = "";
       let emittedTextLength = 0;

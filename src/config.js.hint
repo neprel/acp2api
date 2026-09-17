@@ -14,6 +14,14 @@ Out: everything else. This module performs no network access, spawns nothing, an
 knows nothing about HTTP or ACP message shapes. `loadConfig` is the only function
 here that touches the filesystem.
 
+`normalizeConfig` remains pure path normalization for programmatic callers.
+`loadConfig` additionally canonicalizes every server/agent workspace before
+returning. For a new workspace it resolves the nearest existing ancestor and
+appends the missing components, so the CLI may create it after loading. A broken
+link or inaccessible existing ancestor is a path-qualified `ConfigError`. Runtime
+filesystem callbacks and child spawning therefore share a stable root without
+making fresh `--init` / `--check` workspaces impossible.
+
 # invariant Validation is total {#total_validation}
 
 Every field that reaches the rest of the program has been checked here. Downstream
@@ -30,22 +38,20 @@ schema or it does not exist** — never add a parallel default, key list, or coe
 branch that a future field can miss. Its commit also needs a test for acceptance and
 rejection.
 
-# func normalizeConfig {#normalize}
+# rule normalizeConfig contract {#normalize}
 
 The single entry point for turning parsed YAML into the validated shape. `loadConfig`
 is a thin wrapper that adds file reading and error prefixing.
 
-## arg raw
-The parsed YAML object. Rejected unless it is a mapping.
+The `raw` argument is the parsed YAML object and is rejected unless it is a
+mapping.
 
-## arg options.baseDir
-Directory relative paths resolve against — the config file's own directory, so a
-config is portable between a checkout and a container without absolute paths.
-Defaults to `process.cwd()`.
+The destructured `baseDir` option is the directory relative paths resolve against —
+the config file's own directory, so a config is portable between a checkout and a
+container without absolute paths. It defaults to `process.cwd()`.
 
-## arg options.env
-The environment used for `${VAR}` expansion. Injected rather than read from
-`process.env` directly, so tests are hermetic.
+The destructured `env` option supplies `${VAR}` expansion. It is injected rather
+than read from `process.env` directly, so tests are hermetic.
 
 ## result
 `{server, agents}` — never a partial object. Throws `ConfigError` instead.
@@ -88,6 +94,12 @@ bracketed form, `[::1]:9090`.
 access must never become default-open. Environment-expanded boolean strings use
 the same coercion as the other boolean fields.
 
+`server.allowedHosts` defaults to `[]` and accepts only a list of non-empty host
+strings. These are additional exact Host header values for documented proxy or
+Docker mappings; they do not imply allowed browser origins and do not authorize
+`X-Forwarded-Host`. Browser origin policy remains the `cors` field above: one exact
+origin string or the explicit wildcard `true`.
+
 # func resolvePreset {#resolve_preset}
 
 See [_.hint#global_install](../_.hint) for why the bare bin name is never spawned.
@@ -121,8 +133,14 @@ Merging the two would silently append adapter flags to someone's custom binary.
 - every numeric and boolean field accepts its env-expanded string form, but nonsense still fails
 - `metricsAddr` parses hostname/IPv4 and bracketed IPv6, and rejects malformed or out-of-range ports
 - `cors` defaults off, accepts one origin or an explicit wildcard, and rejects malformed values
+- `allowedHosts` defaults empty, accepts a list of non-empty proxy/Docker Host
+  values, and stays independent from the explicit `cors` origin policy
 - `limitPatterns` compile case-insensitively and replace the default list when given
 - an invalid `limitPatterns` regex is a path-qualified `ConfigError`, not a raw `SyntaxError`
 - MCP mappings convert to `[{name, value}]`; stdio gets `args`/`env` even when omitted
 - `continuity` accepts a boolean, and a "false"/"0" string from ${VAR}
 - `loadConfig` prefixes errors with the file path and reports an unreadable file
+- `loadConfig` canonicalizes existing workspaces and existing ancestors of new
+  workspaces, and rejects broken links or inaccessible ancestors
+- response storage limits default to 1000 conversations, 1000 responses and 64 MiB,
+  accept positive integer overrides, and reject zero/malformed values

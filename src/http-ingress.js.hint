@@ -1,0 +1,29 @@
+# goal Reject ambient browser and DNS-rebinding input before agents run
+
+This module is the request-front boundary for Host, Origin and inference media
+types. It reduces unauthenticated browser exposure; it is not authentication and
+must never be documented as one.
+
+`readJsonBody` owns the 32 MiB inference-body bound and OpenAI-shaped JSON parse
+errors used by the extracted handlers.
+
+# rule Validation sources
+
+Host authority comes only from the configured listener, the accepted socket's
+local address, or `server.allowedHosts`; never trust forwarded headers. Origin is
+same-origin or explicitly allowed by `server.cors`. `cors: true` is the operator's
+explicit wildcard, including opaque origins. Chat/Responses POST endpoints accept
+only `application/json` with an optional UTF-8 charset.
+
+# invariant Validation precedes model work
+
+`validateHttpIngress` runs before body parsing, registry lookup, session admission,
+agent spawn or prompt. Failures are OpenAI-shaped through `RequestError`: 400
+`invalid_host`, 403 `invalid_origin`, or 415 `unsupported_media_type`.
+
+# test HTTP ingress
+
+- wrong Host, foreign Origin and text/plain inference are rejected before open
+- same-origin browser requests work without CORS response headers
+- explicitly allowed CORS and proxy/Docker host names remain usable
+- MCP POST and body-less GET/DELETE routes are not misclassified as inference

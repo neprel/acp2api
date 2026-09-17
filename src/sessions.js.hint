@@ -5,16 +5,20 @@ is also the only place in this program that holds a resource indefinitely. Both
 halves are the point: retain enough to continue a conversation, never enough to
 strand a child process nobody can reach.
 
-# invariant The unit of retention is a conversation, not a response {#conversation_unit}
+# invariant Responses chains are linear and snapshots are separate {#conversation_unit}
 
-One ACP session serves a whole chain, and **every** response id in that chain
-resolves to it. That is why `previous_response_id` may name any response in the
-chain, not only its tip — a caller branching from an earlier turn is continuing the
-same conversation, because the agent holds one history and cannot be forked.
+One ACP session serves a whole Responses chain, but only its latest successfully
+stored response id may continue it. `claimResponse` distinguishes a retained older
+id as `stale`, an owned tip as `busy`, and a newly acquired tip as `claimed`.
+Unknown, evicted and expired ids return null. This prevents an old id from aliasing
+the newer agent history and pretending to create a branch.
 
-Consequence: `forget` removes a response and closes the session only when the last
-response of its conversation goes. Closing on the first delete would end a
-conversation the caller is still using.
+Stored response bodies have a separate lifecycle. An older retained response stays
+readable through GET even though it is stale for continuation. Deleting the current
+tip or completing a continued turn with `store:false` closes the ACP conversation
+and its bench but preserves older bodies until ordinary bounded snapshot eviction.
+Those orphaned snapshots cannot continue because their conversation no longer
+exists.
 
 # invariant Every path out of the store closes the ACP session {#no_leaks}
 
@@ -143,6 +147,16 @@ and owning its next turn, including when the session is parked and must later be
 resumed. The owner releases in `finally`, except while `pending` still represents
 the same suspended turn.
 
+A Responses claim additionally returns an opaque `claimId`.
+`releaseResponseClaim(convId, claimId)` releases only that owner; a mismatched or
+late release cannot clear a newer turn's ownership.
+
+A pending Responses turn is also claimed here, synchronously: only an unattached
+pending object with no current owner receives a token. The claim sets
+`pending.attached` before returning. A concurrent duplicate observes `busy`, and
+releasing the token clears attachment but deliberately leaves `busy` true while
+the tool turn remains suspended.
+
 A BUSY result is observation, not another claim. Keyed queue/409 handling and the
 pending-result path must see the existing owner without changing it. `peekKey`,
 `peekPrefix`, `peekPending` and `find` are explicitly non-claiming; `peekPending`
@@ -193,10 +207,17 @@ nothing.
 **Parking is unconditional and self-correcting.** Asking an agent whether it can
 resume means starting its process during a prune to find out. Instead every idle
 conversation parks; an agent that cannot resume simply fails the revive,
-`resumeSession` returns null, and the caller opens a fresh session. A failed revive
-is a COLD conversation, never an error — the whole history is replayed into the new
-session, which is why `server.js` decides the prompt blocks after the revive
-attempt and not before.
+`resumeSession` returns null. Chat may retire it and cold-start because the request
+resends the transcript. Responses has no such recovery material: failed resume
+retires the chain and returns `404 not_found`; it must never open an empty
+replacement session.
+
+The conversation stores the exact caller-owned resume arguments used at open time,
+including the caller bench MCP entry. Resume passes those arguments unchanged.
+`Agent` adds its configured cwd and MCP baseline when it builds the complete
+fingerprint; the store must not try to duplicate that agent-layer normalization.
+Chat and Responses both store this context; omitting it for Chat would let a
+temporary per-turn reasoning override become the baseline after resume.
 
 **What is never done: `session/delete`.** Dropping our record must not destroy the
 agent's own stored transcript. Whose history that is, is the agent's business.
@@ -204,8 +225,9 @@ agent's own stored transcript. Whose history that is, is the agent's business.
 # rule Eviction is by last use, never by age {#lru}
 
 A long conversation someone is actively continuing must outlive an abandoned one
-started later. `find` refreshes the timestamp, so continuing a chain is what keeps
-it alive.
+started later. Only a valid latest-id continuation refreshes Responses retention;
+a stale lookup cannot keep a chain alive. Every lookup checks the forget deadline
+before refresh, so touching an already expired id never resurrects it.
 
 `prune` runs before every new conversation, so the store cannot grow between
 requests, and it applies TTL first and the cap second — expiry is about
@@ -235,6 +257,43 @@ the provider's side with its own TTL, refreshed by use; a live child process war
 nothing. What continuity actually buys is that the agent does not re-orient from
 scratch.
 
+# rule Conversation and response storage are independently finite {#storage_bounds}
+
+`maxSessions` bounds resident ACP sessions. It is not a storage limit.
+`maxConversations` defaults to 1,000 retained conversation records;
+`maxResponses` defaults to 1,000 serialized response bodies; and
+`maxResponseBytes` defaults to 64 MiB. `prepareOpen` performs deterministic cleanup
+and evicts the least-recently-used idle conversation when needed. If every slot is
+active it throws `SessionCapacityError` with code `session_capacity`; active or
+pending turns are never cancelled merely to admit another conversation. The error
+has HTTP status 503 for the server's normal error mapper.
+
+`prepareOpen` returns an admission token and reserves its slot across the
+asynchronous ACP `openSession`. `open(..., {admissionId})` consumes that token;
+`cancelOpen(admissionId)` releases it when ACP opening fails. Unreserved opens count
+outstanding admissions and cannot steal their capacity. Admission decisions are
+serialized through eviction so concurrent callers cannot both reserve one freed slot.
+
+`record` serializes once, measures `Buffer.byteLength` of those exact bytes, then
+stores a recursively frozen parse of that serialization. It never retains the
+caller's mutable reference, so later SSE assembly or caller mutation cannot change
+GET data or exceed admitted bytes.
+It may evict oldest stale snapshots, including the prior tip of the same chain,
+but never another conversation's current tip. If the new body itself is too large
+or only current tips remain, it throws `ResponseStorageError` with code
+`response_storage_full` without changing the previous tip or byte/count totals.
+The HTTP layer must handle this after agent work explicitly; it must not report a
+stored response that GET cannot retrieve. The error has HTTP status 507 to separate
+local retention exhaustion from agent or subscription failure.
+
+# invariant Cleanup has one owner and no process-lifetime handle {#periodic_cleanup}
+
+`cleanup(agents)` deduplicates overlapping passes and is awaitable for tests.
+`startCleanup` uses an unref'ed interval, and `stopCleanup` clears it and awaits an
+in-progress pass. `closeAll` stops cleanup before closing every conversation and
+permanently closes the store. All paths that drop a conversation still funnel
+through the cleanup hooks that release pending calls and caller benches.
+
 # invariant Retirement has a closed cause and a bounded attribution {#retirement_attribution}
 
 `retire` accepts exactly `context_fill`, `forgotten`, `revive_failed`,
@@ -256,27 +315,33 @@ conversation-retention policy nor grow with process-lifetime traffic. Responses
 conversations do not create tombstones because `previous_response_id` is already a
 proxy-proof address and exposes retirement as 404.
 
-Generic `discard`, deleting the last stored Responses object, `store: false`, and
+Generic `discard`, deleting the current Responses tip, `store: false`, and
 shutdown are cleanup rather than attributed retirement. A newly opened turn that
 fails before any successful response likewise has nothing a later request can
 truthfully call a replay.
 
-# func prune {#prune}
+# rule Pruning uses an injected registry and clock {#prune}
 
-## arg agents
-The registry, so a closing conversation can reach its agent. Passed in rather than
-held, because this module must not depend on the agent layer.
-
-## invariant No clock of its own
-`now` is injected. Tests drive expiry and LRU by moving a number, not by sleeping.
+`prune(agents)` receives the registry so a closing conversation can reach its
+agent; this module does not depend on the agent layer. `now` is injected. Tests
+drive expiry and LRU by moving a number, never by sleeping.
 
 # test sessions
 
-- an expired conversation is closed by `prune` and stops resolving
+- an expired conversation is closed by `prune` and stops resolving; lookup at the
+  deadline cannot refresh it
 - with the cap exceeded, the least recently *used* conversation is evicted — a
   refreshed old one survives while a newer idle one goes
-- forgetting one response of a chain keeps the conversation; forgetting the last closes it
-- `find` resolves any response in a chain to the same session
+- only the latest stored response can claim a continuation; an older retained id is
+  stale but its body remains readable
+- claim tokens prevent a wrong owner from releasing a continued turn
+- deleting the tip and `store:false` close the chain while preserving older GET snapshots
+- response count/byte limits evict stale snapshots deterministically and reject an
+  oversized body atomically
+- conversation admission evicts idle LRU records and rejects capacity filled by active work
+- admission remains reserved across asynchronous session opening and is cancellable on failure
+- resume metadata retains instructions and caller MCP arguments through parking
+- periodic cleanup is non-overlapping, unref'ed and stopped by shutdown
 - a growing history continues one session; only the unheard tail is sent
 - a diverging history, and a changed system preamble, each start a fresh session
 - proxy-only content-shape and annotation changes continue headerlessly, while an

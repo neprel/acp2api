@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { classify } from "./params.js";
+import { classify, normalizeToolPolicy } from "./params.js";
 
 /** ACP stop reasons -> OpenAI finish_reason. */
 const FINISH = {
@@ -9,6 +9,8 @@ const FINISH = {
   refusal: "content_filter",
   cancelled: "stop",
 };
+
+const EXACT_CHAT_STOP_REASONS = new Set(["end_turn", "max_tokens", "refusal"]);
 
 export class RequestError extends Error {
   constructor(message, status = 400, code = "invalid_request_error") {
@@ -42,16 +44,33 @@ export function toPromptBlocks(messages) {
     if (!m || typeof m !== "object" || typeof m.role !== "string") {
       throw new RequestError("each message needs a `role` and `content`");
     }
+    if (!["system", "developer", "user", "assistant", "tool"].includes(m.role)) {
+      throw new RequestError(`unsupported message role: ${m.role}`);
+    }
+    if (m.tool_calls != null && (m.role !== "assistant" || !Array.isArray(m.tool_calls))) {
+      throw new RequestError("`tool_calls` must be an array on an assistant message");
+    }
+    if (m.role !== "assistant" && m.content == null) {
+      throw new RequestError(`${m.role} messages need content`);
+    }
+    if (m.role === "assistant" && m.content == null && (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0)) {
+      throw new RequestError("assistant messages need content or tool_calls");
+    }
     const text = contentToText(m.content, images);
 
     // An assistant turn that called tools has `content: null` and the calls in a
     // separate field. Rendered as text it was an empty "Assistant:" line -- the
     // agent saw a silent turn where work had happened.
     if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      const calls = m.tool_calls.map((c) => {
-        const name = c?.function?.name ?? "tool";
-        if (c?.id) calledAs.set(c.id, name);
-        return `[calls ${name}] ${c?.function?.arguments ?? "{}"}`;
+      const calls = m.tool_calls.map((c, index) => {
+        if (c?.type !== "function" || typeof c.id !== "string" || c.id === "" ||
+            typeof c.function?.name !== "string" || c.function.name === "" ||
+            typeof c.function?.arguments !== "string") {
+          throw new RequestError(`assistant tool_calls[${index}] must be a complete function call`);
+        }
+        const name = c.function.name;
+        calledAs.set(c.id, name);
+        return `[calls ${name}] ${c.function.arguments}`;
       });
       return { role: "assistant", text: [text, ...calls].filter(Boolean).join("\n") };
     }
@@ -59,6 +78,10 @@ export function toPromptBlocks(messages) {
     // A tool result is not something the USER said. Labelling it "User:" told the
     // agent a person had pasted the output, which is a different conversation.
     if (m.role === "tool") {
+      if (typeof m.tool_call_id !== "string" || m.tool_call_id === "") {
+        throw new RequestError("tool messages need a non-empty `tool_call_id`");
+      }
+      if (m.name != null && typeof m.name !== "string") throw new RequestError("tool message `name` must be a string");
       const name = m.name ?? calledAs.get(m.tool_call_id) ?? "tool";
       return { role: "tool", text: `[result of ${name}]\n${text}` };
     }
@@ -90,8 +113,9 @@ function contentToText(content, images) {
 
   const out = [];
   for (const part of content) {
-    if (part?.type === "text") {
-      out.push(part.text ?? "");
+    if (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") {
+      if (typeof part.text !== "string") throw new RequestError("text content parts need a string `text`");
+      out.push(part.text);
     } else if (part?.type === "image_url") {
       // Only data: URIs -- fetching a remote URL here would silently egress from
       // wherever this runs, which in this deployment is behind a VPN on purpose.
@@ -120,8 +144,9 @@ function contentToText(content, images) {
  * does not exist here, and silently dropping it would send a prompt that talks
  * about an attachment nobody attached.
  */
-function toResource(file) {
+export function toResource(file) {
   if (file?.file_id) throw new RequestError("file_id refers to an OpenAI-hosted file; send file_data instead");
+  if (file?.file_url) throw new RequestError("remote file_url is not fetched; send file_data instead");
   const data = file?.file_data ?? "";
   const m = /^data:([^;,]+);base64,(.+)$/s.exec(data);
   if (!m) throw new RequestError("file_data must be a base64 data: URI");
@@ -134,8 +159,18 @@ function toResource(file) {
 
 /** Validates the request body and pulls out what this server actually honours. */
 export function parseChatRequest(body) {
-  if (!body || typeof body !== "object") throw new RequestError("request body must be a JSON object");
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new RequestError("request body must be a JSON object");
   if (typeof body.model !== "string" || body.model === "") throw new RequestError("`model` is required");
+  if (body.stream != null && typeof body.stream !== "boolean") throw new RequestError("`stream` must be a boolean");
+  if (body.stream_options != null && (!body.stream_options || typeof body.stream_options !== "object" || Array.isArray(body.stream_options))) {
+    throw new RequestError("`stream_options` must be an object");
+  }
+  if (body.stream_options?.include_usage != null && typeof body.stream_options.include_usage !== "boolean") {
+    throw new RequestError("`stream_options.include_usage` must be a boolean");
+  }
+  if (body.reasoning_effort != null && (typeof body.reasoning_effort !== "string" || body.reasoning_effort === "")) {
+    throw new RequestError("`reasoning_effort` must be a non-empty string");
+  }
 
   const { ignored, refused } = classify(body);
   if (refused.length > 0) {
@@ -155,6 +190,13 @@ export function parseChatRequest(body) {
     throw new RequestError("`stop` must be a non-empty string or an array of them");
   }
 
+  let toolPolicy;
+  try {
+    toolPolicy = normalizeToolPolicy(body, "chat");
+  } catch (error) {
+    throw new RequestError(error.message, error.status, error.code);
+  }
+
   return {
     model: body.model,
     blocks: toPromptBlocks(body.messages),
@@ -163,10 +205,13 @@ export function parseChatRequest(body) {
     maxTokens,
     stop,
     ignored,
+    reasoning: body.reasoning_effort ?? null,
+    toolChoice: toolPolicy.choice,
+    toolsProvided: toolPolicy.toolsProvided,
     // The caller's own tools, and the results it has sent back for calls this
     // server handed it. Both are read from the same `messages` array the prompt
     // comes from, because that is where OpenAI puts them.
-    tools: Array.isArray(body.tools) ? body.tools : [],
+    tools: toolPolicy.tools,
     toolResults: toolResultsIn(body.messages),
   };
 }
@@ -238,7 +283,7 @@ export function toolCallDeltas(calls) {
  * the model, and each family counts differently. This exists so `max_tokens` means
  * *something* rather than nothing; it is a budget, not an accountant.
  */
-export const estimateTokens = (text) => Math.ceil(text.length / 4);
+export const estimateTokens = (text) => Math.ceil(Array.from(text).length / 4);
 
 /**
  * Builds the `limit` callback the agent consults after each chunk, or null when the
@@ -252,13 +297,21 @@ export const estimateTokens = (text) => Math.ceil(text.length / 4);
 export function makeLimiter({ maxTokens, stop }) {
   if (!maxTokens && (!stop || stop.length === 0)) return null;
   const limiter = (text) => {
-    for (const needle of stop ?? []) {
+    const stopAt = (stop ?? []).reduce((earliest, needle) => {
       const at = text.indexOf(needle);
-      // The stop sequence itself is not part of the answer, per OpenAI semantics.
-      if (at >= 0) return { stopReason: "end_turn", text: text.slice(0, at) };
+      return at >= 0 && (earliest < 0 || at < earliest) ? at : earliest;
+    }, -1);
+    const points = maxTokens ? Array.from(text) : null;
+    if (stopAt >= 0) {
+      const cutoff = maxTokens && points.length > maxTokens * 4
+        ? points.slice(0, maxTokens * 4).join("").length
+        : null;
+      if (cutoff == null || stopAt < cutoff) {
+        return { stopReason: "end_turn", text: text.slice(0, stopAt) };
+      }
     }
-    if (maxTokens && estimateTokens(text) > maxTokens) {
-      return { stopReason: "max_tokens", text: text.slice(0, maxTokens * 4) };
+    if (maxTokens && points.length > maxTokens * 4) {
+      return { stopReason: "max_tokens", text: points.slice(0, maxTokens * 4).join("") };
     }
     return null;
   };
@@ -360,7 +413,7 @@ export function toUsage(usage) {
 
 export const newCompletionId = () => `chatcmpl-${randomUUID().replace(/-/g, "")}`;
 
-export function acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session } = {}) {
+export function acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session, stopReason } = {}) {
   const value = {
     ...(ignored?.length ? { ignored } : {}),
     ...(suspectedTextToolCall ? { suspected_text_tool_call: suspectedTextToolCall } : {}),
@@ -375,6 +428,7 @@ export function acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cos
       : {}),
     ...(Number.isFinite(cost?.amount) ? { cost: { amount: cost.amount, currency: cost.currency } } : {}),
     ...(session ? { session } : {}),
+    ...(stopReason ? { stop_reason: stopReason } : {}),
   };
   return Object.keys(value).length > 0 ? { x_acp2api: value } : {};
 }
@@ -402,7 +456,14 @@ export function completion({ id, model, created, text, reasoning, stopReason, us
     // Non-standard, and safe: every client reads choices[0], so an extra key costs
     // nothing -- while silently dropping `temperature` and saying nothing would let
     // a caller believe a setting took effect that never could.
-    ...acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session }),
+    ...acp2apiAnnotation({
+      ignored,
+      suspectedTextToolCall,
+      context,
+      cost,
+      session,
+      stopReason: EXACT_CHAT_STOP_REASONS.has(stopReason) ? null : stopReason,
+    }),
   };
 }
 
@@ -414,8 +475,15 @@ export function usageChunk({ id, model, created, usage }) {
   return { id, object: "chat.completion.chunk", created, model, choices: [], usage: toUsage(usage) };
 }
 
-export function chunk({ id, model, created, delta, finishReason = null, ignored, suspectedTextToolCall = null, context, cost, session }) {
-  const annotation = acp2apiAnnotation({ ignored, suspectedTextToolCall, context, cost, session });
+export function chunk({ id, model, created, delta, finishReason = null, ignored, suspectedTextToolCall = null, context, cost, session, stopReason }) {
+  const annotation = acp2apiAnnotation({
+    ignored,
+    suspectedTextToolCall,
+    context,
+    cost,
+    session,
+    stopReason: EXACT_CHAT_STOP_REASONS.has(stopReason) ? null : stopReason,
+  });
   const extension = annotation.x_acp2api;
   return {
     id,

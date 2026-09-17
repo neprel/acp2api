@@ -28,10 +28,12 @@ The prompt text selects the behaviour, so a test asks for the failure it wants.
 | `IGNORE_CANCEL` | keeps streaming after `session/cancel` and never answers the prompt | the post-cancel drain deadline and dead-session rule |
 | `HANG_CLOSE` | answers normally, then leaves that session's `session/close` request pending | close is bounded, logged, and swallowed |
 | `HANG_AFTER_TOOL` | calls a client tool, accepts its result, then never finishes on its own | resumed-turn timeout and disconnect handling |
+| `DELAY_AFTER_TOOL` | calls a client tool, accepts its result, then waits 250 ms before answering | deterministic concurrent tool-result ownership |
 | `DELAY_RESUME` | marks the session so its next `session/resume` waits 100 ms | deterministically opens the parked-continuation race window |
 | `LATE_RESULT` | calls a client tool initially; a replay containing its result answers with `FRESH:<session id>` | late results restart from caller history on a new session |
 | `REFUSE` | completes with `stopReason: "refusal"` | stop-reason mapping |
 | `COUNT` | streams 20 words, checking the abort each one | `max_tokens` and `stop` |
+| `INTERLEAVE` | alternates 20 reasoning/text pairs | stream finalization, item ordering and stored-byte admission |
 | `TELEMETRY` | reports context `{used: 1, size: 3}` and cumulative USD cost in 1.25 increments | response annotations and per-turn cost settling |
 | `LONG_OUTPUT` | streams 256 chunks of 8 KiB over real ACP stdio | slow-reader HTTP backpressure measurement |
 | `ECHOMCP` | answers with the `mcpServers` it received | that MCP config reaches `session/new` |

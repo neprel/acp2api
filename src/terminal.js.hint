@@ -103,6 +103,23 @@ same forbidden thing. `agent.js` maps these to `RequestError.invalidParams` (or
 Errors here are therefore written to be READ by a model: "cwd outside workspace:
 /etc", not "EACCES".
 
+# rule Workspace path checks are fail-closed, not a sandbox {#workspace_paths}
+
+`WorkspacePaths` is the single resolver for terminal cwd and ACP `fs/*`. The
+configured root is canonicalized once. ACP absolute paths are accepted when they
+are lexically inside either that canonical root or the configured spelling of the
+same root; relative paths remain accepted. Paths outside the workspace and paths
+with a `..` component are refused. Every existing component below the trusted root
+is inspected with `lstat`. Any symlink is refused, including a broken link or one
+whose target remains inside the workspace. Existing parents must be directories;
+writes may create missing parents, then revalidate them before opening the target.
+
+Final reads and writes use `O_NOFOLLOW`. This narrows a race on the target but does
+not make the check atomic: Node has no portable `openat` traversal API, and a
+hostile local process can still replace an intermediate component between check
+and operation. Do not describe this as a sandbox or as eliminating TOCTOU. OS user,
+container or jail isolation remains the security boundary.
+
 # bad Never let a command outlive what asked for it {#no_orphans}
 
 Three exits, and all three are needed:
@@ -128,7 +145,11 @@ the command never started instead of an empty failed terminal.
 - a single write larger than the limit is cut inside itself
 - stdout and stderr both arrive, in one stream
 - `exitStatus` is absent while running and present once finished
-- a cwd outside the workspace is refused
+- an absolute cwd inside the workspace works and a cwd outside it is refused
+- absolute and relative workspace files work; traversal, outside paths,
+  file/directory/broken symlinks and non-directory parents are refused by the
+  shared workspace resolver
+- writes at the workspace root and through newly created parents stay inside it
 - the concurrent-command cap is enforced
 - a finished command does not consume a concurrent-command slot
 - the configured timeout and output ceiling are exercised through `Terminals.create`
