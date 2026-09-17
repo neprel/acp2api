@@ -36,7 +36,7 @@ reported in the stream and cannot be promised as HTTP 429.
 | remote image URL / `file_id` | refused | refused; the bridge never downloads it implicitly |
 | inline file data | `file`/`input_file` with a `file_data` data URI supported when the agent advertises embedded context | `input_file` with a `file_data` data URI supported with the same capability |
 | `reasoning_effort` / `reasoning.effort` | supported when the agent advertises `thought_level` | supported per turn |
-| `max_tokens` / `max_output_tokens` | emulated | emulated |
+| `max_completion_tokens` or legacy `max_tokens` / `max_output_tokens` | emulated | emulated |
 | `stop` | emulated, earliest match wins | no Responses stop field |
 | sampling (`temperature`, `top_p`, seed, penalties) | ignored and reported | unknown non-contract fields ignored and reported |
 | nested request fields | known shapes validated; unsupported tool guarantees refused | unknown `reasoning.*` fields ignored and reported by dotted path; tool definitions validated/refused |
@@ -45,7 +45,11 @@ reported in the stream and cannot be promised as HTTP 429.
 Token limits are approximately four Unicode characters per token and cancel the
 ACP turn after the visible bound is reached. They are not tokenizer-accurate spend
 limits. Usage is present only when the agent reports ACP usage; missing usage means
-unknown, not zero.
+unknown, not zero. ACP counters are session-cumulative, so the bridge reports the
+current turn's delta. Chat non-streaming responses include it directly; Chat SSE
+adds a final empty-choice usage chunk only with `stream_options.include_usage`.
+Responses objects and their terminal stream event use `input_tokens`,
+`output_tokens`, and cached-input details.
 
 Inline file data becomes an ACP resource block: text remains inline and other MIME
 types become blobs. `file_id` and remote file URLs are refused because the bridge
@@ -59,21 +63,36 @@ non-function tools, and `strict: true` are refused because ACP cannot provide th
 guarantees. `"none"` prevents caller tools from being exposed on that turn.
 
 Chat returns `tool_calls`; Responses returns `function_call` items and streaming
-argument events. A result must carry the matching live call id; standalone or
-unknown results are refused before a prompt starts. A Responses request that mixes
-`function_call_output` with new message input is also refused, so the new input is
-never silently discarded—resolve the call first, then send the message. Agent-owned
+argument events. A live Chat `tool_call_id` routes to its suspended turn even when
+a supplied conversation header points elsewhere; results spanning multiple live
+turns are refused as ambiguous. Responses is stricter: every
+`function_call_output` must match a call pending on the named latest response, and
+standalone or unknown ids are refused before a prompt starts. A Responses request
+that mixes tool output with new message input is also refused, so input is never
+silently discarded—resolve the call first, then send the message. Agent-owned
 `mcpServers` remain separate from caller tools.
 
 Responses continuation is a linear chain. Only the latest stored response id may
 continue it: a known older id is `409 stale_previous_response`; an unknown, expired
 or unrecoverable id is `404 not_found`. Unchanged explicit `instructions` may
 continue. Adding, changing or removing them in a live chain is refused because a
-text preamble cannot erase instructions already in ACP history. `store: false`
-returns a result but creates no continuation point.
+text preamble cannot erase instructions already in ACP history. One request owns a
+continuation claim at a time; a concurrent continuation or duplicate tool result
+gets `409 conversation_busy` and cannot mutate the owner. `store: false` returns
+an unstored result and creates no continuation point. If it continues an existing
+chain, it closes that chain while preserving older objects for GET; those old ids
+are no longer valid continuation tips. Served tools require storage, so combining
+them with `store: false` is refused with 400 `store_required`.
 If a continued turn fails, times out or disconnects after its prompt began, the
 old response id is invalidated: the ACP history changed without a successful new
-continuation point, so retrying from the old id returns 404.
+continuation point, so retrying from the old id returns 404. A validation error
+before a prompt or matching tool result advances the turn releases the claim and
+leaves the latest id reusable after the request is corrected.
+
+Reasoning overrides are temporary. The baseline is captured after the configured
+model and raw options have been applied; a later request without an override
+restores it. Parking/resume preserves the same baseline rather than promoting the
+last temporary value.
 
 ## Output semantics
 

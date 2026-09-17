@@ -47,7 +47,9 @@ Conversations and stored Responses are in memory. A restart forgets them, so a
 later `previous_response_id` returns 404. TTL is checked before refresh: reading an
 expired id does not revive it. Resident sessions, retained conversations, response
 count and serialized response bytes are separate limits; see the commented
-defaults in `acp2api.example.yaml` for the current names and values.
+defaults in `acp2api.example.yaml` for the current names and values. Inactive
+Responses objects are evicted before active or tool-pending conversations; if no
+safe eviction can satisfy a limit, the request fails instead of interrupting one.
 
 Parking closes an ACP session, not the shared child process. Resume depends on the
 agent retaining that session id and accepting the same cwd and complete MCP set.
@@ -58,8 +60,11 @@ without history.
 
 `requestTimeoutMs` caps a turn; `agentRpcTimeoutMs` caps setup/control calls;
 `toolTimeoutMs` caps a caller tool waiting for its result. Client disconnects and
-timeouts cancel the turn and retire unsafe session state. Cancellation is
-cooperative, so the CLI may emit briefly while cleanup drains it.
+timeouts cancel the turn. A keyed Chat session is retained only when cancellation
+drains safely; failed/undrainable state is retired. An advanced Responses
+continuation always invalidates its old id when it fails, because its ACP history
+no longer matches that stored snapshot. Cancellation is cooperative, so the CLI
+may emit briefly while cleanup drains it.
 
 Automatic retries need application judgment. Before streaming headers, an
 exhaustion match is an HTTP 429 suitable for provider failover. After headers, HTTP
@@ -72,7 +77,8 @@ effects idempotent where possible.
 - Keep the acp2api listener private and terminate authentication at the proxy.
 - Preserve the configured Host and explicitly allow browser origins; do not rely
   on `X-Forwarded-*` to authorize a request.
-- Send `Content-Type: application/json` on inference POSTs.
+- Send `Content-Type: application/json` on inference POSTs. Request bodies larger
+  than 32 MiB are rejected with 413, including inline base64 attachments.
 - In Docker, bind acp2api to `0.0.0.0` inside the container but publish the port to
   host loopback. Add the published authority, including its external port, to
   `server.allowedHosts` (for example `localhost:10021` and

@@ -108,11 +108,16 @@ in [`acp2api.example.yaml`](acp2api.example.yaml). The essentials:
 | `server.*` | continuity, conversation header, steering (`busy: queue`), session bounds, progress, terminal |
 
 ```sh
+acp2api --help
+acp2api --version
+acp2api --init ./acp2api.yaml          # create; never overwrite
 acp2api --config acp2api.yaml --check   # validate and exit
 acp2api --config acp2api.yaml --doctor  # setup every agent, no prompt/login change
 acp2api --config acp2api.yaml --doctor --json
 acp2api --config acp2api.yaml --probe claude-opus  # live models/options, no prompt
 ```
+
+`--config` also has the `-c` alias and may be supplied as `ACP2API_CONFIG`.
 
 Agent model lists move independently of acp2api. `--doctor` applies the configured
 model first and then validates the resulting reasoning, mode and raw-option set,
@@ -122,7 +127,7 @@ capability highlights without applying the config. Neither command sends a promp
 performs warm-up or changes login.
 
 Routes: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (SSE with
-`stream: true`), `POST/GET/DELETE /v1/responses`.
+`stream: true`), `POST /v1/responses`, and `GET`/`DELETE /v1/responses/:id`.
 
 See the exact supported/emulated/ignored/refused surface in the
 [compatibility matrix](docs/compatibility.md), and runnable official-SDK examples

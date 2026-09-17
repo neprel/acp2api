@@ -1,8 +1,9 @@
 # The guide
 
-What acp2api does beyond the quick start, one section per feature,
-each with the request that exercises it. Everything here was built against a
-fleet running in production.
+What acp2api does beyond the quick start, one section per feature, each with a
+request that exercises it. The compatibility claims below are bounded to the
+implemented and tested surface; individual ACP agents still vary by version,
+configuration and login.
 
 A coding agent is not a chat model, and the gap between the two is where every
 feature comes from: a turn runs for minutes, holds state you paid for, narrates
@@ -134,11 +135,13 @@ longer has the id, continuation fails rather than silently opening an empty sess
 that lost the conversation. Start a new conversation explicitly when losing state
 is acceptable.
 
-Two other things end a session. `maxContextFill` retires one that has used up its
-context window, because the alternative is the agent's own compaction and then a
-wall no retry gets past. And a turn nobody waited for — the caller hung up, or the
-request timed out — no longer costs a **keyed** conversation its session: that is a
-human redirecting the agent, not a broken agent.
+Two other things end or retire a session. `maxContextFill` retires one that has
+used up its context window, because the alternative is the agent's own compaction
+and then a wall no retry gets past. A timed-out keyed Chat turn may keep its session
+when cancellation drains safely, so a correction can continue the work; an agent
+failure or a turn that cannot be drained retires it rather than offering state the
+bridge can no longer account for. Responses uses the stricter id invalidation
+rules described below.
 
 ## Starting warm instead of cold
 
@@ -183,6 +186,13 @@ Never into the answer: a trace written into the text becomes part of the text, a
 comes back as the assistant's own words on the next turn. Off by default, so a
 caller already rendering reasoning as prose does not suddenly start showing tool
 traffic.
+
+ACP also does not label prose emitted before a tool call as commentary. By default
+`server.commentary: answer` preserves it in answer text. With `commentary: trace`,
+only prose that a following tool call proves was intermediate is moved to the
+reasoning channel; a turn that never calls a tool is unchanged. This mode buffers
+each prose run until the next tool call or the end of the turn—text already sent as
+an answer delta cannot later be reclassified.
 
 ## Running the agent's commands yourself
 
@@ -231,7 +241,10 @@ You get back the supported OpenAI-shaped tool-call subset:
 ```
 
 Run it, send the result back as a `tool` message in the same conversation, and the
-turn finishes.
+turn finishes. The live `tool_call_id` identifies the suspended Chat turn and takes
+precedence over a conflicting conversation header. Results spanning two suspended
+turns are refused as ambiguous, and a concurrent request for the same named
+conversation receives 409 rather than interleaving with the owner.
 
 **`session/prompt` has no `tools` field**, and will not get one — an ACP agent runs
 its own loop, and the protocol's answer to "where do tools come from" is
@@ -259,10 +272,9 @@ the caller still received ordinary answer text. In the field, Codex at low
 reasoning imitated `submit_plan`, while high reasoning made the actual tool call.
 Raise that agent's configured `reasoning` when this annotation appears.
 
-Verified against a real Claude Code end to end: the agent listed the tool, called
-it, and finished the turn quoting a value that existed nowhere but the result sent
-back to it. Set `server.tools: off` to drop them instead, which is what every
-version before 1.8.0 did.
+This path has automated end-to-end coverage with the repository's ACP fixture;
+dated live-agent observations are recorded separately in [agents.md](agents.md).
+Set `server.tools: off` to drop caller tools instead.
 
 ## The agent's own tools come from MCP
 
@@ -305,10 +317,10 @@ So parameters are split by **what breaks if we proceed**, not by what is support
 | | behaviour |
 | --- | --- |
 | `model`, `messages`, `stream`, `reasoning_effort` | native when the agent advertises the matching option |
-| `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (token counts are approximate; there is no tokenizer here) |
+| `max_completion_tokens` / `max_tokens`, `stop` | **emulated for real** — the output is watched and the turn cut short (`max_completion_tokens` wins; token counts are approximate because there is no tokenizer here) |
 | `stream_options.include_usage` | native |
 | `temperature`, `top_p`, `seed`, penalties, `logprobs`, unknown fields | **accepted and ignored.** Every client library sends `temperature` unasked; failing on it would reject nearly every real request over a difference the caller cannot perceive |
-| `tools` | **served by default.** The bridge exposes caller tools through a per-conversation MCP server and can return `tool_calls`; set `server.tools: off` to drop them and report `tools` in `ignored_params`. See [Your tools in the agent's hands](#your-tools-in-the-agents-hands) |
+| `tools` | **served by default.** The bridge exposes caller tools through a per-conversation MCP server and can return `tool_calls`; set `server.tools: off` to drop them and report `tools` in `x_acp2api.ignored`. See [Your tools in the agent's hands](#your-tools-in-the-agents-hands) |
 | `tool_choice: "auto"` | supported; the ACP agent chooses whether to call a served tool |
 | `tool_choice: "none"` | supported; caller tools are withheld for that turn |
 | `tool_choice: "required"` / named, `strict: true` | **400.** ACP cannot guarantee selection or constrained arguments |
@@ -401,6 +413,13 @@ id, because the ids differ per agent — Claude calls its reasoning selector `ef
 Codex calls it `reasoning_effort`. A `model` the agent does not offer is a **400**,
 never a silent fallback: you named that agent to get that model.
 
+The configured model and raw options are applied before acp2api captures the
+session's reasoning baseline. A request-level `reasoning_effort` (Chat) or
+`reasoning.effort` (Responses) is temporary: the next request without an override
+restores that baseline. Parking and `session/resume` preserve the same baseline,
+including an explicitly configured `reasoning` value; an unavailable requested
+effort is a 400 instead of a silent fallback.
+
 For a `type: claude` agent, acp2api passes its configured `model` as
 `ANTHROPIC_MODEL` when it starts the adapter. An explicit `ANTHROPIC_MODEL` under
 the agent's `env:` mapping wins over that derived value. The live option still
@@ -442,7 +461,7 @@ than approximate:
 | `instructions` | an explicitly limited text-preamble emulation |
 | `reasoning: {effort}` | the `thought_level` config option, **per request** |
 | `max_output_tokens` | the same output-watching cut as `max_tokens` |
-| `store: false` | return the result without creating a continuation point |
+| `store: false` | return the result without retaining it; when continuing a chain, close its continuation state |
 
 ```sh
 curl localhost:10021/v1/responses \
@@ -458,23 +477,43 @@ curl localhost:10021/v1/responses \
 
 The second request sends **only the new input** and must name the latest successful
 stored response. A known older id gets `409 stale_previous_response`; an unknown or
-unrecoverable id gets 404. Chat completions has to resend the
+unrecoverable id gets 404. A second concurrent claimant—including a duplicate
+`function_call_output`—gets `409 conversation_busy` without changing the first
+request's state. Chat completions has to resend the
 whole history each time and the agent reads it as one flattened transcript; here the
 agent already holds it. `reasoning.effort` can likewise be raised for one hard
-question mid-conversation and dropped again. Chat uses `reasoning_effort`.
+question mid-conversation; omitting it next time restores the configured/session
+baseline. Chat uses `reasoning_effort` and follows the same reset rule.
 
 `instructions` are not a native ACP system-role channel: acp2api places them in the
 initial text. An explicitly identical value may continue, but adding, changing or
 removing it after the first response is refused because old text cannot be erased
 from the agent's history. Start a new chain to change instructions.
 
+Request-shape and option validation happens before an ACP prompt begins. A
+correctable 400 at that stage releases the claim and leaves the latest id usable.
+Once a prompt or matching tool result has advanced the ACP turn, a failure,
+timeout or disconnect invalidates the old id: retrying it returns 404 because its
+stored snapshot no longer matches live history.
+
+Responses tool continuations require stored state: `store: false` with served
+tools is refused with 400 `store_required`. A `function_call_output` must name a
+pending call from that latest response, may not be mixed with new message input,
+and does not permit adding tools to a chain that was opened without them. Resolve
+the call first, then send the next message. A successful `store: false`
+continuation returns its unstored result, leaves older response bodies readable by
+GET, and closes the chain so none of those ids can continue it.
+
 Retained conversations hold live ACP sessions inside the agent process, so resident
 sessions are bounded by `server.maxSessions` (parked by last *use*, so an actively
 continued conversation outlives a newer idle one) and `server.sessionTtlMs`. Both
 close the resident ACP session while retaining its id for `session/resume`.
-`server.forgetTtlMs` ends the conversation outright. Deleting its last stored
-response, shutting down, and a first turn that fails before answering also close
-and discard it.
+`maxConversations`, `maxResponses`, and `maxResponseBytes` bound retained Responses
+metadata, immutable objects and serialized bytes. Inactive snapshots are evicted
+before active/pending chains; if safe eviction cannot make room, admission fails
+instead of interrupting an active turn. `server.forgetTtlMs` ends the conversation
+outright. Deleting its last stored response, shutting down, and a first turn that
+fails before answering also close and discard it.
 
 There is no authentication: acp2api is a local bridge, and authorization is the
 job of the router in front of it. It binds loopback by default and warns at startup

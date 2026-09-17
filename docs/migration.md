@@ -1,5 +1,11 @@
 # Migration notes
 
+## From 1.16.0 to 1.16.1
+
+This patch release corrects and completes the user documentation and narrows the
+published examples glob so generated Python cache files cannot enter the package.
+It does not change the runtime API or configuration behavior.
+
 ## From 1.15.x to 1.16.0
 
 The changes below intentionally replace behaviours that could return a successful
@@ -12,14 +18,21 @@ but incorrect result.
 - A failed, timed-out or disconnected continued turn invalidates its old response
   id after the prompt starts; it cannot be reused as if the failed input had never
   reached the agent.
+- Validation that fails before a prompt or matching tool result is sent now leaves
+  the latest response id usable after correction. It does not consume or corrupt
+  the continuation claim.
 - Changing, adding or removing `instructions` during a chain is refused. Start a
   new response without `previous_response_id` to change them.
-- `store: false` creates no retrievable response or continuation tip.
+- `store: false` creates no retrievable new response or continuation tip. When it
+  continues a stored chain, the result is returned, older GET snapshots remain
+  readable, and the chain is closed so those ids cannot be continued.
 - `tool_choice: "required"`, named tool selection, `strict: true`, and unsupported
   tool types are refused. `tool_choice: "none"` now actually withholds caller
   tools; `"auto"` remains supported.
 - Chat accepts `reasoning_effort` when the selected agent exposes a
-  `thought_level` option. Responses continues to use `reasoning.effort`.
+  `thought_level` option. Responses continues to use `reasoning.effort`. A
+  request-level override is reset to the baseline derived after configured model
+  and raw options; parking/resume preserves that baseline.
 - Stop strings choose the earliest occurrence in generated text, independent of
   array order. Token limits remain an approximate visible-text bound.
 - JSON inference POSTs require `Content-Type: application/json`. Requests with an
@@ -33,9 +46,13 @@ but incorrect result.
 - Responses streaming uses canonical item ids/indexes and function-call argument
   events. Consumers that parsed earlier non-canonical event sequences should use
   the official SDK or update their parser.
-- Standalone or unknown `function_call_output` ids are refused. A request that
-  combines tool results with new message input is refused rather than dropping the
-  message; send the result and the next message in separate requests.
+- Standalone or unknown Responses `function_call_output` ids are refused. A
+  Responses request that combines tool results with new message input is refused
+  rather than dropping the message; send the result and the next message in
+  separate requests.
+- Responses continuation ownership is exclusive. A concurrent continuation or
+  duplicate `function_call_output` receives 409 `conversation_busy` without
+  changing the first request; the winning request can finish and continue.
 
 New operator commands are `--version`, `--init <file>`, and `--doctor [--json]`.
 `--init` never overwrites. Run doctor before rollout; it performs setup and applies

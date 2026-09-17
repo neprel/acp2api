@@ -105,6 +105,14 @@ server:
   # where a command says what happened.
   progressOutputLines: 6
 
+  # Agent prose before a tool call is ambiguous: ACP does not mark whether it was
+  # a final answer or running commentary. `answer` (default) preserves all prose
+  # in answer text. `trace` moves prose that a FOLLOWING tool call proves was
+  # commentary into the reasoning channel; a turn with no tool call is unchanged.
+  # `trace` buffers each prose run until the next tool call or the end of the turn,
+  # because already-streamed answer text cannot be moved later.
+  commentary: answer
+
   # Retire a session once this much of its context window is in use, as a fraction.
   # 0 turns the check off.
   #
@@ -121,7 +129,7 @@ server:
 
   # Agents can think for a long time. Past this the caller gets 504 rather than a
   # truncated 200 that a router would count as a success.
-  requestTimeoutMs: 900000
+  requestTimeoutMs: 600000
 
   # Deadline for ACP control RPCs such as initialize, session/new, configuration,
   # resume and fork. The prompt itself may run for requestTimeoutMs; after a prompt
@@ -131,8 +139,15 @@ server:
 
   # What makes a failure a 429 ("out of quota, try the next brain") instead of a 502
   # ("broken"). ACP has no quota error code, so this pattern list is the whole
-  # detection mechanism. Setting it REPLACES the built-in list.
-  # limitPatterns: ["rate.?limit", "usage limit", "quota"]
+  # detection mechanism. Setting it REPLACES this built-in default list:
+  # limitPatterns:
+  #   - rate.?limit
+  #   - usage limit
+  #   - quota
+  #   - too many requests
+  #   - "\\b429\\b"
+  #   - exceeded your current
+  #   - insufficient_quota
 
   # OpenAI parameters ACP cannot carry -- temperature, top_p, seed and friends.
   #   warn   (default) accept, drop, log once, and report in `x_acp2api.ignored`
@@ -237,8 +252,10 @@ server:
   #
   # The turn does NOT end at the call. It waits inside it while the completion
   # returns, so the result the caller sends back reaches the same turn and the
-  # agent carries on from where it was. That needs a NAMED conversation
-  # (`conversationHeader`), since the turn outlives the request that started it.
+  # agent carries on from where it was. Chat results are routed by the live
+  # `tool_call_id`; Responses results use `previous_response_id`. A stable named
+  # Chat conversation is still recommended for ordinary messages around the call,
+  # but is not required to deliver the matching result.
   tools: mcp
 
   # How long a tool call may sit unanswered before the agent is told it failed.
@@ -250,6 +267,10 @@ agents:
   # `name` is the OpenAI model id clients ask for.
   - name: claude-opus
     type: claude # bundled adapter: @agentclientprotocol/claude-agent-acp
+    # Optional display metadata and per-process spawn overrides:
+    # description: Claude for repository work
+    # cwd: ./another-workspace
+    # env: { MY_AGENT_SETTING: "${MY_AGENT_SETTING}" }
     # Attached to every metric this agent produces. Free-form on purpose: which
     # SUBSCRIPTION an agent spends is a property of the login in the home directory
     # it was spawned with, no ACP message reports it, and no probe would make it
